@@ -171,3 +171,62 @@ class TCRFileManager:
         ds = self.read_dataset()
         return strategy.experimental_distribute_dataset(ds)
 
+
+
+class Likelihood(keras.losses.Loss):
+    def __init__(self, donor_mhc: tf.Tensor, memory_efficient: bool = False, 
+                 pad_token = -1, **kwargs):
+        super().__init__()
+        self.donor_mhc = tf.Variable(donor_mhc) #(N, A)
+        self.memory_efficient = memory_efficient
+        self.pad_token = pad_token
+        assert len(tf.shape(self.donor_mhc)) == 2, f'the shape of donor_mhc should be (donor, mhc_allele), found {tf.shape(donor_mhc)}'
+        self.Na = tf.reduce_sum(self.donor_mhc, axis=0) #(A,)
+    def calculateLL(self, gamma, q, gamma_donor_id):
+        '''
+        gamma: output of model. dimension (batch, mhc_allele) or (B,A)
+        q: output of model. dimension (batch,)
+        gamma_donor_id: padded integers of donor ids per each tcr. dimension (batch, padded_donor_id) or (B, D_i). map tcr to donors.
+        '''
+        #### Calculate The second Term ####
+        # |Ni_size| * Sum^A( Na * gamma_ia )
+        Ni_size, Ni, gamma_donor_id_mask = self.calculate_Ni_Nisize(gamma_donor_id) #(B,) and (B, N_i, A) and (B, N_i)
+        second_term = Ni_size * tf.reduce_sum(self.Na[tf.newaxis, :] * gamma, axis=-1) #(B,) * Sum^A ( (B, A) * (B, A)) --> (B,)
+
+        #### Calculate The first Term ####
+        # Sum^Ni (ln( qi*pni / 1 - qi*pni))
+        ## calculate pni: 1 - Prod( 1 - gamma_ia) ** x_na
+        pn = self.calculate_pni(Ni, gamma, gamma_donor_id_mask) # (B, N_i)
+        numerator = tf.multiply(q[:, tf.newaxis], pn) # (B,1) * (B, N_i)
+        denominator = 1. - numerator
+        first_term = tf.math.log(numerator / denominator)
+        first_term = tf.reduce_sum(first_term, axis=-1) #(B, N_i) --> (B,)
+        
+        LL_batch = first_term - second_term
+        return tf.reduce_sum(LL_batch)
+
+    def calculate_Ni_Nisize(self, gamma_donor_id): #(B, max)
+        # calculate count of donors per each tcr
+        gamma_donor_id_count = tf.where(gamma_donor_id == self.pad_token, 0., 1.) #(B, pad_donor_id)
+        Ni_size = tf.reduce_sum(gamma_donor_id_count, axis=-1) #(B,) each has the number of Ni 
+        ## extract (Ni, A) from (N, A)
+        # First, we need to create a masking for padded tokens
+        gamma_donor_id_converted = tf.where(gamma_donor_id == self.pad_token, 0., gamma_donor_id) # just to make sure tf.gather does not raise error
+        gamma_donor_id_mask = tf.where(gamma_donor_id == self.pad_token, 0., 1) #(B,D_i) or (B,N_i)
+        Ni = tf.gather(self.donor_mhc, gamma_donor_id_converted, axis=0) # (N, A), (B,D_i) --> (B, N_i, A) N_i are simply gathered D_is , D_i is index and is padded. len(N_i) == len(D_i)
+        Ni = tf.multiply(Ni, gamma_donor_id_mask[:, :, tf.newaxis]) #(B,N_i,A) masked out
+        return Ni_size, Ni, gamma_donor_id_mask
+
+    def calculate_pni(self, Ni, gamma, gamma_donor_id_mask): #(B,N_i,A) and (B,A)
+        # pni = 1 - Prod (1 - gamma_ia) ^ xna
+        # Ni has only 0 and 1 now. Also, the N_i dim is padded to maximum number of donors for a tcr.
+        # gamma should be expanded from (B,A) to (B, N_i, A)
+        gamma_expanded = tf.expand_dims(gamma, axis=1) #(B, 1, A)
+        gamma_expanded = tf.broadcast_to(gamma_expanded, shape=tf.shape(Ni)) #(B, N_i, A)
+        # output = (1 - gamma)^ xna
+        output = tf.pow(1. - gamma_expanded, Ni) #(B, N_i, A)
+        # 1. - Prod(output)
+        pni = 1. - tf.reduce_prod(output, axis=-1) #(B, N_i)
+        # apply mask
+        pni = pni * gamma_donor_id_mask #(B, N_i)
+        return pni
