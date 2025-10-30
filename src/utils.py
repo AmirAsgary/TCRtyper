@@ -2,7 +2,45 @@ import keras
 import tensorflow as tf
 import numpy as np
 from typing import List, Tuple, Union
+from src.constants import AMINO_ACID_IDX, AMINO_ACIDS, PHYSICHE_STOCKHOLM, PHYSICHE_STOCKHOLM_AA_to_IDX, PHYSICHE_STOCKHOLM_IDX_to_ENCODE
+import pandas as pd
+import os
+import subprocess
+from pathlib import Path
+import shutil
+import json
 
+
+
+aa_order = list("ARNDCEQGHILKMFPSTWYVX")
+AMINO_ACIDS = ''.join(aa_order)
+AMINO_ACID_IDX = {aa: i for i, aa in enumerate(AMINO_ACIDS)}
+encode_table = str.maketrans({aa: chr(i) for aa, i in AMINO_ACID_IDX.items()})
+decode_table = str.maketrans({chr(i): aa for aa, i in AMINO_ACID_IDX.items()})
+
+def convert_protein_sequences_fast(data_list, convert_to_aa=True, convert_to_ind=False):
+    """
+    Extremely fast conversion between amino acid sequences and index-encoded strings.
+    Works for both directions.
+    """
+    converted = []
+    for item in data_list:
+        item = item.strip()
+        if convert_to_aa:
+            if all(ch.isdigit() or ch == ';' for ch in item):
+                # Index → sequence
+                indices = map(int, item.split(';'))
+                seq = ''.join(aa_order[i] for i in indices)
+                converted.append(seq)
+            else:
+                converted.append(item)
+        elif convert_to_ind:
+            # Sequence → index form using translation
+            encoded = item.translate(encode_table)
+            indices = [str(ord(c)) for c in encoded]
+            converted.append(';'.join(indices))
+            
+    return converted
 
 def _float_feature(value):
     return tf.train.Feature(float_list=tf.train.FloatList(value=value))
@@ -28,15 +66,281 @@ def _int64_feature(value):
     elif isinstance(value, np.ndarray):
         value = value.flatten().tolist()
     return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
+    
 
 
-class DonorFileManager:
-    def __init__(self, 
-                 donor_seqid_path: None | Union[str, List[str]], # (n_donor, padded_num_seq_ids_indexes) e.g (1000, 200k)
-                 donor_mhc_path: None | Union[str, List[str]], # (n_donor, n_mhc) binary)
-    ):
-        self.donor_seqid_path = donor_seqid_path
-        self.donor_mhc_path = donor_mhc_path
+
+
+class ReadAndPreprocess:
+    """
+    Read and preprocess TCR (T-cell receptor) and MHC (Major Histocompatibility Complex) data.
+    
+    This class handles loading TCR sequences and MHC arrays from multiple patients,
+    validates the data, maps sequences to numeric representations, and aggregates
+    results for downstream analysis.
+    """
+    
+    def __init__(self, df: Union[str, pd.DataFrame],
+                 csv_output_path: str,
+                 pad_token: int = -1,
+                 tcr_tsv_path: str = 'tcr_tsv_path',
+                 mhc_arr_path: str = 'mhc_arr_path',
+                 cdr3_col: str = 'cdr3_col',
+                 cdr1_col: str = 'cdr1_col',
+                 cdr2_col: str = 'cdr2_col',
+                 id_col: str = 'id',
+                 mhc_maximum_num: int = 200,
+                 mhc_num_allele_thr: Union[List, Tuple] = (10, 12)):
+        """
+        Initialize the preprocessor with data paths and configuration.
+        
+        Args:
+            df: Path to CSV/TSV file or loaded DataFrame containing patient data.
+                Must have columns specified by tcr_tsv_path and mhc_arr_path parameters.
+            csv_output_path: Directory path where output files will be saved.
+            pad_token: Integer token used for padding sequences to the same length (default: -1).
+            tcr_tsv_path: Column name in df containing paths to TCR data files (default: 'tcr_tsv_path').
+            mhc_arr_path: Column name in df containing paths to MHC array files (default: 'mhc_arr_path').
+            cdr3_col: Column name in df specifying the CDR3 column name in TCR files (default: 'cdr3_col').
+            cdr1_col: Column name in df specifying the CDR1 column name in TCR files (default: 'cdr1_col').
+            cdr2_col: Column name in df specifying the CDR2 column name in TCR files (default: 'cdr2_col').
+            id_col: Column name for patient IDs in df (default: 'id'). If not present, IDs are auto-assigned.
+            mhc_maximum_num: Expected number of MHC alleles in arrays (default: 200).
+            mhc_num_allele_thr: Tuple of (min, max) number of alleles that should be present (default: (10, 12)).
+        """
+        # Load dataframe if path is provided
+        if isinstance(df, str):
+            try:
+                df = pd.read_csv(df)
+            except:
+                df = pd.read_csv(df, sep='\t')
+        # Validate required columns
+        assert tcr_tsv_path in df.columns and mhc_arr_path in df.columns, (
+            f"DataFrame must have {[tcr_tsv_path, mhc_arr_path]} columns. Found: {df.columns.tolist()}"
+        )
+        # Handle ID column
+        if id_col in df.columns:
+            assert len(df[id_col].dropna()) == len(df), (
+                "ID column provided but contains missing values."
+            )
+            # Ensure IDs are strings for consistency
+            df[id_col] = df[id_col].astype(str)
+        else:
+            df[id_col] = [str(i) for i in range(len(df))]
+        # Handle CDR column name specifications
+        for i, cdr_col in zip(range(1, 4), [cdr1_col, cdr2_col, cdr3_col]):
+            if cdr_col in df.columns:
+                assert len(df[cdr_col].dropna()) == len(df), (
+                    f"{cdr_col} column provided but contains missing values."
+                )
+            else:
+                # Default CDR column names
+                df[cdr_col] = f'cdr{i}'
+        self.df = df
+        self.csv_output_path = csv_output_path
+        self.pad_token = pad_token
+        self.tcr_tsv_path = tcr_tsv_path
+        self.mhc_arr_path = mhc_arr_path
+        self.cdr3_col = cdr3_col
+        self.cdr1_col = cdr1_col
+        self.cdr2_col = cdr2_col
+        self.id_col = id_col
+        self.mhc_maximum_num = mhc_maximum_num
+        self.mhc_num_allele_thr = mhc_num_allele_thr
+        self.get_idx = AMINO_ACID_IDX.get
+    
+    def read_tcr_df(self, path: str, cdr3_col: str = 'cdr3', 
+                    cdr2_col: str = 'cdr2', cdr1_col: str = 'cdr1') -> pd.DataFrame:
+        """
+        Read TCR (T-cell receptor) data from a CSV or TSV file.
+        
+        Args:
+            path: Path to the TCR data file.
+            cdr3_col: Name of the CDR3 sequence column (default: 'cdr3').
+            cdr2_col: Name of the CDR2 sequence column (default: 'cdr2').
+            cdr1_col: Name of the CDR1 sequence column (default: 'cdr1').
+            
+        Returns:
+            DataFrame containing TCR sequences with rows containing missing CDR3 values removed.
+            
+        Raises:
+            AssertionError: If required columns are missing or dataframe is empty.
+        """
+        tcr_df = pd.read_csv(path)
+        if not all(col in tcr_df.columns for col in [cdr3_col, cdr2_col, cdr1_col]):
+            tcr_df = pd.read_csv(path, sep='\t')
+        
+        # Validate required columns exist
+        assert all(col in tcr_df.columns for col in [cdr3_col, cdr2_col, cdr1_col]), (
+            f"Required columns {[cdr3_col, cdr2_col, cdr1_col]} not found. "
+            f"Available columns: {tcr_df.columns.tolist()}"
+        )
+        
+        assert len(tcr_df) > 0, f"Empty dataframe loaded from {path}"
+        
+        # Filter out rows with missing CDR3 values (CDR3 is mandatory)
+        tcr_df = tcr_df[~tcr_df[cdr3_col].isna()]
+        
+        return tcr_df
+    
+    def read_mhc_arr(self, path: str) -> np.ndarray:
+        """
+        Read and validate MHC (Major Histocompatibility Complex) array from .npy file.
+        Args:
+            path: Path to the .npy file containing MHC array.
+        Returns:
+            Validated MHC array as numpy ndarray.
+        Raises:
+            AssertionError: If array size, values, or allele count don't meet requirements.
+        """
+        arr = np.load(path)
+        
+        # Validate array shape
+        assert arr.shape[0] == self.mhc_maximum_num, (
+            f"Expected array size of {self.mhc_maximum_num}, "
+            f"but received array of shape {arr.shape}"
+        )
+        # Validate array contains only binary values
+        assert np.isin(arr, [0, 1]).all(), (
+            f"Expected all elements to be [0, 1], found unique values: {np.unique(arr)}"
+        )
+        # Validate number of present alleles (1s)
+        allele_sum = np.sum(arr)
+        assert self.mhc_num_allele_thr[0] <= allele_sum <= self.mhc_num_allele_thr[1], (
+            f"Expected between {self.mhc_num_allele_thr[0]} and {self.mhc_num_allele_thr[1]} "
+            f"alleles to be present, found {allele_sum}"
+        )
+        return arr
+    
+    def assign_patient_ids_to_tcrs(self, tcr_data: pd.DataFrame, 
+                                   separator: str = ';', 
+                                   cdr_columns: List[str] = None) -> pd.DataFrame:
+        """
+        Group TCR sequences by CDR regions and aggregate patient IDs.
+        For identical TCR sequences from different patients, this combines their IDs
+        into a single semicolon-separated string.
+        Args:
+            tcr_data: DataFrame containing TCR sequences and patient IDs.
+            separator: String to join multiple patient IDs (default: ';').
+            cdr_columns: List of CDR column names to group by (default: ['cdr1', 'cdr2', 'cdr3']).
+            
+        Returns:
+            DataFrame with unique TCR sequences and aggregated patient IDs.
+        """
+        if cdr_columns is None:
+            cdr_columns = ['cdr1', 'cdr2', 'cdr3']
+        
+        result = tcr_data.groupby(cdr_columns, as_index=False, sort=False).agg({
+            self.id_col: lambda x: separator.join(sorted(set(map(str, x))))
+        })
+        return result
+    
+    def map_df_to_num(self, df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+        """
+        Map amino acid sequences to numeric representations.
+        Converts amino acid sequences to semicolon-separated numeric indices
+        based on AMINO_ACID_IDX mapping. Unknown amino acids are mapped to '?'.
+        Args:
+            df: DataFrame containing sequence columns to map.
+            columns: List of column names containing amino acid sequences.
+        Returns:
+            DataFrame with new 'mapped_{column}' columns added.
+        """
+        
+        for col in columns:
+            df[col] = [
+                ';'.join(str(self.get_idx(aa)) for aa in seq) 
+                for seq in df[str(col)].values
+            ]
+        return df
+    
+    def call(self, sequence_mapping: bool = False, 
+             cdr2_sequence: bool = False, 
+             cdr1_sequence: bool = False) -> None:
+        """
+        Main processing pipeline: read, validate, map, and save TCR and MHC data.
+        
+        Iterates through all patients in the input dataframe, loads their TCR and MHC data,
+        optionally maps sequences to numeric representations, and saves three output files:
+        1. tcr_seq.csv: All TCR sequences with patient IDs
+        2. tcr_donor_ids.csv: Unique TCR sequences with aggregated patient IDs
+        3. donor_mhc.npz: MHC arrays and patient IDs
+        
+        Args:
+            sequence_mapping: If True, map CDR3 sequences to numeric representation (default: False).
+            cdr2_sequence: If True, also map CDR2 sequences (requires sequence_mapping=True).
+            cdr1_sequence: If True, also map CDR1 sequences (requires sequence_mapping=True).
+        """
+        # Create output directory
+        os.makedirs(self.csv_output_path, exist_ok=True)
+        
+        # Define output paths
+        tcr_seq_path = os.path.join(self.csv_output_path, 'tcr_seq.csv')
+        tcr_donor_ids_path = os.path.join(self.csv_output_path, 'tcr_donor_ids.csv')
+        donor_mhc_arr_path = os.path.join(self.csv_output_path, 'donor_mhc.npz')
+        
+        # Collect all data
+        mhc_arrays = []
+        patient_ids = []
+        all_tcr_dfs = []
+        
+        # Use itertuples for better performance than iterrows
+        for row in self.df.itertuples(index=False):
+            patient_id = getattr(row, self.id_col)
+            cdr3_col = getattr(row, self.cdr3_col)
+            cdr2_col = getattr(row, self.cdr2_col)
+            cdr1_col = getattr(row, self.cdr1_col)
+            tcr_path = getattr(row, self.tcr_tsv_path)
+            mhc_path = getattr(row, self.mhc_arr_path)
+            
+            # Read TCR data
+            tcr_df = self.read_tcr_df(tcr_path, cdr3_col, cdr2_col, cdr1_col)
+            
+            # Read MHC array
+            mhc_arr = self.read_mhc_arr(mhc_path)
+            mhc_arrays.append(mhc_arr)
+            patient_ids.append(patient_id)
+            # Add patient ID column and rename CDR columns to standard names
+            tcr_df[self.id_col] = patient_id
+            tcr_df = tcr_df.rename(columns={
+                cdr3_col: 'cdr3', 
+                cdr2_col: 'cdr2', 
+                cdr1_col: 'cdr1'
+            })
+            # sequence mapping
+            if sequence_mapping:
+                cols_to_map = ['cdr3']
+                if cdr1_sequence:
+                    cols_to_map.append('cdr1')
+                if cdr2_sequence:
+                    cols_to_map.append('cdr2')
+                
+                self.map_df_to_num(tcr_df, cols_to_map)
+            
+            all_tcr_dfs.append(tcr_df)
+        
+        # Concatenate all TCR dataframes and save (more efficient than appending)
+        combined_tcr_df = pd.concat(all_tcr_dfs, ignore_index=True)
+        combined_tcr_df.to_csv(tcr_seq_path, index=False)
+        
+        # Stack MHC arrays and save with patient IDs
+        mhc_array_stacked = np.stack(mhc_arrays, axis=0)
+        patient_ids_array = np.array(patient_ids)
+        np.savez(donor_mhc_arr_path, array=mhc_array_stacked, patient_id=patient_ids_array)
+        
+        # Aggregate TCR sequences by patient IDs
+        tcr_aggregated = self.assign_patient_ids_to_tcrs(combined_tcr_df)
+        tcr_aggregated['tcr_id'] = range(len(tcr_aggregated))
+        tcr_aggregated.to_csv(tcr_donor_ids_path, index=False)
+        
+        print(f"Processing complete!")
+        print(f"  - TCR sequences saved to: {tcr_seq_path}")
+        print(f"  - Aggregated TCR-patient IDs saved to: {tcr_donor_ids_path}")
+        print(f"  - MHC arrays saved to: {donor_mhc_arr_path}")
+
+
+        
+
 
 
 class TCRFileManager:
@@ -114,20 +418,21 @@ class TCRFileManager:
 
     def write_tcr_samples(
         self, 
-        tcr_seq: np.ndarray, 
-        tcr_ids: np.ndarray, 
-        tcr_donor_ids: np.ndarray
+        tcr_seq: np.ndarray | list, 
+        tcr_ids: np.ndarray | list, 
+        tcr_donor_ids: np.ndarray | list
     ):
         """
         Write multiple TCR sequences, IDs, and donor IDs to a TFRecord file.
         Each TCR sequence and its corresponding donor IDs can have variable lengths.
         The method removes padding tokens before writing to save space.
         Args:
-            tcr_seq: Array of TCR sequences, shape (num_seqs, max_seq_len).
+            tcr_seq: Array of TCR sequences, shape (num_seqs, seq).
                     Each sequence is padded with pad_token to max_seq_len.
+                    If lists provided, no padding required.
             tcr_ids: Array of integer IDs, shape (num_seqs,).
             tcr_donor_ids: Array or list of variable-length donor ID arrays.
-                          Can be a 2D padded array (num_seqs, max_donors) or list of arrays.
+                          Can be a 2D padded array (num_seqs, donors) or list of arrays.
         Raises:
             AssertionError: If input shapes are inconsistent.
             ValueError: If tcr_path is not a single file path string.
@@ -140,8 +445,11 @@ class TCRFileManager:
             )
         
         # Validate input shapes
-        num_seqs = tcr_seq.shape[0]
-        assert tcr_seq.ndim == 2, f"tcr_seq must be 2D array, got shape {tcr_seq.shape}"
+        num_seqs = len(tcr_seq)
+        if isinstance(tcr_seq, np.ndarray):
+            assert tcr_seq.ndim == 2, f"tcr_seq must be 2D array, got shape {tcr_seq.shape}"
+        elif isinstance(tcr_seq, list):
+            assert isinstance(tcr_seq[0], list), f"tcr_seq must be a list of lists, got tcr_seq[0]--> {tcr_seq[0]}"
         assert len(tcr_ids) == num_seqs, (
             f"Shape mismatch: tcr_seq has {num_seqs} sequences "
             f"but tcr_ids has {len(tcr_ids)} IDs"
@@ -169,6 +477,7 @@ class TCRFileManager:
             for i in range(num_seqs):
                 # Remove padding from tcr_seq to store variable-length sequence
                 seq = tcr_seq[i]
+                seq = np.array(seq)
                 # Find actual sequence length (before padding)
                 actual_seq = seq[seq != self.pad_token]
                 
@@ -179,12 +488,12 @@ class TCRFileManager:
                     actual_donor_ids = donor_ids[donor_ids != self.pad_token]
                 else:
                     actual_donor_ids = tcr_donor_ids[i]
-                
+                actual_donor_ids = [int(j) for j in actual_donor_ids.split(';')]
                 # Serialize and write
                 serialized = self._tcr_serialize(
                     actual_seq, 
-                    tcr_ids[i], 
-                    actual_donor_ids
+                    np.array(tcr_ids[i]), 
+                    np.array(actual_donor_ids)
                 )
                 writer.write(serialized)
         
@@ -375,7 +684,8 @@ class Likelihood(keras.losses.Loss):
         self.pad_token = pad_token
         assert len(tf.shape(self.donor_mhc)) == 2, f'the shape of donor_mhc should be (donor, mhc_allele), found {tf.shape(donor_mhc)}'
         self.Na = tf.reduce_sum(self.donor_mhc, axis=0) #(A,)
-    def calculateLL(self, gamma, q, gamma_donor_id):
+
+    def call(self, gamma, q, gamma_donor_id):
         '''
         gamma: output of model. dimension (batch, mhc_allele) or (B,A)
         q: output of model. dimension (batch,)
@@ -428,3 +738,325 @@ class Likelihood(keras.losses.Loss):
         # apply mask
         pni = pni * gamma_donor_id_mask #(B, N_i)
         return pni
+    
+
+
+
+class TCRAlignmentPipeline:
+    """Pipeline for aligning TCR sequences using Profile HMM"""
+    
+    def __init__(self, output_dir: str = "tcr_alignment_output"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+        self.temp_dir = None
+        
+    def check_dependencies(self) -> bool:
+        """Check if required tools are installed"""
+        required_tools = {
+            'mmseqs': 'MMseqs2',
+            'mafft': 'MAFFT',
+            'hmmbuild': 'HMMER (hmmbuild)',
+            'hmmalign': 'HMMER (hmmalign)'
+        }
+        
+        missing = []
+        for tool, name in required_tools.items():
+            if shutil.which(tool) is None:
+                missing.append(name)
+        
+        if missing:
+            print("ERROR: Missing required tools:")
+            for tool in missing:
+                print(f"  - {tool}")
+            print("\nInstall with: conda install -c bioconda hmmer mafft mmseqs2")
+            return False
+        
+        print("✓ All required tools found")
+        return True
+    
+    def read_sequences_from_csv(self, csv_path: str, column_name: str) -> pd.DataFrame:
+        """Read sequences from CSV file"""
+        print(f"\n[1/6] Reading sequences from {csv_path}...")
+        
+        df = pd.read_csv(csv_path)
+        
+        if column_name not in df.columns:
+            raise ValueError(f"Column '{column_name}' not found. Available columns: {list(df.columns)}")
+        
+        # Remove duplicates and empty sequences
+        df = df[df[column_name].notna()].copy()
+        df[column_name] = df[column_name].str.strip()
+        df = df[df[column_name] != '']
+        
+        # Add sequence ID if not present
+        if 'seq_id' not in df.columns:
+            df['seq_id'] = [f"seq_{i}" for i in range(len(df))]
+        
+        print(f"  Found {len(df)} valid sequences")
+        df[column_name] = convert_protein_sequences_fast(df[column_name].tolist())
+        return df
+    
+    def write_fasta(self, df: pd.DataFrame, column_name: str, output_path: Path, id_column: str = 'tcr_id') -> None:
+        """Write sequences to FASTA format"""
+        with open(output_path, 'w') as f:
+            for idx, row in df.iterrows():
+                seq_id = 'seq_' + str(row[id_column])
+                sequence = row[column_name]
+                f.write(f">{seq_id}\n{sequence}\n")
+    
+    def cluster_sequences(self, input_fasta: Path, min_seq_id: float = 0.5, min_seq_cov=0.8, 
+                        sensitivity=7.5, gap_open=10, gap_extend=1, 
+                        alphabet_size=21, cluster_mode=0) -> Path:
+        """Cluster sequences using MMseqs2 to get redundancy-reduced set"""
+        print(f"\n[2/6] Clustering sequences (min identity: {min_seq_id}), min coverage {min_seq_cov}")
+        cluster_prefix = self.output_dir / "cluster"
+        tmp_dir = self.output_dir / "tmp"
+        tmp_dir.mkdir(exist_ok=True)
+        
+        cmd = [
+            'mmseqs', 'easy-cluster',
+            str(input_fasta),
+            str(cluster_prefix),
+            str(tmp_dir),
+            '--min-seq-id', str(min_seq_id),
+            '-c', str(min_seq_cov),
+            '--cov-mode', '1',  # CHANGED: coverage of target (more lenient for short seqs)
+            '-s', str(sensitivity),  # Max sensitivity for short sequences
+            '--gap-open', str(gap_open),  # Lower gap penalties
+            '--gap-extend', str(gap_extend),
+            '--alph-size', str(alphabet_size),
+            '--cluster-mode', str(cluster_mode),  # 0=SetCover (greedy), 2=Connected component
+            '--max-seqs', '1000',  # Consider more sequences per query
+            '-e', '100',  # IMPORTANT: Very permissive E-value for short sequences
+            '--alignment-mode', '3',  # 3=ungapped alignment can work better for very short seqs
+        ]
+        
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print(f"  Clustering complete")
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: MMseqs2 clustering failed")
+            print(e.stderr)
+            raise
+        
+        rep_seq_file = self.output_dir / "cluster_rep_seq.fasta"
+        if not rep_seq_file.exists():
+            raise FileNotFoundError(f"Expected output {rep_seq_file} not found")
+        
+        with open(rep_seq_file) as f:
+            n_reps = sum(1 for line in f if line.startswith('>'))
+        
+        total_seqs = sum(1 for line in open(input_fasta) if line.startswith('>'))
+        print(f"  {n_reps} representative sequences from {total_seqs} total ({100*n_reps/total_seqs:.1f}% retained)")
+        
+        return rep_seq_file
+    
+    def create_msa(self, input_fasta: Path) -> Path:
+        """Create Multiple Sequence Alignment using MAFFT"""
+        print("\n[3/6] Creating Multiple Sequence Alignment...")
+        
+        output_msa = self.output_dir / "msa_alignment.afa"
+        
+        cmd = [
+            'mafft',
+            '--auto',
+            '--quiet',
+            '--op', '5.0',
+            '--ep', '1.0',
+            str(input_fasta)]
+        
+        try:
+            with open(output_msa, 'w') as f:
+                result = subprocess.run(cmd, check=True, stdout=f, stderr=subprocess.PIPE, text=True)
+            print(f"  MSA created: {output_msa}")
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: MAFFT alignment failed")
+            print(e.stderr)
+            raise
+        
+        return output_msa
+    
+    def build_profile_hmm(self, msa_file: Path) -> Path:
+        """Build Profile HMM from MSA using HMMER"""
+        print("\n[4/6] Building Profile HMM...")
+        
+        hmm_file = self.output_dir / "tcr_profile.hmm"
+        
+        cmd = ['hmmbuild', '--amino', str(hmm_file), str(msa_file)]
+        
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print(f"  Profile HMM built: {hmm_file}")
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: hmmbuild failed")
+            print(e.stderr)
+            raise
+        
+        return hmm_file
+    
+    def align_to_profile(self, hmm_file: Path, sequences_fasta: Path) -> Path:
+        """Align all sequences to the profile HMM"""
+        print("\n[5/6] Aligning all sequences to Profile HMM...")
+        
+        aligned_file = self.output_dir / "aligned_sequences.sto"
+        
+        cmd = ['hmmalign', '-o', str(aligned_file), str(hmm_file), str(sequences_fasta)]
+        
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print(f"  Alignment complete: {aligned_file}")
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: hmmalign failed")
+            print(e.stderr)
+            raise
+        
+        return aligned_file
+    
+    def parse_stockholm_alignment(self, stockholm_file: Path) -> Tuple[List[str], List[str]]:
+        """Parse Stockholm format alignment file"""
+        print("\n[6/6] Parsing alignment...")
+        
+        sequences = {}
+        
+        with open(stockholm_file) as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and markup
+                if line.startswith('#') or line.startswith('//') or not line:
+                    continue
+                
+                parts = line.split()
+                if len(parts) == 2:
+                    seq_id, seq = parts
+                    if seq_id in sequences:
+                        sequences[seq_id] += seq
+                    else:
+                        sequences[seq_id] = seq
+        
+        seq_ids = list(sequences.keys())
+        aligned_seqs = list(sequences.values())
+        
+        print(f"  Parsed {len(seq_ids)} aligned sequences")
+        if aligned_seqs:
+            print(f"  Alignment length: {len(aligned_seqs[0])} positions")
+        
+        return seq_ids, aligned_seqs
+    
+    def save_aligned_sequences(self, seq_ids: List[str], aligned_seqs: List[str]) -> Path:
+        """Save aligned sequences in FASTA format"""
+        output_file = self.output_dir / "aligned_sequences.fasta"
+        
+        with open(output_file, 'w') as f:
+            for seq_id, seq in zip(seq_ids, aligned_seqs):
+                f.write(f">{seq_id}\n{seq}\n")
+        
+        print(f"\n✓ Aligned sequences saved: {output_file}")
+        return output_file
+    
+    def prepare_data_from_aln(self, seq_ids, aligned_seqs, tcr_df_donor):
+        """
+        Process aligned sequences and donor information, then save the results as JSON.
+        Outputs of parse_stockholm_alignment and read_sequences_from_csv.
+        """
+        CDRS = []
+        TCR_ID = []
+        DONOR_IDS = []
+        sep = PHYSICHE_STOCKHOLM_AA_to_IDX[';']
+        for seq_id, seq in zip(seq_ids, aligned_seqs):
+            cdr3 = []
+            tcr_id = int(seq_id.split('_')[-1])
+            for s in seq:
+                numeric = PHYSICHE_STOCKHOLM_AA_to_IDX[s]
+                cdr3.append(numeric)  # (S,)
+            row = tcr_df_donor[tcr_df_donor['tcr_id'] == tcr_id]
+            if row.empty:
+                print(f"Warning: No data found for tcr_id {tcr_id}")
+                continue
+            cdr1_str = str(row['cdr1'].iloc[0])
+            cdr2_str = str(row['cdr2'].iloc[0])
+            donor_id_val = str(row['id'].iloc[0])
+            donor_id_val = [int(i) for i in donor_id_val.split(';')]
+            if isinstance(cdr1_str, str):
+                cdr1 = [int(x) for x in cdr1_str.split(';') if x.strip()]
+            else:
+                cdr1 = []
+            if isinstance(cdr2_str, str):
+                cdr2 = [int(x) for x in cdr2_str.split(';') if x.strip()]
+            else:
+                cdr2 = []
+            # Concatenate CDR1 + separator + CDR2 + separator + CDR3
+            cdrs = cdr1 + [sep] + cdr2 + [sep] + cdr3
+            CDRS.append(cdrs)
+            TCR_ID.append(tcr_id)
+            DONOR_IDS.append(donor_id_val)
+        # --- Save outputs as JSON ---
+        output_path = Path(self.output_dir) / "aligned_tcr_data.json"
+        output_data = {
+            "CDRS": CDRS,
+            "TCR_ID": TCR_ID,
+            "DONOR_IDS": DONOR_IDS
+        }
+        # Convert NumPy types (if any) to Python native types before dumping
+        def to_native(obj):
+            if hasattr(obj, "tolist"):
+                return obj.tolist()
+            return obj
+        with open(output_path, "w") as f:
+            json.dump(output_data, f, indent=4, default=to_native)
+        print(f"Saved aligned data to {output_path}")
+        return CDRS, TCR_ID, DONOR_IDS
+
+    def run_pipeline(self, csv_path: str, column_name: str, min_seq_id: float = 0.9):
+        """Run the complete alignment pipeline"""
+        print("="*70)
+        print("TCR Sequence Alignment Pipeline")
+        print("="*70)
+        # Check dependencies
+        if not self.check_dependencies():
+            return None
+        try:
+            # Step 1: Read sequences
+            df = self.read_sequences_from_csv(csv_path, column_name)
+            
+            # Write to FASTA
+            input_fasta = self.output_dir / "input_sequences.fasta"
+            self.write_fasta(df, column_name, input_fasta)
+            
+            # Step 2: Cluster sequences
+            rep_fasta = self.cluster_sequences(input_fasta, min_seq_id)
+            
+            # Step 3: Create MSA
+            msa_file = self.create_msa(rep_fasta)
+            
+            # Step 4: Build Profile HMM
+            hmm_file = self.build_profile_hmm(msa_file)
+            
+            # Step 5: Align all sequences
+            aligned_stockholm = self.align_to_profile(hmm_file, input_fasta)
+            
+            # Step 6: Parse and save
+            seq_ids, aligned_seqs = self.parse_stockholm_alignment(aligned_stockholm)
+            output_fasta = self.save_aligned_sequences(seq_ids, aligned_seqs)
+            
+            print("\n" + "="*70)
+            print("Pipeline complete!")
+            print("="*70)
+            print(f"\nOutput files in: {self.output_dir}/")
+            print(f"  - Profile HMM: {hmm_file.name}")
+            print(f"  - Aligned sequences (Stockholm): {aligned_stockholm.name}")
+            print(f"  - Aligned sequences (FASTA): {output_fasta.name}")
+            
+            return {
+                'hmm_file': hmm_file,
+                'aligned_fasta': output_fasta,
+                'aligned_stockholm': aligned_stockholm,
+                'seq_ids': seq_ids,
+                'aligned_seqs': aligned_seqs
+            }
+            
+        except Exception as e:
+            print(f"\n✗ Pipeline failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
