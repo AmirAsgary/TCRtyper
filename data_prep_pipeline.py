@@ -1,8 +1,6 @@
-import test_utils
 import pandas as pd
 import numpy as np
 import os
-from importlib import reload
 import src
 from src import utils
 import json
@@ -10,7 +8,7 @@ import json
 output_dir = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022'
 relpath_input = 'data/dataproj/export_train_dataset_2025_11_17/'
 mhc_maximum_num = 358
-mhc_num_allele_thr = (10, 12)
+mhc_num_allele_thr = (10, 20)
 tcr_tsv_path_col = 'relpath_tcr'
 mhc_arr_path_col = 'relpath_mask'
 cdr1_col = 'cdr1aa_gapped'
