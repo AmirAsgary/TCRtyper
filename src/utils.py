@@ -88,6 +88,7 @@ class ReadAndPreprocess:
                  cdr3_col: str = 'cdr3_col',
                  cdr1_col: str = 'cdr1_col',
                  cdr2_col: str = 'cdr2_col',
+                 cdr2_5_col: str = 'cdr2.5_col',
                  id_col: str = 'id',
                  mhc_maximum_num: int = 200,
                  mhc_num_allele_thr: Union[List, Tuple] = (10, 12)):
@@ -104,6 +105,7 @@ class ReadAndPreprocess:
             cdr3_col: Column name in df specifying the CDR3 column name in TCR files (default: 'cdr3_col').
             cdr1_col: Column name in df specifying the CDR1 column name in TCR files (default: 'cdr1_col').
             cdr2_col: Column name in df specifying the CDR2 column name in TCR files (default: 'cdr2_col').
+            cdr2_5_col: Column name in df specifying the CDR2.5 column name in TCR files (default: 'cdr2.5_col').
             id_col: Column name for patient IDs in df (default: 'id'). If not present, IDs are auto-assigned.
             mhc_maximum_num: Expected number of MHC alleles in arrays (default: 200).
             mhc_num_allele_thr: Tuple of (min, max) number of alleles that should be present (default: (10, 12)).
@@ -128,14 +130,14 @@ class ReadAndPreprocess:
         else:
             df[id_col] = [str(i) for i in range(len(df))]
         # Handle CDR column name specifications
-        for i, cdr_col in zip(range(1, 4), [cdr1_col, cdr2_col, cdr3_col]):
+        for cdr_num, cdr_col in [(1, cdr1_col), (2, cdr2_col), (2.5, cdr2_5_col), (3, cdr3_col)]:
             if cdr_col in df.columns:
                 assert len(df[cdr_col].dropna()) == len(df), (
                     f"{cdr_col} column provided but contains missing values."
                 )
             else:
                 # Default CDR column names
-                df[cdr_col] = f'cdr{i}'
+                df[cdr_col] = f'cdr{cdr_num}'
         self.df = df
         self.csv_output_path = csv_output_path
         self.pad_token = pad_token
@@ -144,13 +146,16 @@ class ReadAndPreprocess:
         self.cdr3_col = cdr3_col
         self.cdr1_col = cdr1_col
         self.cdr2_col = cdr2_col
+        self.cdr2_5_col = cdr2_5_col
         self.id_col = id_col
         self.mhc_maximum_num = mhc_maximum_num
         self.mhc_num_allele_thr = mhc_num_allele_thr
-        self.get_idx = AMINO_ACID_IDX.get
+        gap_value = AMINO_ACID_IDX.get('-')
+        self.get_idx = lambda aa: AMINO_ACID_IDX.get(aa, gap_value)
     
     def read_tcr_df(self, path: str, cdr3_col: str = 'cdr3', 
-                    cdr2_col: str = 'cdr2', cdr1_col: str = 'cdr1') -> pd.DataFrame:
+                    cdr2_col: str = 'cdr2', cdr2_5_col: str = 'cdr2.5', 
+                    cdr1_col: str = 'cdr1') -> pd.DataFrame:
         """
         Read TCR (T-cell receptor) data from a CSV or TSV file.
         
@@ -158,6 +163,7 @@ class ReadAndPreprocess:
             path: Path to the TCR data file.
             cdr3_col: Name of the CDR3 sequence column (default: 'cdr3').
             cdr2_col: Name of the CDR2 sequence column (default: 'cdr2').
+            cdr2_5_col: Name of the CDR2.5 sequence column (default: 'cdr2.5').
             cdr1_col: Name of the CDR1 sequence column (default: 'cdr1').
             
         Returns:
@@ -167,12 +173,12 @@ class ReadAndPreprocess:
             AssertionError: If required columns are missing or dataframe is empty.
         """
         tcr_df = pd.read_csv(path)
-        if not all(col in tcr_df.columns for col in [cdr3_col, cdr2_col, cdr1_col]):
+        if not all(col in tcr_df.columns for col in [cdr3_col, cdr2_col, cdr2_5_col, cdr1_col]):
             tcr_df = pd.read_csv(path, sep='\t')
         
         # Validate required columns exist
-        assert all(col in tcr_df.columns for col in [cdr3_col, cdr2_col, cdr1_col]), (
-            f"Required columns {[cdr3_col, cdr2_col, cdr1_col]} not found. "
+        assert all(col in tcr_df.columns for col in [cdr3_col, cdr2_col, cdr2_5_col, cdr1_col]), (
+            f"Required columns {[cdr3_col, cdr2_col, cdr2_5_col, cdr1_col]} not found. "
             f"Available columns: {tcr_df.columns.tolist()}"
         )
         
@@ -183,11 +189,12 @@ class ReadAndPreprocess:
         
         return tcr_df
     
-    def read_mhc_arr(self, path: str) -> np.ndarray:
+    def read_mhc_arr(self, path: str, easy_mode: bool = True) -> np.ndarray:
         """
         Read and validate MHC (Major Histocompatibility Complex) array from .npy file.
         Args:
             path: Path to the .npy file containing MHC array.
+            easy_mode: If True, excludes patients where their HLAs are less thatn defined limit by self.mhc_num_allele_thr.
         Returns:
             Validated MHC array as numpy ndarray.
         Raises:
@@ -206,11 +213,16 @@ class ReadAndPreprocess:
         )
         # Validate number of present alleles (1s)
         allele_sum = np.sum(arr)
-        assert self.mhc_num_allele_thr[0] <= allele_sum <= self.mhc_num_allele_thr[1], (
-            f"Expected between {self.mhc_num_allele_thr[0]} and {self.mhc_num_allele_thr[1]} "
-            f"alleles to be present, found {allele_sum}"
-        )
-        return arr
+        if easy_mode:
+            if not self.mhc_num_allele_thr[0] <= allele_sum <= self.mhc_num_allele_thr[1]:
+                return arr, False
+        else:
+            assert self.mhc_num_allele_thr[0] <= allele_sum <= self.mhc_num_allele_thr[1], (
+                f"Expected between {self.mhc_num_allele_thr[0]} and {self.mhc_num_allele_thr[1]} "
+                f"alleles to be present, found {allele_sum}"
+                f"File {path}"
+            )
+        return arr, True
     
     def assign_patient_ids_to_tcrs(self, tcr_data: pd.DataFrame, 
                                    separator: str = ';', 
@@ -222,13 +234,13 @@ class ReadAndPreprocess:
         Args:
             tcr_data: DataFrame containing TCR sequences and patient IDs.
             separator: String to join multiple patient IDs (default: ';').
-            cdr_columns: List of CDR column names to group by (default: ['cdr1', 'cdr2', 'cdr3']).
+            cdr_columns: List of CDR column names to group by (default: ['cdr1', 'cdr2', 'cdr2.5', 'cdr3']).
             
         Returns:
             DataFrame with unique TCR sequences and aggregated patient IDs.
         """
         if cdr_columns is None:
-            cdr_columns = ['cdr1', 'cdr2', 'cdr3']
+            cdr_columns = ['cdr1', 'cdr2', 'cdr2.5', 'cdr3']
         
         result = tcr_data.groupby(cdr_columns, as_index=False, sort=False).agg({
             self.id_col: lambda x: separator.join(sorted(set(map(str, x))))
@@ -256,6 +268,7 @@ class ReadAndPreprocess:
     
     def call(self, sequence_mapping: bool = False, 
              cdr2_sequence: bool = False, 
+             cdr2_5_sequence: bool = False,
              cdr1_sequence: bool = False) -> None:
         """
         Main processing pipeline: read, validate, map, and save TCR and MHC data.
@@ -269,6 +282,7 @@ class ReadAndPreprocess:
         Args:
             sequence_mapping: If True, map CDR3 sequences to numeric representation (default: False).
             cdr2_sequence: If True, also map CDR2 sequences (requires sequence_mapping=True).
+            cdr2_5_sequence: If True, also map CDR2.5 sequences (requires sequence_mapping=True).
             cdr1_sequence: If True, also map CDR1 sequences (requires sequence_mapping=True).
         """
         # Create output directory
@@ -278,33 +292,43 @@ class ReadAndPreprocess:
         tcr_seq_path = os.path.join(self.csv_output_path, 'tcr_seq.csv')
         tcr_donor_ids_path = os.path.join(self.csv_output_path, 'tcr_donor_ids.csv')
         donor_mhc_arr_path = os.path.join(self.csv_output_path, 'donor_mhc.npz')
+        patients_processed_path = os.path.join(self.csv_output_path, 'patients_remained_index.csv')
+        petients_faulty_path = os.path.join(self.csv_output_path, 'petients_faulty_removed.csv')
         
         # Collect all data
         mhc_arrays = []
         patient_ids = []
         all_tcr_dfs = []
-        
+        #TODO add the below lists
+        patients_processed = [] # updates self.df and keeps only patients that are passing all the tests.
+        patients_faulty = [] 
         # Use itertuples for better performance than iterrows
         for row in self.df.itertuples(index=False):
             patient_id = getattr(row, self.id_col)
-            cdr3_col = getattr(row, self.cdr3_col)
-            cdr2_col = getattr(row, self.cdr2_col)
-            cdr1_col = getattr(row, self.cdr1_col)
+            cdr3_col = getattr(row, self.cdr3_col, self.cdr3_col)
+            cdr2_col = getattr(row, self.cdr2_col, self.cdr2_col)
+            cdr2_5_col = getattr(row, self.cdr2_5_col, self.cdr2_5_col)
+            cdr1_col = getattr(row, self.cdr1_col, self.cdr1_col)
             tcr_path = getattr(row, self.tcr_tsv_path)
             mhc_path = getattr(row, self.mhc_arr_path)
             
             # Read TCR data
-            tcr_df = self.read_tcr_df(tcr_path, cdr3_col, cdr2_col, cdr1_col)
+            tcr_df = self.read_tcr_df(tcr_path, cdr3_col, cdr2_col, cdr2_5_col, cdr1_col)
             
             # Read MHC array
-            mhc_arr = self.read_mhc_arr(mhc_path)
+            mhc_arr, mhc_state = self.read_mhc_arr(mhc_path)
+            if mhc_state == False:
+                patients_faulty.append(row._asdict)
+                continue
+            patients_processed.append(row._asdict())
             mhc_arrays.append(mhc_arr)
             patient_ids.append(patient_id)
             # Add patient ID column and rename CDR columns to standard names
             tcr_df[self.id_col] = patient_id
             tcr_df = tcr_df.rename(columns={
                 cdr3_col: 'cdr3', 
-                cdr2_col: 'cdr2', 
+                cdr2_col: 'cdr2',
+                cdr2_5_col: 'cdr2.5',
                 cdr1_col: 'cdr1'
             })
             # sequence mapping
@@ -314,6 +338,8 @@ class ReadAndPreprocess:
                     cols_to_map.append('cdr1')
                 if cdr2_sequence:
                     cols_to_map.append('cdr2')
+                if cdr2_5_sequence:
+                    cols_to_map.append('cdr2.5')
                 
                 self.map_df_to_num(tcr_df, cols_to_map)
             
@@ -333,6 +359,12 @@ class ReadAndPreprocess:
         tcr_aggregated['tcr_id'] = range(len(tcr_aggregated))
         tcr_aggregated.to_csv(tcr_donor_ids_path, index=False)
         
+        if len(patients_faulty) > 0:
+            patients_faulty = pd.concat(patients_faulty)
+            patients_faulty.to_csv(patients_processed_path)
+        if len(patients_processed) > 0:
+            patients_processed = pc.concat(patients_processed)
+            patients_processed.to_csv(patients_processed_path)
         print(f"Processing complete!")
         print(f"  - TCR sequences saved to: {tcr_seq_path}")
         print(f"  - Aggregated TCR-patient IDs saved to: {tcr_donor_ids_path}")
@@ -859,10 +891,11 @@ class TCRAlignmentPipeline:
         
         cmd = [
             'mafft',
-            '--auto',
+            '--retree', '1',
             '--quiet',
-            '--op', '5.0',
-            '--ep', '1.0',
+            '--op', '11.0',
+            '--ep', '10.0',
+            '--thread', '-1',
             str(input_fasta)]
         
         try:

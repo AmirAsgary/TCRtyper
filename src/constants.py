@@ -3,6 +3,7 @@ aa_order = list("ARNDCEQGHILKMFPSTWYVX")
 AMINO_ACIDS = 'ARNDCEQGHILKMFPSTWYVX'
 AMINO_ACID_IDX = dict(zip(AMINO_ACIDS, range(len(AMINO_ACIDS))))
 
+
 one_hot_encoding_scalar = {'ALA': 0,
     'ARG': 1,
     'ASN': 2,
