@@ -8,6 +8,7 @@ import os
 import subprocess
 from pathlib import Path
 import shutil
+import re
 import json
 
 
@@ -15,6 +16,8 @@ import json
 aa_order = list("ARNDCEQGHILKMFPSTWYVX")
 AMINO_ACIDS = ''.join(aa_order)
 AMINO_ACID_IDX = {aa: i for i, aa in enumerate(AMINO_ACIDS)}
+AMINO_ACID_IDX['.'] = AMINO_ACID_IDX['X']
+AMINO_ACID_IDX['-'] = AMINO_ACID_IDX['X']
 encode_table = str.maketrans({aa: chr(i) for aa, i in AMINO_ACID_IDX.items()})
 decode_table = str.maketrans({chr(i): aa for aa, i in AMINO_ACID_IDX.items()})
 
@@ -318,7 +321,7 @@ class ReadAndPreprocess:
             # Read MHC array
             mhc_arr, mhc_state = self.read_mhc_arr(mhc_path)
             if mhc_state == False:
-                patients_faulty.append(row._asdict)
+                patients_faulty.append(row._asdict())
                 continue
             patients_processed.append(row._asdict())
             mhc_arrays.append(mhc_arr)
@@ -347,7 +350,7 @@ class ReadAndPreprocess:
         
         # Concatenate all TCR dataframes and save (more efficient than appending)
         combined_tcr_df = pd.concat(all_tcr_dfs, ignore_index=True)
-        combined_tcr_df.to_csv(tcr_seq_path, index=False)
+        #combined_tcr_df.to_csv(tcr_seq_path, index=False)
         
         # Stack MHC arrays and save with patient IDs
         mhc_array_stacked = np.stack(mhc_arrays, axis=0)
@@ -359,12 +362,19 @@ class ReadAndPreprocess:
         tcr_aggregated['tcr_id'] = range(len(tcr_aggregated))
         tcr_aggregated.to_csv(tcr_donor_ids_path, index=False)
         
+        # merge and assign tcr ids from tcr_aggregated to combined tcr df.
+        # the first would have one row for each tcr and all patient ids are in one column
+        # the second would have for each patient id, all tcrs that it has, so they are just compressed and uncompressed forms of each other
+        combined_tcr_df = combined_tcr_df.merge(tcr_aggregated, on=['cdr1', 'cdr2', 'cdr3', 'cdr2.5'], how='left')
+        combined_tcr_df.to_csv(tcr_seq_path, index=False)
+
         if len(patients_faulty) > 0:
-            patients_faulty = pd.concat(patients_faulty)
-            patients_faulty.to_csv(patients_processed_path)
+            patients_faulty_df = pd.DataFrame(patients_faulty)
+            patients_faulty_df.to_csv(petients_faulty_path, index=False)  
         if len(patients_processed) > 0:
-            patients_processed = pc.concat(patients_processed)
-            patients_processed.to_csv(patients_processed_path)
+            patients_processed_df = pd.DataFrame(patients_processed)
+            patients_processed_df.to_csv(patients_processed_path, index=False)  #
+        else: raise ValueError(f'expected remained patients, found none')
         print(f"Processing complete!")
         print(f"  - TCR sequences saved to: {tcr_seq_path}")
         print(f"  - Aggregated TCR-patient IDs saved to: {tcr_donor_ids_path}")
@@ -1093,3 +1103,358 @@ class TCRAlignmentPipeline:
             traceback.print_exc()
             return None
 
+
+class CrossValGen():
+    """
+    Generates cross-validation splits for TCR data, ensuring patient-level separation.
+    Handles both dataset-wise and random patient-wise split strategies.
+    """
+    
+    def __init__(self, patient_index_path, tcr_donor_id_path, output_path, 
+                 datasetwise=True, random_patient_wise=True, K=5):
+        """
+        Args:
+            patient_index_path: Path to patient metadata (sample_id, dataset)
+            tcr_donor_id_path: Path to TCR data (cdr1-3, cdr2.5, sample_id, tcr_id)
+            output_path: Directory for saving train/test splits
+            datasetwise: Generate dataset-wise splits (leave-one-dataset-out)
+            random_patient_wise: Generate random K-fold patient-wise splits
+            K: Number of folds for random patient-wise CV
+        """
+        self.patient_index_path = patient_index_path
+        self.tcr_donor_id_path = tcr_donor_id_path
+        self.output_path = output_path
+        self.datasetwise = datasetwise
+        self.random_patient_wise = random_patient_wise
+        self.K = K
+    
+    def call(self):
+        """Execute cross-validation split generation."""
+        print(f"Loading patient index from: {self.patient_index_path}")
+        patient_index = pd.read_csv(self.patient_index_path) if self.patient_index_path.endswith('.csv') else pd.read_csv(self.patient_index_path, sep='\t')
+        print(f"  → Loaded {len(patient_index)} patients")
+        
+        print(f"Loading TCR data from: {self.tcr_donor_id_path}")
+        tcr_donor_id = pd.read_csv(self.tcr_donor_id_path) if self.tcr_donor_id_path.endswith('.csv') else pd.read_csv(self.tcr_donor_id_path, sep='\t')
+        print(f"  → Loaded {len(tcr_donor_id)} TCR sequences\n")
+        
+        output = []
+        if self.datasetwise:
+            print("=" * 60)
+            print("DATASET-WISE CROSS-VALIDATION")
+            print("=" * 60)
+            datasetwise_dict = self.DatasetWise(patient_index, tcr_donor_id)
+            output.append(datasetwise_dict)
+            
+        if self.random_patient_wise:
+            print("\n" + "=" * 60)
+            print("RANDOM PATIENT-WISE CROSS-VALIDATION")
+            print("=" * 60)
+            patientwise_dict = self.RandomPatientWise(patient_index, tcr_donor_id)
+            output.append(patientwise_dict)
+            
+        assert len(output) != 0
+        print("\n" + "=" * 60)
+        print("✓ Cross-validation generation completed successfully")
+        print("=" * 60)
+        return output
+            
+    def DatasetWise(self, patient_index, tcr_donor_id):
+        """Leave-one-dataset-out cross-validation."""
+        datasets = np.unique(patient_index.dataset.tolist())
+        datasets = [str(d) for d in datasets]
+        print(f"Found {len(datasets)} datasets: {datasets}\n")
+        
+        DICT = {}
+        outdir = os.path.join(self.output_path, 'datasetwise')
+        os.makedirs(outdir, exist_ok=True)
+        
+        for number, dataset in enumerate(datasets):
+            print(f"Fold {number+1}/{len(datasets)}: Validation on dataset '{dataset}'")
+            pid = patient_index[patient_index['dataset'] == dataset]['sample_id'].tolist()
+            print(f"  → {len(pid)} validation patients")
+            
+            train_tcr_donor, validation_df, included, excluded = self.iterate_and_create(pid, tcr_donor_id)
+            
+            print(f"  → Train: {len(train_tcr_donor)} TCRs | Test: {len(validation_df)} TCRs")
+            print(f"  → Public: {len(included)} TCRs | Private: {len(excluded)} TCRs\n")
+            
+            DICT[f'{number}'] = {
+                'patient_ids': pid, 
+                'included_tcr_ids': included,
+                'excluded_tcr_ids': excluded,
+                'validation_set': [str(dataset)], 
+                'training_set': [i for i in datasets if i != dataset]
+            }
+            
+            assert len(train_tcr_donor) != 0
+            assert len(validation_df) != 0
+            
+            train_tcr_donor.to_csv(os.path.join(outdir, f'train{number}.csv'), index=False)
+            validation_df.to_csv(os.path.join(outdir, f'test{number}.csv'), index=False)
+            
+        with open(os.path.join(outdir, 'info.json'), 'w') as f:
+            json.dump(DICT, f)
+        print(f"✓ Saved dataset-wise splits to: {outdir}")
+        return DICT
+
+    def RandomPatientWise(self, patient_index, tcr_donor_id):
+        """Random K-fold patient-wise cross-validation."""
+        sampleids = np.unique(patient_index.sample_id.tolist())
+        np.random.shuffle(sampleids)
+        valsize = len(sampleids) // self.K
+        print(f"Generating {self.K}-fold CV with ~{valsize} patients per fold\n")
+        
+        outdir = os.path.join(self.output_path, 'randompatientwise')
+        os.makedirs(outdir, exist_ok=True)
+        
+        DICT = {}
+        sampleids = [int(i) for i in sampleids]
+        
+        for k in range(self.K):
+            print(f"Fold {k+1}/{self.K}")
+            pid = sampleids[int(valsize*k):int(valsize*(k+1))]
+            print(f"  → {len(pid)} validation patients")
+            
+            train_tcr_donor, validation_df, included, excluded = self.iterate_and_create(pid, tcr_donor_id)
+            
+            print(f"  → Train: {len(train_tcr_donor)} TCRs | Test: {len(validation_df)} TCRs")
+            print(f"  → Public: {len(included)} TCRs | Private: {len(excluded)} TCRs\n")
+            
+            DICT[f'{k}'] = {
+                'patient_ids': pid, 
+                'included_tcr_ids': included, 
+                'excluded_tcr_ids': excluded
+            }
+            
+            assert len(train_tcr_donor) != 0
+            train_tcr_donor.to_csv(os.path.join(outdir, f'train{k}.csv'), index=False)
+            validation_df.to_csv(os.path.join(outdir, f'test{k}.csv'), index=False)
+            
+        with open(os.path.join(outdir, 'info.json'), 'w') as f:
+            json.dump(DICT, f)
+        print(f"✓ Saved patient-wise splits to: {outdir}")
+        return DICT
+
+    def iterate_and_create(self, sample_ids, tcr_donor_id):
+        """
+        Remove validation patients from training data.
+        
+        Returns:
+            train_df: Training data with validation patients removed
+            validation_df: Validation data
+            included: TCR IDs that remain in training (public/shared)
+            excluded: TCR IDs removed from training (private/unique to validation patients)
+        """
+        INCLUDED = []
+        EXCLUDED = []
+        validation_df = []
+        
+        for idx, sample_id in enumerate(sample_ids, 1):
+            if idx % 10 == 0 or idx == len(sample_ids):
+                print(f"    Processing patient {idx}/{len(sample_ids)}", end='\r')
+            
+            sample_id_str = str(sample_id)
+            pattern = re.compile(f'(^|;){re.escape(sample_id_str)}(;|$)')
+            
+            mask = tcr_donor_id['sample_id'].astype(str).str.contains(pattern, regex=True, na=False)
+            assert mask.any(), f'Sample ID {sample_id} not found in data'
+            
+            affected = tcr_donor_id[mask].copy()
+            unaffected = tcr_donor_id[~mask].copy()
+            
+            affected_train = affected.copy()
+            affected_test = affected.copy()
+            
+            def exclude_sample_id(sample_id_col):
+                sample_ids_list = sample_id_col.split(';')
+                remaining = [sid for sid in sample_ids_list if sid != sample_id_str]
+                return ';'.join(remaining) if remaining else None
+            
+            affected_train['sample_id'] = affected['sample_id'].apply(exclude_sample_id)
+            affected_test['sample_id'] = sample_id_str
+            
+            affected_included = affected_train[affected_train['sample_id'].notna()]
+            affected_excluded = affected_train[affected_train['sample_id'].isna()]
+            
+            tcr_donor_id = pd.concat([affected_included, unaffected], ignore_index=True)
+            
+            INCLUDED += affected_included.tcr_id.tolist()
+            EXCLUDED += affected_excluded.tcr_id.tolist()
+            validation_df.append(affected_test)
+        
+        print()  # New line after progress
+        
+        EXCLUDED = np.unique(EXCLUDED)
+        INCLUDED = np.unique(INCLUDED)
+        INCLUDED = INCLUDED[~np.isin(INCLUDED, EXCLUDED)]
+        
+        validation_df = pd.concat(validation_df, ignore_index=True)
+        validation_df.drop_duplicates(inplace=True)
+        validation_df = (
+            validation_df.groupby(['cdr1', 'cdr2', 'cdr3', 'cdr2.5'])['sample_id']
+            .agg(lambda x: ';'.join(x.astype(str)))
+            .reset_index()
+        )
+        
+        return (tcr_donor_id, validation_df, INCLUDED.tolist(), EXCLUDED.tolist())    """
+    Generates cross-validation splits for TCR data, ensuring patient-level separation.
+    Handles both dataset-wise and random patient-wise split strategies.
+    """
+    
+    def __init__(self, patient_index_path, tcr_donor_id_path, output_path, 
+                 datasetwise=True, random_patient_wise=True, K=5):
+        """
+        Args:
+            patient_index_path: Path to patient metadata (sample_id, dataset)
+            tcr_donor_id_path: Path to TCR data (cdr1-3, cdr2.5, sample_id, tcr_id)
+            output_path: Directory for saving train/test splits
+            datasetwise: Generate dataset-wise splits (leave-one-dataset-out)
+            random_patient_wise: Generate random K-fold patient-wise splits
+            K: Number of folds for random patient-wise CV
+        """
+        self.patient_index_path = patient_index_path
+        self.tcr_donor_id_path = tcr_donor_id_path
+        self.output_path = output_path
+        self.datasetwise = datasetwise
+        self.random_patient_wise = random_patient_wise
+        self.K = K
+    
+    def call(self):
+        """Execute cross-validation split generation."""
+        patient_index = pd.read_csv(self.patient_index_path) if self.patient_index_path.endswith('.csv') else pd.read_csv(self.patient_index_path, sep='\t')
+        tcr_donor_id = pd.read_csv(self.tcr_donor_id_path) if self.tcr_donor_id_path.endswith('.csv') else pd.read_csv(self.tcr_donor_id_path, sep='\t')
+        output = []
+        if self.datasetwise:
+            datasetwise_dict = self.DatasetWise(patient_index, tcr_donor_id)
+            output.append(datasetwise_dict)
+        if self.random_patient_wise:
+            patientwise_dict = self.RandomPatientWise(patient_index, tcr_donor_id)
+            output.append(patientwise_dict)
+        assert len(output) != 0
+        return output
+            
+    def DatasetWise(self, patient_index, tcr_donor_id):
+        """Leave-one-dataset-out cross-validation."""
+        datasets = np.unique(patient_index.dataset.tolist())
+        datasets = [str(d) for d in datasets]
+        
+        DICT = {}
+        outdir = os.path.join(self.output_path, 'datasetwise')
+        os.makedirs(outdir, exist_ok=True)
+        
+        for number, dataset in enumerate(datasets):
+            pid = patient_index[patient_index['dataset'] == dataset]['sample_id'].tolist()
+            train_tcr_donor, validation_df, included, excluded = self.iterate_and_create(pid, tcr_donor_id)
+            
+            DICT[f'{number}'] = {
+                'patient_ids': pid, 
+                'included_tcr_ids': included,  # Public TCRs (remain in training)
+                'excluded_tcr_ids': excluded,  # Private TCRs (removed from training)
+                'validation_set': [str(dataset)], 
+                'training_set': [i for i in datasets if i != dataset]
+            }
+            
+            assert len(train_tcr_donor) != 0
+            assert len(validation_df) != 0
+            
+            train_tcr_donor.to_csv(os.path.join(outdir, f'train{number}.csv'), index=False)
+            validation_df.to_csv(os.path.join(outdir, f'test{number}.csv'), index=False)
+            
+        with open(os.path.join(outdir, 'info.json'), 'w') as f:
+            json.dump(DICT, f)
+        return DICT
+
+    def RandomPatientWise(self, patient_index, tcr_donor_id):
+        """Random K-fold patient-wise cross-validation."""
+        sampleids = np.unique(patient_index.sample_id.tolist())
+        np.random.shuffle(sampleids)
+        valsize = len(sampleids) // self.K
+        
+        outdir = os.path.join(self.output_path, 'randompatientwise')
+        os.makedirs(outdir, exist_ok=True)
+        
+        DICT = {}
+        sampleids = [int(i) for i in sampleids]
+        
+        for k in range(self.K):
+            pid = sampleids[int(valsize*k):int(valsize*(k+1))]
+            train_tcr_donor, validation_df, included, excluded = self.iterate_and_create(pid, tcr_donor_id)
+            
+            DICT[f'{k}'] = {
+                'patient_ids': pid, 
+                'included_tcr_ids': included, 
+                'excluded_tcr_ids': excluded
+            }
+            
+            assert len(train_tcr_donor) != 0
+            train_tcr_donor.to_csv(os.path.join(outdir, f'train{k}.csv'), index=False)
+            validation_df.to_csv(os.path.join(outdir, f'test{k}.csv'), index=False)
+            
+        with open(os.path.join(outdir, 'info.json'), 'w') as f:
+            json.dump(DICT, f)
+        return DICT
+
+    def iterate_and_create(self, sample_ids, tcr_donor_id):
+        """
+        Remove validation patients from training data.
+        
+        Returns:
+            train_df: Training data with validation patients removed
+            validation_df: Validation data
+            included: TCR IDs that remain in training (public/shared)
+            excluded: TCR IDs removed from training (private/unique to validation patients)
+        """
+        INCLUDED = []
+        EXCLUDED = []
+        validation_df = []
+        
+        for sample_id in sample_ids:
+            sample_id_str = str(sample_id)
+            pattern = re.compile(f'(^|;){re.escape(sample_id_str)}(;|$)')
+            
+            mask = tcr_donor_id['sample_id'].astype(str).str.contains(pattern, regex=True, na=False)
+            assert mask.any(), f'Sample ID {sample_id} not found in data'
+            
+            affected = tcr_donor_id[mask].copy()
+            unaffected = tcr_donor_id[~mask].copy()
+            
+            affected_train = affected.copy()
+            affected_test = affected.copy()
+            
+            # Remove sample_id from training data
+            def exclude_sample_id(sample_id_col):
+                sample_ids_list = sample_id_col.split(';')
+                remaining = [sid for sid in sample_ids_list if sid != sample_id_str]
+                return ';'.join(remaining) if remaining else None
+            
+            affected_train['sample_id'] = affected['sample_id'].apply(exclude_sample_id)
+            affected_test['sample_id'] = sample_id_str  # Validation data keeps only this sample_id
+            
+            # Separate included (shared TCRs) vs excluded (private TCRs)
+            affected_included = affected_train[affected_train['sample_id'].notna()]
+            affected_excluded = affected_train[affected_train['sample_id'].isna()]
+            
+            # Update training data
+            tcr_donor_id = pd.concat([affected_included, unaffected], ignore_index=True)
+            
+            INCLUDED += affected_included.tcr_id.tolist()
+            EXCLUDED += affected_excluded.tcr_id.tolist()
+            validation_df.append(affected_test)
+        
+        EXCLUDED = np.unique(EXCLUDED)
+        INCLUDED = np.unique(INCLUDED)
+        
+        # Remove TCRs that ended up excluded from included list
+        INCLUDED = INCLUDED[~np.isin(INCLUDED, EXCLUDED)]
+        
+        # Aggregate validation data
+        validation_df = pd.concat(validation_df, ignore_index=True)
+        validation_df.drop_duplicates(inplace=True)
+        validation_df = (
+            validation_df.groupby(['cdr1', 'cdr2', 'cdr3', 'cdr2.5'])['sample_id']
+            .agg(lambda x: ';'.join(x.astype(str)))
+            .reset_index()
+        )
+        
+        return (tcr_donor_id, validation_df, INCLUDED.tolist(), EXCLUDED.tolist())
