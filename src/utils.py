@@ -365,7 +365,7 @@ class ReadAndPreprocess:
         # merge and assign tcr ids from tcr_aggregated to combined tcr df.
         # the first would have one row for each tcr and all patient ids are in one column
         # the second would have for each patient id, all tcrs that it has, so they are just compressed and uncompressed forms of each other
-        combined_tcr_df = combined_tcr_df.merge(tcr_aggregated, on=['cdr1', 'cdr2', 'cdr3', 'cdr2.5'], how='left')
+        combined_tcr_df = combined_tcr_df.merge(tcr_aggregated[['cdr1', 'cdr2', 'cdr3', 'cdr2.5', 'tcr_id']], on=['cdr1', 'cdr2', 'cdr3', 'cdr2.5'], how='left')
         combined_tcr_df.to_csv(tcr_seq_path, index=False)
 
         if len(patients_faulty) > 0:
@@ -1238,63 +1238,252 @@ class CrossValGen():
 
     def iterate_and_create(self, sample_ids, tcr_donor_id):
         """
-        Remove validation patients from training data.
-        
+        Remove validation patients from training data (VECTORIZED VERSION).
         Returns:
             train_df: Training data with validation patients removed
             validation_df: Validation data
             included: TCR IDs that remain in training (public/shared)
             excluded: TCR IDs removed from training (private/unique to validation patients)
         """
-        INCLUDED = []
-        EXCLUDED = []
-        validation_df = []
+        import time
+        start = time.time()
+        print(f"    Processing {len(sample_ids)} validation patients from {len(tcr_donor_id):,} TCRs...")
         
-        for idx, sample_id in enumerate(sample_ids, 1):
-            if idx % 10 == 0 or idx == len(sample_ids):
-                print(f"    Processing patient {idx}/{len(sample_ids)}", end='\r')
-            
-            sample_id_str = str(sample_id)
-            pattern = re.compile(f'(^|;){re.escape(sample_id_str)}(;|$)')
-            
-            mask = tcr_donor_id['sample_id'].astype(str).str.contains(pattern, regex=True, na=False)
-            assert mask.any(), f'Sample ID {sample_id} not found in data'
-            
-            affected = tcr_donor_id[mask].copy()
-            unaffected = tcr_donor_id[~mask].copy()
-            
-            affected_train = affected.copy()
-            affected_test = affected.copy()
-            
-            def exclude_sample_id(sample_id_col):
-                sample_ids_list = sample_id_col.split(';')
-                remaining = [sid for sid in sample_ids_list if sid != sample_id_str]
-                return ';'.join(remaining) if remaining else None
-            
-            affected_train['sample_id'] = affected['sample_id'].apply(exclude_sample_id)
-            affected_test['sample_id'] = sample_id_str
-            
-            affected_included = affected_train[affected_train['sample_id'].notna()]
-            affected_excluded = affected_train[affected_train['sample_id'].isna()]
-            
-            tcr_donor_id = pd.concat([affected_included, unaffected], ignore_index=True)
-            
-            INCLUDED += affected_included.tcr_id.tolist()
-            EXCLUDED += affected_excluded.tcr_id.tolist()
-            validation_df.append(affected_test)
+        val_sample_ids = set(str(sid) for sid in sample_ids)
         
-        print()  # New line after progress
+        # Create single regex pattern
+        escaped_ids = [re.escape(str(sid)) for sid in sample_ids]
+        pattern = '(?:^|;)(?:' + '|'.join(escaped_ids) + ')(?:;|$)'
         
-        EXCLUDED = np.unique(EXCLUDED)
-        INCLUDED = np.unique(INCLUDED)
-        INCLUDED = INCLUDED[~np.isin(INCLUDED, EXCLUDED)]
+        print(f"    → Identifying affected rows...")
+        affected_mask = tcr_donor_id['sample_id'].astype(str).str.contains(pattern, regex=True, na=False)
         
-        validation_df = pd.concat(validation_df, ignore_index=True)
-        validation_df.drop_duplicates(inplace=True)
+        num_affected = affected_mask.sum()
+        print(f"    → Found {num_affected:,} affected TCRs ({num_affected/len(tcr_donor_id)*100:.2f}%)")
+        
+        if num_affected == 0:
+            return (tcr_donor_id.copy(), pd.DataFrame(), [], [])
+        
+        affected = tcr_donor_id[affected_mask].copy()
+        unaffected = tcr_donor_id[~affected_mask]
+        
+        print(f"    → Processing affected rows...")
+        affected['sample_id_list'] = affected['sample_id'].str.split(';')
+        
+        # Vectorized filtering
+        def filter_samples(sample_list):
+            remaining = [sid for sid in sample_list if sid not in val_sample_ids]
+            val_only = [sid for sid in sample_list if sid in val_sample_ids]
+            return pd.Series({'remaining': remaining, 'val_samples': val_only})
+        
+        filtered = affected['sample_id_list'].apply(filter_samples)
+        affected['remaining'] = filtered['remaining']
+        affected['val_samples'] = filtered['val_samples']
+        
+        # Determine included vs excluded
+        affected['has_remaining'] = affected['remaining'].apply(len) > 0
+        included_mask = affected['has_remaining']
+        
+        included = affected[included_mask].copy()
+        excluded = affected[~included_mask].copy()
+        
+        print(f"    → Public TCRs: {len(included):,} | Private TCRs: {len(excluded):,}")
+        
+        # Update sample_id for included rows
+        included['sample_id'] = included['remaining'].apply(lambda x: ';'.join(x))
+        included = included.drop(columns=['sample_id_list', 'remaining', 'val_samples', 'has_remaining'])
+        
+        # Build training dataframe
+        print(f"    → Building training set...")
+        train_df = pd.concat([unaffected, included], ignore_index=True)
+        
+        # Build validation dataframe - EFFICIENT VERSION using explode()
+        print(f"    → Building validation set...")
+        
+        # Keep only necessary columns and explode val_samples
+        val_df = affected[['cdr1', 'cdr2', 'cdr3', 'cdr2.5', 'val_samples']].copy()
+        
+        # Use pandas explode (vectorized, much faster than iterrows)
+        val_df = val_df.explode('val_samples').rename(columns={'val_samples': 'sample_id'})
+        
+        # Drop any None/NaN values
+        val_df = val_df[val_df['sample_id'].notna()]
+        
+        # Drop duplicates
+        val_df.drop_duplicates(inplace=True)
+        
+        # Aggregate sample_ids
         validation_df = (
-            validation_df.groupby(['cdr1', 'cdr2', 'cdr3', 'cdr2.5'])['sample_id']
-            .agg(lambda x: ';'.join(x.astype(str)))
+            val_df.groupby(['cdr1', 'cdr2', 'cdr3', 'cdr2.5'])['sample_id']
+            .agg(lambda x: ';'.join(x))
             .reset_index()
         )
         
-        return (tcr_donor_id, validation_df, INCLUDED.tolist(), EXCLUDED.tolist())
+        # Collect TCR IDs
+        INCLUDED = included['tcr_id'].tolist() if len(included) > 0 else []
+        EXCLUDED = excluded['tcr_id'].tolist() if len(excluded) > 0 else []
+        
+        elapsed = time.time() - start
+        print(f"    ✓ Completed in {elapsed:.2f}s ({len(tcr_donor_id)/elapsed:,.0f} rows/sec)")
+        
+        return (train_df, validation_df, INCLUDED, EXCLUDED)
+    
+
+
+
+
+
+
+class CrossValGen2():
+    """
+    Generates cross-validation splits for TCR data, ensuring patient-level separation.
+    Handles both dataset-wise and random patient-wise split strategies.
+    """
+    
+    def __init__(self, patient_index_path, tcr_seq_path, output_path, 
+                 datasetwise=True, random_patient_wise=True, K=5, id_col='sample_id'):
+        """
+        Args:
+            patient_index_path: Path to patient metadata (sample_id, dataset)
+            tcr_seq_path: Path to TCR data (cdr1-3, cdr2.5, sample_id, tcr_id)
+            output_path: Directory for saving train/test splits
+            datasetwise: Generate dataset-wise splits (leave-one-dataset-out)
+            random_patient_wise: Generate random K-fold patient-wise splits
+            K: Number of folds for random patient-wise CV
+            id_col: Column name to aggregate in TCR data (default: 'sample_id')
+        """
+        self.patient_index_path = patient_index_path
+        self.tcr_seq_path = tcr_seq_path
+        self.output_path = output_path
+        self.datasetwise = datasetwise
+        self.random_patient_wise = random_patient_wise
+        self.K = K
+        self.id_col = id_col  # FIX: Added missing attribute
+    
+    def call(self):
+        """Execute cross-validation split generation."""
+        print(f"Loading patient index from: {self.patient_index_path}")
+        patient_index = pd.read_csv(self.patient_index_path) if self.patient_index_path.endswith('.csv') else pd.read_csv(self.patient_index_path, sep='\t')
+        print(f"  → Loaded {len(patient_index)} patients")
+        
+        print(f"Loading TCR data from: {self.tcr_seq_path}")
+        tcr_donor_id = pd.read_csv(self.tcr_seq_path) if self.tcr_seq_path.endswith('.csv') else pd.read_csv(self.tcr_seq_path, sep='\t')
+        print(f"  → Loaded {len(tcr_donor_id)} TCR sequences\n")
+        
+        output = []
+        if self.datasetwise:
+            print("=" * 60)
+            print("DATASET-WISE CROSS-VALIDATION")
+            print("=" * 60)
+            datasetwise_dict = self.DatasetWise(patient_index, tcr_donor_id)
+            output.append(datasetwise_dict)
+            
+        if self.random_patient_wise:
+            print("\n" + "=" * 60)
+            print("RANDOM PATIENT-WISE CROSS-VALIDATION")
+            print("=" * 60)
+            patientwise_dict = self.RandomPatientWise(patient_index, tcr_donor_id)
+            output.append(patientwise_dict)
+            
+        assert len(output) != 0, "No cross-validation strategy selected"  # FIX: Added error message
+        print("\n" + "=" * 60)
+        print("✓ Cross-validation generation completed successfully")
+        print("=" * 60)
+        return output
+            
+    def DatasetWise(self, patient_index, tcr_donor_id):
+        """Leave-one-dataset-out cross-validation."""
+        datasets = np.unique(patient_index.dataset.tolist())
+        datasets = [str(d) for d in datasets]
+        print(f"Found {len(datasets)} datasets: {datasets}\n")
+        
+        DICT = {}
+        outdir = os.path.join(self.output_path, 'datasetwise')
+        os.makedirs(outdir, exist_ok=True)
+        
+        for number, dataset in enumerate(datasets):
+            print(f"Fold {number+1}/{len(datasets)}: Validation on dataset '{dataset}'")
+            pid = patient_index[patient_index['dataset'] == dataset]['sample_id'].tolist()
+            print(f"  → {len(pid)} validation patients")
+            
+            train_tcr_donor, validation_df = self.iterate_and_create(pid, tcr_donor_id)
+            
+            print(f"  → Train: {len(train_tcr_donor)} TCRs | Test: {len(validation_df)} TCRs")
+            
+            DICT[f'{number}'] = {
+                'patient_ids': pid, 
+                'validation_set': [str(dataset)], 
+                'training_set': [i for i in datasets if i != dataset]
+            }
+            
+            assert len(train_tcr_donor) != 0, f"Empty training set for fold {number}"  # FIX: Added error message
+            assert len(validation_df) != 0, f"Empty validation set for fold {number}"  # FIX: Added error message
+            
+            train_tcr_donor.to_csv(os.path.join(outdir, f'train{number}.csv'), index=False)
+            validation_df.to_csv(os.path.join(outdir, f'test{number}.csv'), index=False)
+            
+        with open(os.path.join(outdir, 'info.json'), 'w') as f:
+            json.dump(DICT, f, indent=2)  # FIX: Added indent for readability
+        print(f"✓ Saved dataset-wise splits to: {outdir}")
+        return DICT
+
+    def RandomPatientWise(self, patient_index, tcr_donor_id):
+        """Random K-fold patient-wise cross-validation."""
+        sampleids = np.unique(patient_index.sample_id.tolist())
+        np.random.shuffle(sampleids)
+        valsize = len(sampleids) // self.K
+        print(f"Generating {self.K}-fold CV with ~{valsize} patients per fold\n")
+        
+        outdir = os.path.join(self.output_path, 'randompatientwise')
+        os.makedirs(outdir, exist_ok=True)
+        
+        DICT = {}
+        sampleids = [int(i) for i in sampleids]
+        
+        for k in range(self.K):
+            print(f"Fold {k+1}/{self.K}")
+            # FIX: Handle last fold properly to include remaining samples
+            if k == self.K - 1:
+                pid = sampleids[int(valsize*k):]  # Include all remaining samples in last fold
+            else:
+                pid = sampleids[int(valsize*k):int(valsize*(k+1))]
+            print(f"  → {len(pid)} validation patients")
+            
+            train_tcr_donor, validation_df = self.iterate_and_create(pid, tcr_donor_id)
+            
+            print(f"  → Train: {len(train_tcr_donor)} TCRs | Test: {len(validation_df)} TCRs")
+            
+            DICT[f'{k}'] = {
+                'patient_ids': pid, 
+            }
+            
+            assert len(train_tcr_donor) != 0, f"Empty training set for fold {k}"  # FIX: Added error message
+            assert len(validation_df) != 0, f"Empty validation set for fold {k}"  # FIX: Added error message
+            train_tcr_donor.to_csv(os.path.join(outdir, f'train{k}.csv'), index=False)
+            validation_df.to_csv(os.path.join(outdir, f'test{k}.csv'), index=False)
+            
+        with open(os.path.join(outdir, 'info.json'), 'w') as f:
+            json.dump(DICT, f, indent=2)  # FIX: Added indent for readability
+        print(f"✓ Saved patient-wise splits to: {outdir}")
+        return DICT
+
+    def iterate_and_create(self, sample_ids, tcr_donor_id):
+        """
+        Remove validation patients from training data (VECTORIZED VERSION).
+        Returns:
+            train_df: Training data with validation patients removed
+            validation_df: Validation data
+        """
+        valid_df = tcr_donor_id[tcr_donor_id['sample_id'].isin(sample_ids)].copy()  # FIX: Added .copy() to avoid SettingWithCopyWarning
+        train_df = tcr_donor_id[~tcr_donor_id['sample_id'].isin(sample_ids)].copy()  # FIX: Added .copy()
+        
+        cdr_columns = ['cdr1', 'cdr2', 'cdr2.5', 'cdr3']
+        
+        valid_df = valid_df.groupby(cdr_columns, as_index=False, sort=False).agg({
+            self.id_col: lambda x: ';'.join(sorted(set(map(str, x))))
+        })
+        train_df = train_df.groupby(cdr_columns, as_index=False, sort=False).agg({
+            self.id_col: lambda x: ';'.join(sorted(set(map(str, x))))
+        })
+        
+        return train_df, valid_df
