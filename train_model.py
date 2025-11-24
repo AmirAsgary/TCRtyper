@@ -97,7 +97,7 @@ model = define_model(mhc_num=358, embedding_dim=64, vocab_size=21, rope=True, ga
                      pad_token=PAD_TOKEN, mask_token=MASK_TOKEN,
                      return_att_weights=False, heads=4)
 
-model.compile(optimizer=tf.keras.optimizers.Lion(learning_rate=1e-6, use_ema=True, ema_overwrite_frequency=2))
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6))
 print("\nModel Summary:")
 print(model.summary())
 
