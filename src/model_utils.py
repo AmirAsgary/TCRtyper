@@ -1,5 +1,6 @@
-import tensorflow as tf
 import keras
+from keras import layers
+import tensorflow as tf
 
 
 
@@ -51,36 +52,71 @@ class PositionalEncoding(keras.layers.Layer):
         return x + pe
 
 
-@tf.keras.utils.register_keras_serializable(package='custom_layers', name='MaskedEmbedding')
+
+@keras.utils.register_keras_serializable(package='custom_layers', name='MaskedEmbedding')
 class MaskedEmbedding(keras.layers.Layer):
-    def __init__(self, mask_token=-1., pad_token=-2., name='masked_embedding', **kwargs):
-        super().__init__(name=name)
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim,
+        mask_token=-1,
+        pad_token=-2,
+        name='masked_embedding',
+        **kwargs
+    ):
+        super().__init__(name=name, **kwargs)
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
         self.mask_token = mask_token
         self.pad_token = pad_token
+
+    def build(self, input_shape):
+        # Learnable embedding matrix
+        self.embedding = self.add_weight(
+            name="embedding_matrix",
+            shape=(self.vocab_size+1, self.embed_dim),
+            initializer="glorot_uniform",
+            trainable=True,
+        )
 
     @tf.function(reduce_retracing=True)
     def call(self, x, mask):
         """
         Args:
-            x: Input tensor of shape (B, N, D)
-            mask: Tensor of shape (B, N)
+            x: integer input tokens, shape (B, N)
+            mask: mask values, shape (B, N),
+                  contains original IDs so we check pad/mask tokens
         Returns:
-            Tensor with masked positions set to zero.
+            Embeddings with padded/masked positions set to zero.
         """
-        mask = tf.cast(mask, tf.float32)
-        mask = tf.where((mask == self.pad_token) | (mask == self.mask_token), 0., 1.)
-        mask = tf.cast(mask, x.dtype)
-        return x * mask[:, :, tf.newaxis]  # Apply mask to zero out positions
+        # Standard embedding lookup
+        x = tf.cast(x, dtype=tf.int32) #(B,S)
+        x = tf.where(x == tf.cast(self.pad_token, tf.int32), self.vocab_size, x)
+        embedded = tf.nn.embedding_lookup(self.embedding, x)
+        mask = tf.cast(mask, embedded.dtype)
+
+        # Identify padded or masked tokens
+        bad = (mask == self.pad_token) | (mask == self.mask_token)
+
+        # Convert to (0 for masked/padded, 1 for valid)
+        keep_mask = tf.where(bad, 0.0, 1.0)
+        keep_mask = tf.cast(keep_mask, embedded.dtype)
+
+        # Zero-out embeddings at masked/padded positions
+        embedded = embedded * keep_mask[:, :, tf.newaxis]
+
+        return embedded
+
 
     def get_config(self):
-        """Serializes the layer's configuration."""
         config = super().get_config()
         config.update({
+            'vocab_size': self.vocab_size,
+            'embed_dim': self.embed_dim,
             'mask_token': self.mask_token,
             'pad_token': self.pad_token,
         })
         return config
-    
 
 
 def _neg_inf(dtype):
@@ -246,13 +282,48 @@ class AttentionLayer(keras.layers.Layer):
                 name=f'gate_{self.name}'
             )
         
-        # Layer normalizations
-        self.norm = layers.LayerNormalization(epsilon=self.epsilon, name=f'ln_{self.name}')
+        # Layer normalization parameters - norm_in
+        self.gamma_in = self.add_weight(
+            shape=(self.query_dim,),
+            initializer='ones',
+            trainable=True,
+            name=f'gamma_in_{self.name}'
+        )
+        self.beta_in = self.add_weight(
+            shape=(self.query_dim,),
+            initializer='zeros',
+            trainable=True,
+            name=f'beta_in_{self.name}'
+        )
+        
+        # Layer normalization parameters - norm_context (for cross-attention)
         if self.type == 'cross':
-            self.norm_context = layers.LayerNormalization(
-                epsilon=self.epsilon, name=f'ln_context_{self.name}'
+            self.gamma_context = self.add_weight(
+                shape=(self.context_dim,),
+                initializer='ones',
+                trainable=True,
+                name=f'gamma_context_{self.name}'
             )
-        self.norm_out = layers.LayerNormalization(epsilon=self.epsilon, name=f'ln_out_{self.name}')
+            self.beta_context = self.add_weight(
+                shape=(self.context_dim,),
+                initializer='zeros',
+                trainable=True,
+                name=f'beta_context_{self.name}'
+            )
+        
+        # Layer normalization parameters - norm_out
+        self.gamma_out = self.add_weight(
+            shape=(self.output_dim,),
+            initializer='ones',
+            trainable=True,
+            name=f'gamma_out_{self.name}'
+        )
+        self.beta_out = self.add_weight(
+            shape=(self.output_dim,),
+            initializer='zeros',
+            trainable=True,
+            name=f'beta_out_{self.name}'
+        )
         
         # Output projection
         self.out_w = self.add_weight(
@@ -295,6 +366,28 @@ class AttentionLayer(keras.layers.Layer):
                 name=f'rope_sin_{self.name}'
             )
 
+    def layer_norm(self, x, gamma, beta):
+        """
+        Custom layer normalization implementation.
+        
+        Args:
+            x: Input tensor of shape (B, N, D)
+            gamma: Scale parameter of shape (D,)
+            beta: Shift parameter of shape (D,)
+            
+        Returns:
+            Normalized tensor of same shape as x
+        """
+        # Compute mean and variance across the feature dimension (axis=-1)
+        mean = tf.reduce_mean(x, axis=-1, keepdims=True)
+        variance = tf.reduce_mean(tf.square(x - mean), axis=-1, keepdims=True)
+        
+        # Normalize
+        x_norm = (x - mean) / tf.sqrt(variance + self.epsilon)
+        
+        # Scale and shift
+        return gamma * x_norm + beta
+
     @tf.function
     def call(self, x, mask, context=None, context_mask=None, start_index=0):
         """
@@ -311,22 +404,19 @@ class AttentionLayer(keras.layers.Layer):
         if self.type == 'self':
             context = x
             context_mask = mask
-            q_input = k_input = v_input = self.norm(x)
+            q_input = k_input = v_input = self.layer_norm(x, self.gamma_in, self.beta_in)
             mask_q = mask_k = tf.where(mask == self.pad_token, 0., 1.)
         else:
             assert context is not None and context_mask is not None
-            q_input = self.norm(x)
-            k_input = v_input = self.norm_context(context)
+            q_input = self.layer_norm(x, self.gamma_in, self.beta_in)
+            k_input = v_input = self.layer_norm(context, self.gamma_context, self.beta_context)
             mask_q = tf.where(mask == self.pad_token, 0., 1.)
             mask_k = tf.where(tf.cast(context_mask, self.compute_dtype) == self.pad_token, 0., 1.)
 
         # Project query, key, value
-        q = tf.einsum('bnd,hde->bhne', tf.cast(q_input, self.compute_dtype), 
-                      tf.cast(self.q_proj, self.compute_dtype))
-        k = tf.einsum('bmd,hde->bhme', tf.cast(k_input, self.compute_dtype), 
-                      tf.cast(self.k_proj, self.compute_dtype))
-        v = tf.einsum('bmd,hde->bhme', tf.cast(v_input, self.compute_dtype), 
-                      tf.cast(self.v_proj, self.compute_dtype))
+        q = tf.einsum('bnd,hde->bhne', q_input, self.q_proj)
+        k = tf.einsum('bmd,hde->bhme', k_input, self.k_proj)
+        v = tf.einsum('bmd,hde->bhme', v_input, self.v_proj)
 
         # Apply RoPE to queries and keys (not values)
         if self.use_rope:
@@ -365,7 +455,7 @@ class AttentionLayer(keras.layers.Layer):
             out += tf.cast(x, self.compute_dtype)
 
         # Final normalization and masking
-        out = self.norm_out(out)
+        out = self.layer_norm(out, self.gamma_out, self.beta_out)
         mask_exp = tf.expand_dims(mask_q, axis=-1)
         out *= mask_exp
 
@@ -392,14 +482,15 @@ class AttentionLayer(keras.layers.Layer):
         return config
 
 
+
 class Likelihood(keras.losses.Loss):
     def __init__(self, donor_mhc: tf.Tensor, 
                  pad_token = -1, **kwargs):
         super().__init__()
         self.donor_mhc = tf.constant(donor_mhc) #(N, A)
-        self.pad_token = pad_token
+        self.pad_token = tf.cast(pad_token, tf.int32)
         assert len(tf.shape(self.donor_mhc)) == 2, f'the shape of donor_mhc should be (donor, mhc_allele), found {tf.shape(donor_mhc)}'
-        self.Na = tf.reduce_sum(self.donor_mhc, axis=0) #(A,)
+        self.Na = tf.cast(tf.reduce_sum(self.donor_mhc, axis=0), tf.float32) #(A,)
 
     def call(self, gamma, q, gamma_donor_id):
         '''
@@ -408,6 +499,9 @@ class Likelihood(keras.losses.Loss):
         gamma_donor_id: padded integers of donor ids per each tcr. dimension (batch, padded_donor_id) or (B, D_i). map tcr to donors.
         '''
         #### Calculate The second Term ####
+        if len(tf.shape(1)) == 2: q = tf.squeeze(q, axis=-1) #(B,1) --> (B,)
+        gamma = tf.clip_by_value(gamma, 1e-7, 1.0 - 1e-7)
+        q = tf.clip_by_value(q, 1e-7, 1.0 - 1e-7)
         # |Ni_size| * Sum^A( Na * gamma_ia )
         Ni_size, Ni, gamma_donor_id_mask = self.calculate_Ni_Nisize(gamma_donor_id) #(B,) and (B, N_i, A) and (B, N_i)
         second_term = q * Ni_size * tf.reduce_sum(self.Na[tf.newaxis, :] * gamma, axis=-1) #(B,) * (B,) * Sum^A ( (B, A) * (B, A)) --> (B,)
@@ -436,8 +530,8 @@ class Likelihood(keras.losses.Loss):
         gamma_donor_id_converted = tf.cast(gamma_donor_id_converted, dtype=tf.int32)
         gamma_donor_id_mask = tf.where(gamma_donor_id == self.pad_token, 0., 1) #(B,D_i) or (B,N_i)
         Ni = tf.gather(self.donor_mhc, gamma_donor_id_converted, axis=0) # (N, A), (B,D_i) --> (B, N_i, A) N_i are simply gathered D_is , D_i is index and is padded. len(N_i) == len(D_i)
-        Ni = tf.multiply(Ni, gamma_donor_id_mask[:, :, tf.newaxis]) #(B,N_i,A) masked out
-        return Ni_size, Ni, gamma_donor_id_mask
+        Ni = tf.multiply(Ni, tf.cast(gamma_donor_id_mask[:, :, tf.newaxis], tf.int32)) #(B,N_i,A) masked out
+        return tf.cast(Ni_size, tf.float32), tf.cast(Ni, tf.float32), gamma_donor_id_mask
 
     def calculate_pni(self, Ni, gamma, gamma_donor_id_mask): #(B,N_i,A) and (B,A)
         # pni = 1 - Prod (1 - gamma_ia) ^ xna
@@ -454,3 +548,67 @@ class Likelihood(keras.losses.Loss):
         # apply mask
         pni = pni * gamma_donor_id_mask #(B, N_i)
         return pni
+
+
+@tf.keras.utils.register_keras_serializable(package="custom_layers")
+class MaskedDense(keras.layers.Layer):
+    def __init__(self, units, pad_token=-2., use_bias=True, name='maskeddense', **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.pad_token = pad_token
+        self.use_bias = use_bias
+        self.name
+
+    def build(self, input_shapes):
+        """input_shapes = (x_shape, mask_shape)"""
+        x_shape, _ = input_shapes
+        last_dim = x_shape[-1]
+
+        # Weight matrix
+        self.W = self.add_weight(
+            name="kernel",
+            shape=(last_dim, self.units),
+            initializer="glorot_uniform",
+            trainable=True
+        )
+
+        # Optional bias
+        if self.use_bias:
+            self.b = self.add_weight(
+                name="bias",
+                shape=(self.units,),
+                initializer="zeros",
+                trainable=True
+            )
+        else:
+            self.b = None
+
+    def call(self, inputs):
+        """
+        inputs: tuple (x, mask)
+        x:    (B, Seq, D)
+        mask: (B, Seq)
+        """
+        x, mask = inputs
+
+        # Dense projection
+        y = tf.matmul(x, self.W)  # (B, Seq, units)
+        if self.use_bias:
+            y = y + self.b
+
+        # Make mask binary: 1 = keep, 0 = pad
+        mask_binary = tf.cast(mask != self.pad_token, y.dtype)  # (B, Seq)
+        mask_binary = mask_binary[:, :, tf.newaxis]             # (B, Seq, 1)
+
+        # Zero-out padded tokens
+        return y * mask_binary
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "units": self.units,
+            "pad_token": self.pad_token,
+            "use_bias": self.use_bias,
+            "name": self.name
+        })
+        return config

@@ -1,6 +1,4 @@
 import tensorflow as tf
-import keras
-from keras import layers
 import numpy as np
 from typing import List, Tuple, Union
 from src.constants import AMINO_ACID_IDX, AMINO_ACIDS, PHYSICHE_STOCKHOLM, PHYSICHE_STOCKHOLM_AA_to_IDX, PHYSICHE_STOCKHOLM_IDX_to_ENCODE
@@ -89,7 +87,7 @@ class ReadAndPreprocess:
     
     def __init__(self, df: Union[str, pd.DataFrame],
                  csv_output_path: str,
-                 pad_token: int = -1,
+                 pad_token: int = -2,
                  tcr_tsv_path: str = 'tcr_tsv_path',
                  mhc_arr_path: str = 'mhc_arr_path',
                  cdr3_col: str = 'cdr3_col',
@@ -412,7 +410,7 @@ class TCRFileManager:
         tcr_length: int = 25,
         batch_size: int = 32, 
         shuffle_buffer_size: int = 1000,
-        pad_token: int = -1
+        pad_token: int = -2.
     ):
         """
         Initialize the TCRFileManager.
@@ -598,10 +596,10 @@ class TCRFileManager:
                 - padded_tcr_donor_ids: Tensor of shape (batch_size, max_donors_in_batch)
         """
         # Pad tcr_seq to maximum length in the batch
-        padded_tcr_seq = tcr_seq.to_tensor(default_value=self.pad_token)
+        padded_tcr_seq = tcr_seq.to_tensor(default_value=int(self.pad_token))
         
         # Pad tcr_donor_ids to maximum length in the batch
-        padded_tcr_donor_ids = tcr_donor_ids.to_tensor(default_value=self.pad_token)
+        padded_tcr_donor_ids = tcr_donor_ids.to_tensor(default_value=int(self.pad_token))
         
         return padded_tcr_seq, tcr_ids, padded_tcr_donor_ids
     
