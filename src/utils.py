@@ -68,6 +68,8 @@ def _int64_feature(value):
         value = [value]
     elif isinstance(value, np.ndarray):
         value = value.flatten().tolist()
+    elif isinstance(value, list):
+        pass
     return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
     
 
@@ -427,9 +429,9 @@ class TCRFileManager:
     
     @staticmethod
     def _tcr_serialize(
-        tcr_seq: np.ndarray, 
-        tcr_ids: Union[np.ndarray, int], 
-        tcr_donor_ids: np.ndarray
+        tcr_seq: np.ndarray | list, 
+        tcr_ids: int, 
+        tcr_donor_ids: np.ndarray | list
     ) -> bytes:
         """
         Serialize a single TCR sequence, its ID, and donor IDs into a TFRecord Example.
@@ -443,9 +445,6 @@ class TCRFileManager:
         Returns:
             bytes: Serialized TFRecord Example.
         """
-        # Ensure tcr_ids is an integer
-        if isinstance(tcr_ids, np.ndarray):
-            tcr_ids = int(tcr_ids.item())
         # Create feature dictionary with variable-length sequences
         tcr_data = {
             "tcr_seq": _int64_feature(tcr_seq),          # Variable-length sequence
@@ -518,24 +517,19 @@ class TCRFileManager:
         with tf.io.TFRecordWriter(self.tcr_path) as writer:
             for i in range(num_seqs):
                 # Remove padding from tcr_seq to store variable-length sequence
-                seq = tcr_seq[i]
-                seq = np.array(seq)
+                #### REMOVED
+                #seq = tcr_seq[i]
+                #seq = np.array(seq)
                 # Find actual sequence length (before padding)
-                actual_seq = seq[seq != self.pad_token]
-                
-                # Get donor IDs and remove padding
-                if isinstance(tcr_donor_ids, np.ndarray):
-                    donor_ids = tcr_donor_ids[i]
-                    # Remove padding from donor_ids
-                    actual_donor_ids = donor_ids[donor_ids != self.pad_token]
-                else:
-                    actual_donor_ids = tcr_donor_ids[i]
-                actual_donor_ids = [int(j) for j in actual_donor_ids.split(';')]
+                #actual_seq = seq[seq != self.pad_token]
+                ####
+                actual_seq = tcr_seq[i]
+                actual_donor_ids = tcr_donor_ids[i]
                 # Serialize and write
                 serialized = self._tcr_serialize(
                     actual_seq, 
-                    np.array(tcr_ids[i]), 
-                    np.array(actual_donor_ids)
+                    tcr_ids[i], 
+                    actual_donor_ids
                 )
                 writer.write(serialized)
         
@@ -1420,7 +1414,7 @@ class CrossValGen2():
             assert len(validation_df) != 0, f"Empty validation set for fold {number}"  # FIX: Added error message
             
             train_tcr_donor.to_csv(os.path.join(outdir, f'train{number}.csv'), index=False)
-            validation_df.to_csv(os.path.join(outdir, f'test{number}.csv'), index=False)
+            validation_df.to_csv(os.path.join(outdir, f'val{number}.csv'), index=False)
             
         with open(os.path.join(outdir, 'info.json'), 'w') as f:
             json.dump(DICT, f, indent=2)  # FIX: Added indent for readability
@@ -1460,7 +1454,7 @@ class CrossValGen2():
             assert len(train_tcr_donor) != 0, f"Empty training set for fold {k}"  # FIX: Added error message
             assert len(validation_df) != 0, f"Empty validation set for fold {k}"  # FIX: Added error message
             train_tcr_donor.to_csv(os.path.join(outdir, f'train{k}.csv'), index=False)
-            validation_df.to_csv(os.path.join(outdir, f'test{k}.csv'), index=False)
+            validation_df.to_csv(os.path.join(outdir, f'val{k}.csv'), index=False)
             
         with open(os.path.join(outdir, 'info.json'), 'w') as f:
             json.dump(DICT, f, indent=2)  # FIX: Added indent for readability
@@ -1476,13 +1470,13 @@ class CrossValGen2():
         """
         valid_df = tcr_donor_id[tcr_donor_id['sample_id'].isin(sample_ids)].copy()  # FIX: Added .copy() to avoid SettingWithCopyWarning
         train_df = tcr_donor_id[~tcr_donor_id['sample_id'].isin(sample_ids)].copy()  # FIX: Added .copy()
+        # self.id_col is 'sample_id'
+        share_columns = ['cdr1', 'cdr2', 'cdr2.5', 'cdr3', 'tcr_id']
         
-        cdr_columns = ['cdr1', 'cdr2', 'cdr2.5', 'cdr3']
-        
-        valid_df = valid_df.groupby(cdr_columns, as_index=False, sort=False).agg({
+        valid_df = valid_df.groupby(share_columns, as_index=False, sort=False).agg({
             self.id_col: lambda x: ';'.join(sorted(set(map(str, x))))
         })
-        train_df = train_df.groupby(cdr_columns, as_index=False, sort=False).agg({
+        train_df = train_df.groupby(share_columns, as_index=False, sort=False).agg({
             self.id_col: lambda x: ';'.join(sorted(set(map(str, x))))
         })
         
