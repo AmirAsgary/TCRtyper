@@ -7,11 +7,12 @@ from src.utils import TCRFileManager
 import numpy as np
 import os
 import pandas as pd
+import json
 
 PAD_TOKEN = -2.
 MASK_TOKEN = -1.
-BATCH_SIZE = 1000
-EPOCH = 10
+BATCH_SIZE = 5000
+EPOCH = 15
 
 train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/train1.tfrecord'
 val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/val1.tfrecord'
@@ -134,7 +135,8 @@ print("\nCheckpoint directory created/verified: ./checkpoints/")
 print("\n" + "="*80)
 print("Starting Training...")
 print("="*80)
-
+train_hist = []
+val_hist = []
 for epoch in range(EPOCH):
     print(f"\n{'='*80}")
     print(f"EPOCH {epoch+1}/{EPOCH}")
@@ -177,6 +179,7 @@ for epoch in range(EPOCH):
     avg_loss = np.mean(epoch_losses)
     min_loss = np.min(epoch_losses)
     max_loss = np.max(epoch_losses)
+    train_hist.append(avg_loss)
     print(f"\n  Training Summary:")
     print(f"    Average Loss: {avg_loss:.4f}")
     print(f"    Min Loss:     {min_loss:.4f}")
@@ -196,7 +199,7 @@ for epoch in range(EPOCH):
         tcr_seq_mask = tf.where(tcr_seqs == PAD_TOKEN, PAD_TOKEN, 1.)
         
         gamma, q = model([tcr_seqs, tcr_seq_mask], training=False)
-        LL = loss_func(gamma, q, tcr_donor_ids)
+        LL = loss_func.call(gamma, q, tcr_donor_ids)
         val_losses.append(LL.numpy())
     
     avg_val_loss = np.mean(val_losses)
@@ -207,7 +210,7 @@ for epoch in range(EPOCH):
     print(f"    Min Loss:     {min_val_loss:.4f}")
     print(f"    Max Loss:     {max_val_loss:.4f}")
     print(f"    Total Steps:  {val_step}")
-    
+    val_hist.append(avg_val_loss)
     # Save model checkpoint
     checkpoint_path = f'checkpoints/model_epoch_{epoch+1}.keras'
     model.save(checkpoint_path)
@@ -217,6 +220,9 @@ for epoch in range(EPOCH):
 print("\n" + "="*80)
 final_model_path = 'checkpoints/final_model.keras'
 model.save(final_model_path)
+dicti = {'train': [float(i) for i in train_hist], 'val':[float(i) for i in val_hist]}
+with open('train_hist.json', 'w') as f:
+    json.dump(dicti, f)
 print(f"✓ Training completed successfully!")
 print(f"✓ Final model saved: {final_model_path}")
 print("="*80)

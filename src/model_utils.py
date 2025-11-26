@@ -9,38 +9,48 @@ class PositionalEncoding(keras.layers.Layer):
     """
     Sinusoidal Positional Encoding layer that applies encodings
     only to non-masked tokens.
+    
     Args:
         embed_dim (int): Dimension of embeddings (must match input last dim).
-        max_len (int): Maximum sequence length expected (used to precompute encodings).
+        pos_range (int): Maximum sequence length expected (used to precompute encodings).
+        mask_token (float): Value for masked tokens.
+        pad_token (float): Value for padded tokens.
     """
-
     def __init__(self, embed_dim, pos_range=100, mask_token=-1., pad_token=-2., name='positional_encoding', **kwargs):
-        super().__init__(name=name)
+        super().__init__(name=name, **kwargs)
         self.embed_dim = embed_dim
         self.pos_range = pos_range
         self.mask_token = mask_token
         self.pad_token = pad_token
 
-    def build(self, x):
+    def build(self, input_shape):
         # Create (1, pos_range, embed_dim) encoding matrix
         pos = tf.range(self.pos_range, dtype=tf.float32)[:, tf.newaxis]  # (pos_range, 1)
-        i = tf.range(self.embed_dim, dtype=tf.float32)[tf.newaxis, :]  # (1, embed_dim)
-        # angle_rates = 1 / tf.pow(300.0, (2 * (i // 2)) / tf.cast(self.embed_dim, GLOBAL_DTYPE))
-        angle_rates = tf.pow(300.0, -(2.0 * tf.floor(i // 2)) / tf.cast(self.embed_dim, tf.float32))
+        # Use integer range for dimension indices, do integer division, then cast
+        i = tf.range(self.embed_dim, dtype=tf.int32)[tf.newaxis, :]  # (1, embed_dim) as int32
+        i_div_2 = i // 2  # Integer division on int32 tensor
+        # Now cast to float for computation
+        i_div_2_float = tf.cast(i_div_2, tf.float32)
+        embed_dim_float = tf.cast(self.embed_dim, tf.float32)
+        power = -(2.0 * i_div_2_float)
+        power = power / embed_dim_float
+        # Compute angle rates
+        angle_rates = tf.exp(tf.math.log(300.0) * power)
         angle_rads = pos * angle_rates  # (pos_range, embed_dim)
         # Apply sin to even indices, cos to odd indices
         sines = tf.sin(angle_rads[:, 0::2])
         cosines = tf.cos(angle_rads[:, 1::2])
-        pos_encoding = tf.concat([sines, cosines], axis=-1)  # (max_len, embed_dim)
-        pos_encoding = pos_encoding[tf.newaxis, ...]  # (1, max_len, embed_dim)
-        # store in compute dtype to reduce casts
+        pos_encoding = tf.concat([sines, cosines], axis=-1)  # (pos_range, embed_dim)
+        pos_encoding = pos_encoding[tf.newaxis, ...]  # (1, pos_range, embed_dim)
+        # Store in compute dtype to reduce casts
         self.pos_encoding = tf.cast(pos_encoding, dtype=self.compute_dtype)
 
     def call(self, x, mask):
         """
         Args:
             x: Input tensor of shape (B, N, D)
-            mask: Tensor of shape (B,N)
+            mask: Tensor of shape (B, N)
+        
         Returns:
             Tensor with positional encodings added for masked and non padded tokens.
         """
@@ -50,6 +60,17 @@ class PositionalEncoding(keras.layers.Layer):
         mask = tf.where(mask == self.pad_token, tf.cast(0.0, x.dtype), tf.cast(1.0, x.dtype))
         pe = tf.cast(pe, x.dtype) * mask  # zero out positions where mask is 0
         return x + pe
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'embed_dim': self.embed_dim,
+            'pos_range': self.pos_range,
+            'mask_token': self.mask_token,
+            'pad_token': self.pad_token,
+        })
+        return config
+
 
 
 
@@ -499,7 +520,7 @@ class Likelihood(keras.losses.Loss):
         gamma_donor_id: padded integers of donor ids per each tcr. dimension (batch, padded_donor_id) or (B, D_i). map tcr to donors.
         '''
         #### Calculate The second Term ####
-        if len(tf.shape(1)) == 2: q = tf.squeeze(q, axis=-1) #(B,1) --> (B,)
+        if len(tf.shape(q)) == 2: q = tf.squeeze(q, axis=-1) #(B,1) --> (B,)
         gamma = tf.clip_by_value(gamma, 1e-7, 1.0 - 1e-7)
         q = tf.clip_by_value(q, 1e-7, 1.0 - 1e-7)
         # |Ni_size| * Sum^A( Na * gamma_ia )
@@ -518,7 +539,7 @@ class Likelihood(keras.losses.Loss):
         first_term = tf.reduce_sum(first_term, axis=-1) #(B, N_i) --> (B,)
         
         LL_batch = first_term - second_term
-        return -tf.reduce_sum(LL_batch) 
+        return -tf.reduce_mean(LL_batch) #-tf.reduce_sum(LL_batch) 
 
     def calculate_Ni_Nisize(self, gamma_donor_id): #(B, max)
         # calculate count of donors per each tcr
