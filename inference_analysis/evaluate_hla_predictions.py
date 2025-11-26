@@ -1,877 +1,716 @@
 #!/usr/bin/env python3
 """
-Donor-Level HLA Prediction Evaluation (GPU-Accelerated, TensorFlow-based)
-Aggregates TCR-level HLA binding probabilities to donor-level predictions
-and evaluates performance against ground truth HLA typing.
+TCR-HLA Binding Analysis Pipeline
+==================================
+Analyzes TCR binding predictions and compares with ground truth HLA typing data.
+Supports GPU acceleration via TensorFlow and efficient CPU operations via NumPy.
 
-Optimized version with:
-- Single data loading for all aggregation methods
-- Vectorized pandas groupby operations
-- Per-patient heatmap visualizations
-- Proper caching and method separation
+Author: Computational Immunology Pipeline
 """
 
-import pandas as pd
-import numpy as np
-import pyarrow.parquet as pq
+import argparse
+import os
+import sys
 from pathlib import Path
-import json
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Tuple, Dict, List, Optional
+import warnings
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import (
-    roc_curve, auc, precision_recall_curve, average_precision_score,
-    accuracy_score, precision_score, recall_score, confusion_matrix
-)
-from scipy import stats
-import warnings
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+
 warnings.filterwarnings('ignore')
 
-import keras
-import tensorflow as tf
+# ============================================================================
+# GPU DETECTION AND TENSORFLOW SETUP
+# ============================================================================
+GPU_AVAILABLE = False
+tf = None
 
-# Configure GPU
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
+def setup_tensorflow():
+    """Initialize TensorFlow with optimal GPU settings."""
+    global GPU_AVAILABLE, tf
     try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"GPU available: {len(gpus)} device(s)")
-        USE_GPU = True
-    except RuntimeError as e:
-        print(f"GPU configuration error: {e}")
-        USE_GPU = False
-else:
-    print("No GPU found, using CPU")
-    USE_GPU = False
+        import tensorflow as _tf
+        tf = _tf
+        
+        # Enable memory growth to avoid OOM
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            GPU_AVAILABLE = True
+            print(f"[INFO] GPU(s) detected: {[gpu.name for gpu in gpus]}")
+        else:
+            print("[INFO] No GPU detected, using CPU")
+    except ImportError:
+        print("[WARN] TensorFlow not installed, using NumPy only")
+    except Exception as e:
+        print(f"[WARN] TensorFlow GPU setup failed: {e}")
+
+setup_tensorflow()
 
 
-class DonorLevelHLAEvaluator:
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='TCR-HLA Binding Analysis Pipeline',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('--tcr_file', type=str, required=True,
+                        help='Path to TCR probability parquet file')
+    parser.add_argument('--gt_file', type=str, required=True,
+                        help='Path to ground truth CSV file')
+    parser.add_argument('--output_dir', type=str, required=True,
+                        help='Output directory')
+    parser.add_argument('--top_k', type=int, default=100,
+                        help='Top K TCRs for aggregation')
+    parser.add_argument('--threshold', type=float, default=0.3,
+                        help='Binary threshold for HLA prediction')
+    parser.add_argument('--use_gpu', action='store_true', default=True,
+                        help='Use GPU if available')
+    parser.add_argument('--batch_size', type=int, default=10000,
+                        help='Batch size for GPU processing')
+    return parser.parse_args()
+
+
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+def get_hla_columns(df: pd.DataFrame) -> List[str]:
+    """Extract HLA column names from dataframe."""
+    return sorted([col for col in df.columns if col.startswith('HLA-')])
+
+
+def load_data(tcr_file: str, gt_file: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """Load TCR predictions and ground truth data efficiently."""
+    print("[LOAD] Loading ground truth CSV...")
+    gt_df = pd.read_csv(gt_file)
+    
+    print("[LOAD] Loading TCR parquet file (streaming)...")
+    # Use pyarrow for efficient reading
+    tcr_table = pq.read_table(tcr_file)
+    tcr_df = tcr_table.to_pandas()
+    
+    hla_cols = get_hla_columns(tcr_df)
+    
+    # Validate columns
+    gt_hla_cols = get_hla_columns(gt_df)
+    common_hla = sorted(set(hla_cols) & set(gt_hla_cols))
+    
+    print(f"[LOAD] TCR data shape: {tcr_df.shape}")
+    print(f"[LOAD] Ground truth shape: {gt_df.shape}")
+    print(f"[LOAD] HLA columns in TCR: {len(hla_cols)}")
+    print(f"[LOAD] HLA columns in GT: {len(gt_hla_cols)}")
+    print(f"[LOAD] Common HLA columns: {len(common_hla)}")
+    print(f"[LOAD] Unique donors in TCR: {tcr_df['donor_id'].nunique()}")
+    print(f"[LOAD] Unique donors in GT: {gt_df['donor_id'].nunique()}")
+    
+    return tcr_df, gt_df, hla_cols, common_hla
+
+
+# ============================================================================
+# AGGREGATION - NUMPY (CPU)
+# ============================================================================
+def aggregate_mean_numpy(tcr_df: pd.DataFrame, hla_cols: List[str]) -> pd.DataFrame:
+    """Aggregate TCR probabilities by donor using mean (vectorized NumPy)."""
+    print("[AGG-CPU] Computing mean aggregation...")
+    agg_df = tcr_df.groupby('donor_id', sort=False)[hla_cols].mean()
+    return agg_df.reset_index()
+
+
+def aggregate_topk_numpy(tcr_df: pd.DataFrame, hla_cols: List[str], k: int) -> pd.DataFrame:
     """
-    Evaluates TCR-level HLA predictions at the donor level (TensorFlow-accelerated).
-    Optimized for efficiency with single data loading and vectorized operations.
+    Aggregate TCR probabilities by donor using top-k mean.
+    Optimized with numpy partition for O(n) top-k selection.
     """
+    print(f"[AGG-CPU] Computing top-{k} aggregation...")
     
-    def __init__(self, output_dir: str, use_gpu: bool = True):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.use_gpu = use_gpu and USE_GPU
-        
-        self.plots_dir = self.output_dir / "plots"
-        self.plots_dir.mkdir(exist_ok=True)
-        
-        self.metrics_dir = self.output_dir / "metrics"
-        self.metrics_dir.mkdir(exist_ok=True)
-        
-        self.predictions_dir = self.output_dir / "predictions"
-        self.predictions_dir.mkdir(exist_ok=True)
-        
-        self.heatmaps_dir = self.output_dir / "heatmaps"
-        self.heatmaps_dir.mkdir(exist_ok=True)
-        
-        # Cache for loaded data
-        self._cached_tcr_data: Optional[pd.DataFrame] = None
-        self._cached_hla_cols: Optional[List[str]] = None
-        self._cached_file_path: Optional[str] = None
-        
-        print(f"GPU acceleration {'ENABLED' if self.use_gpu else 'DISABLED'}")
+    donors = tcr_df['donor_id'].unique()
+    n_hla = len(hla_cols)
+    results = np.zeros((len(donors), n_hla), dtype=np.float32)
     
-    def load_tcr_predictions(self, parquet_file: str, force_reload: bool = False) -> Tuple[pd.DataFrame, List[str]]:
-        """
-        Load TCR predictions from parquet file. Caches result for reuse.
-        
-        Returns:
-            Tuple of (DataFrame with predictions, list of HLA column names)
-        """
-        if not force_reload and self._cached_tcr_data is not None and self._cached_file_path == parquet_file:
-            print("Using cached TCR predictions data")
-            return self._cached_tcr_data, self._cached_hla_cols
-        
-        print(f"Loading TCR predictions from {parquet_file}...")
-        
-        # Load entire parquet file at once - more efficient than chunking for in-memory ops
-        df = pd.read_parquet(parquet_file)
-        
-        # Identify HLA columns
-        hla_cols = [col for col in df.columns if col not in ['donor_id', 'tcr_id']]
-        print(f"Loaded {len(df):,} TCR predictions for {df['donor_id'].nunique():,} donors")
-        print(f"Found {len(hla_cols)} HLA alleles")
-        
-        # Convert HLA columns to float32 for memory efficiency
-        df[hla_cols] = df[hla_cols].astype(np.float32)
-        
-        # Cache the data
-        self._cached_tcr_data = df
-        self._cached_hla_cols = hla_cols
-        self._cached_file_path = parquet_file
-        
-        return df, hla_cols
+    # Group once and iterate
+    grouped = tcr_df.groupby('donor_id', sort=False)
+    donor_to_idx = {d: i for i, d in enumerate(donors)}
     
-    def _aggregate_group_gpu(self, group_values: np.ndarray, method: str, top_k: int = None) -> np.ndarray:
-        """GPU-accelerated aggregation for a single donor's TCR predictions."""
-        t = tf.convert_to_tensor(group_values, dtype=tf.float32)
+    for donor, group in grouped:
+        data = group[hla_cols].values.astype(np.float32)
+        n_tcr = data.shape[0]
+        idx = donor_to_idx[donor]
         
-        if method == 'max':
-            return tf.reduce_max(t, axis=0).numpy()
-        elif method == 'mean':
-            return tf.reduce_mean(t, axis=0).numpy()
-        elif method == 'top_k_mean' and top_k:
-            n_tcrs = t.shape[0]
-            k = min(top_k, n_tcrs)
-            # Top-k along axis 0 for each column
-            top_vals, _ = tf.math.top_k(tf.transpose(t), k=k)
-            return tf.reduce_mean(top_vals, axis=1).numpy()
-        elif method == 'weighted_sum':
-            weights = t / (tf.reduce_sum(t, axis=0, keepdims=True) + 1e-10)
-            return tf.reduce_sum(t * weights, axis=0).numpy()
+        if n_tcr <= k:
+            results[idx] = np.mean(data, axis=0)
         else:
-            raise ValueError(f"Unknown aggregation method: {method}")
+            # Use argpartition for O(n) top-k per column
+            # Process column-wise for memory efficiency
+            for j in range(n_hla):
+                col_data = data[:, j]
+                top_k_idx = np.argpartition(col_data, -k)[-k:]
+                results[idx, j] = np.mean(col_data[top_k_idx])
     
-    def _aggregate_group_cpu(self, group_values: np.ndarray, method: str, top_k: int = None) -> np.ndarray:
-        """CPU aggregation for a single donor's TCR predictions."""
-        if method == 'max':
-            return np.max(group_values, axis=0)
-        elif method == 'mean':
-            return np.mean(group_values, axis=0)
-        elif method == 'top_k_mean' and top_k:
-            k = min(top_k, group_values.shape[0])
-            # Partition is faster than full sort for top-k
-            idx = np.argpartition(group_values, -k, axis=0)[-k:]
-            top_vals = np.take_along_axis(group_values, idx, axis=0)
-            return np.mean(top_vals, axis=0)
-        elif method == 'weighted_sum':
-            weights = group_values / (np.sum(group_values, axis=0, keepdims=True) + 1e-10)
-            return np.sum(group_values * weights, axis=0)
-        else:
-            raise ValueError(f"Unknown aggregation method: {method}")
+    agg_df = pd.DataFrame(results, columns=hla_cols)
+    agg_df.insert(0, 'donor_id', donors)
+    return agg_df
+
+
+# ============================================================================
+# AGGREGATION - TENSORFLOW (GPU)
+# ============================================================================
+def aggregate_mean_gpu(tcr_df: pd.DataFrame, hla_cols: List[str]) -> pd.DataFrame:
+    """Aggregate TCR probabilities by donor using mean (TensorFlow GPU)."""
+    print("[AGG-GPU] Computing mean aggregation...")
     
-    def aggregate_tcr_to_donor(
-        self,
-        tcr_data: Union[str, pd.DataFrame],
-        aggregation_method: str = 'max',
-        top_k: int = None,
-        hla_cols: List[str] = None
-    ) -> pd.DataFrame:
-        """
-        Aggregate TCR-level predictions to donor-level using vectorized operations.
-        
-        Parameters:
-            tcr_data: Either path to parquet file or pre-loaded DataFrame
-            aggregation_method: 'max', 'mean', 'top_k_mean', 'weighted_sum'
-            top_k: Number of top TCRs for top_k_mean method
-            hla_cols: List of HLA columns (required if tcr_data is DataFrame)
-        """
-        # Load data if path provided
-        if isinstance(tcr_data, str):
-            df, hla_cols = self.load_tcr_predictions(tcr_data)
-        else:
-            df = tcr_data
-            if hla_cols is None:
-                raise ValueError("hla_cols must be provided when tcr_data is DataFrame")
-        
-        print(f"Aggregating using '{aggregation_method}' method...")
-        
-        # Vectorized aggregation using pandas groupby
-        grouped = df.groupby('donor_id')[hla_cols]
-        
-        if aggregation_method == 'max':
-            donor_pred_df = grouped.max()
-        elif aggregation_method == 'mean':
-            donor_pred_df = grouped.mean()
-        elif aggregation_method in ('top_k_mean', 'weighted_sum'):
-            # These require custom aggregation
-            agg_func = self._aggregate_group_gpu if self.use_gpu else self._aggregate_group_cpu
-            
-            results = {}
-            donor_ids = df['donor_id'].unique()
-            n_donors = len(donor_ids)
-            
-            for i, donor_id in enumerate(donor_ids):
-                if i % 500 == 0:
-                    print(f"  Processing donor {i+1}/{n_donors}...")
-                
-                donor_mask = df['donor_id'] == donor_id
-                group_vals = df.loc[donor_mask, hla_cols].values
-                results[donor_id] = agg_func(group_vals, aggregation_method, top_k)
-            
-            donor_pred_df = pd.DataFrame.from_dict(results, orient='index', columns=hla_cols)
-        else:
-            raise ValueError(f"Unknown aggregation method: {aggregation_method}")
-        
-        donor_pred_df.index.name = 'donor_id'
-        print(f"Aggregated shape: {donor_pred_df.shape}")
-        return donor_pred_df
+    donors = tcr_df['donor_id'].unique()
+    donor_to_idx = {d: i for i, d in enumerate(donors)}
+    n_donors = len(donors)
     
-    def load_ground_truth(self, ground_truth_file: str) -> pd.DataFrame:
-        """Load ground truth HLA typing from CSV/TSV/Parquet."""
-        print(f"Loading ground truth from {ground_truth_file}...")
+    # Convert to tensors
+    with tf.device('/GPU:0'):
+        hla_data = tf.constant(tcr_df[hla_cols].values, dtype=tf.float32)
+        donor_indices = tf.constant(
+            [donor_to_idx[d] for d in tcr_df['donor_id']], 
+            dtype=tf.int32
+        )
         
-        ext = Path(ground_truth_file).suffix.lower()
-        if ext == '.csv':
-            gt_df = pd.read_csv(ground_truth_file, index_col='donor_id')
-        elif ext == '.tsv':
-            gt_df = pd.read_csv(ground_truth_file, sep='\t', index_col='donor_id')
-        elif ext == '.parquet':
-            gt_df = pd.read_parquet(ground_truth_file).set_index('donor_id')
-        else:
-            raise ValueError("Ground truth must be CSV, TSV, or Parquet")
-        
-        print(f"Ground truth shape: {gt_df.shape}")
-        return gt_df
-    
-    def align_predictions_and_truth(
-        self,
-        predictions: pd.DataFrame,
-        ground_truth: pd.DataFrame
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Align predictions and ground truth to common donors and HLA alleles."""
-        common_donors = predictions.index.intersection(ground_truth.index)
-        common_hlas = predictions.columns.intersection(ground_truth.columns)
-        
-        print(f"Common donors: {len(common_donors)}, Common HLAs: {len(common_hlas)}")
-        
-        return (
-            predictions.loc[common_donors, common_hlas],
-            ground_truth.loc[common_donors, common_hlas]
+        # Efficient unsorted segment mean
+        agg_values = tf.math.unsorted_segment_mean(
+            hla_data, donor_indices, n_donors
         )
     
-    def evaluate_all_alleles(
-        self,
-        predictions: pd.DataFrame,
-        ground_truth: pd.DataFrame,
-        threshold: float = 0.5,
-        method_name: str = ""
-    ) -> pd.DataFrame:
-        """
-        Evaluate predictions for all HLA alleles with vectorized operations.
-        """
-        print(f"Evaluating {len(predictions.columns)} HLA alleles...")
-        
-        y_true_all = ground_truth.values.astype(np.int32)
-        y_scores_all = predictions.values.astype(np.float32)
-        y_pred_all = (y_scores_all >= threshold).astype(np.int32)
-        
-        # Vectorized confusion matrix computation
-        if self.use_gpu:
-            t_true = tf.convert_to_tensor(y_true_all, dtype=tf.int32)
-            t_pred = tf.convert_to_tensor(y_pred_all, dtype=tf.int32)
+    agg_df = pd.DataFrame(agg_values.numpy(), columns=hla_cols)
+    agg_df.insert(0, 'donor_id', donors)
+    return agg_df
+
+
+def aggregate_topk_gpu(tcr_df: pd.DataFrame, hla_cols: List[str], k: int) -> pd.DataFrame:
+    """
+    Aggregate TCR probabilities by donor using top-k mean (TensorFlow GPU).
+    Uses tf.math.top_k for efficient GPU-accelerated top-k selection.
+    """
+    print(f"[AGG-GPU] Computing top-{k} aggregation...")
+    
+    donors = tcr_df['donor_id'].unique()
+    n_hla = len(hla_cols)
+    results = np.zeros((len(donors), n_hla), dtype=np.float32)
+    
+    grouped = tcr_df.groupby('donor_id', sort=False)
+    donor_to_idx = {d: i for i, d in enumerate(donors)}
+    
+    with tf.device('/GPU:0'):
+        for donor, group in grouped:
+            data = group[hla_cols].values.astype(np.float32)
+            n_tcr = data.shape[0]
+            idx = donor_to_idx[donor]
             
-            t_true_pos = tf.equal(t_true, 1)
-            t_true_neg = tf.equal(t_true, 0)
-            t_pred_pos = tf.equal(t_pred, 1)
-            t_pred_neg = tf.equal(t_pred, 0)
+            if n_tcr <= k:
+                results[idx] = np.mean(data, axis=0)
+            else:
+                # tf.math.top_k operates on last dimension, so transpose
+                # Shape: (n_tcr, n_hla) -> (n_hla, n_tcr)
+                data_t = tf.constant(data.T, dtype=tf.float32)
+                top_k_vals, _ = tf.math.top_k(data_t, k=k)
+                results[idx] = tf.reduce_mean(top_k_vals, axis=1).numpy()
+    
+    agg_df = pd.DataFrame(results, columns=hla_cols)
+    agg_df.insert(0, 'donor_id', donors)
+    return agg_df
+
+
+def aggregate_data(tcr_df: pd.DataFrame, hla_cols: List[str], k: int, 
+                   use_gpu: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Perform both aggregation methods with appropriate backend."""
+    if use_gpu and GPU_AVAILABLE and tf is not None:
+        agg_mean = aggregate_mean_gpu(tcr_df, hla_cols)
+        agg_topk = aggregate_topk_gpu(tcr_df, hla_cols, k)
+    else:
+        agg_mean = aggregate_mean_numpy(tcr_df, hla_cols)
+        agg_topk = aggregate_topk_numpy(tcr_df, hla_cols, k)
+    
+    return agg_mean, agg_topk
+
+
+# ============================================================================
+# VISUALIZATION - HEATMAPS
+# ============================================================================
+def plot_heatmap(agg_df: pd.DataFrame, hla_cols: List[str], 
+                 output_path: str, title: str):
+    """Plot heatmap of aggregated probabilities."""
+    print(f"[VIZ] Plotting heatmap: {title[:50]}...")
+    
+    data = agg_df.set_index('donor_id')[hla_cols]
+    
+    # Dynamic figure sizing
+    n_donors, n_hla = data.shape
+    fig_width = min(50, max(15, n_hla * 0.08))
+    fig_height = min(30, max(8, n_donors * 0.25))
+    
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    
+    sns.heatmap(
+        data, 
+        cmap='viridis', 
+        ax=ax,
+        xticklabels=True if n_hla <= 100 else False,
+        yticklabels=True,
+        cbar_kws={'label': 'Binding Probability'}
+    )
+    
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_xlabel('HLA Alleles', fontsize=12)
+    ax.set_ylabel('Donors', fontsize=12)
+    
+    if n_hla <= 100:
+        ax.tick_params(axis='x', labelsize=5, rotation=90)
+    ax.tick_params(axis='y', labelsize=7)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+# ============================================================================
+# ENRICHMENT ANALYSIS
+# ============================================================================
+def compute_enrichment_vectorized(agg_df: pd.DataFrame, gt_df: pd.DataFrame,
+                                   hla_cols: List[str], use_gpu: bool) -> Dict:
+    """
+    Compute enrichment curves for all patients in a vectorized manner.
+    Returns curves and normalized AUC values.
+    """
+    print("[ENRICH] Computing enrichment curves...")
+    
+    # Align dataframes by donor_id
+    common_donors = sorted(set(agg_df['donor_id']) & set(gt_df['donor_id']))
+    
+    agg_aligned = agg_df[agg_df['donor_id'].isin(common_donors)].copy()
+    agg_aligned = agg_aligned.set_index('donor_id').loc[common_donors]
+    
+    gt_aligned = gt_df[gt_df['donor_id'].isin(common_donors)].copy()
+    gt_aligned = gt_aligned.set_index('donor_id').loc[common_donors]
+    
+    # Get common HLA columns
+    common_hla = [col for col in hla_cols if col in gt_aligned.columns]
+    n_hla = len(common_hla)
+    n_donors = len(common_donors)
+    
+    probs_matrix = agg_aligned[common_hla].values.astype(np.float32)
+    gt_matrix = gt_aligned[common_hla].values.astype(np.float32)
+    
+    # Vectorized enrichment computation
+    if use_gpu and GPU_AVAILABLE and tf is not None:
+        with tf.device('/GPU:0'):
+            probs_tf = tf.constant(probs_matrix, dtype=tf.float32)
+            gt_tf = tf.constant(gt_matrix, dtype=tf.float32)
             
-            tp = tf.reduce_sum(tf.cast(t_true_pos & t_pred_pos, tf.int32), axis=0).numpy()
-            fp = tf.reduce_sum(tf.cast(t_true_neg & t_pred_pos, tf.int32), axis=0).numpy()
-            tn = tf.reduce_sum(tf.cast(t_true_neg & t_pred_neg, tf.int32), axis=0).numpy()
-            fn = tf.reduce_sum(tf.cast(t_true_pos & t_pred_neg, tf.int32), axis=0).numpy()
-        else:
-            tp = np.sum((y_true_all == 1) & (y_pred_all == 1), axis=0)
-            fp = np.sum((y_true_all == 0) & (y_pred_all == 1), axis=0)
-            tn = np.sum((y_true_all == 0) & (y_pred_all == 0), axis=0)
-            fn = np.sum((y_true_all == 1) & (y_pred_all == 0), axis=0)
-        
-        # Vectorized metric computation
-        n_samples = y_true_all.shape[0]
-        accuracy = (tp + tn) / n_samples
-        precision = np.divide(tp, tp + fp, out=np.zeros_like(tp, dtype=float), where=(tp + fp) > 0)
-        recall = np.divide(tp, tp + fn, out=np.zeros_like(tp, dtype=float), where=(tp + fn) > 0)
-        specificity = np.divide(tn, tn + fp, out=np.zeros_like(tn, dtype=float), where=(tn + fp) > 0)
-        prevalence = np.mean(y_true_all, axis=0)
-        
-        # Compute AUC metrics (requires loop due to sklearn)
-        auc_roc = np.full(len(predictions.columns), np.nan)
-        auc_pr = np.full(len(predictions.columns), np.nan)
-        avg_precision = np.full(len(predictions.columns), np.nan)
-        
-        for idx in range(len(predictions.columns)):
-            y_true = y_true_all[:, idx]
-            y_scores = y_scores_all[:, idx]
+            # Get sorted indices (descending by probability)
+            sorted_indices = tf.argsort(probs_tf, axis=1, direction='DESCENDING')
             
-            if len(np.unique(y_true)) > 1:
-                fpr, tpr, _ = roc_curve(y_true, y_scores)
-                auc_roc[idx] = auc(fpr, tpr)
-                prec_curve, rec_curve, _ = precision_recall_curve(y_true, y_scores)
-                auc_pr[idx] = auc(rec_curve, prec_curve)
-                avg_precision[idx] = average_precision_score(y_true, y_scores)
+            # Gather ground truth in sorted order
+            batch_indices = tf.repeat(
+                tf.range(n_donors)[:, tf.newaxis], n_hla, axis=1
+            )
+            gather_indices = tf.stack([batch_indices, sorted_indices], axis=-1)
+            sorted_gt = tf.gather_nd(gt_tf, gather_indices)
+            
+            # Cumulative sum for enrichment
+            cumsum = tf.cumsum(sorted_gt, axis=1).numpy()
+            sorted_gt_np = sorted_gt.numpy()
+    else:
+        # NumPy version
+        sorted_indices = np.argsort(-probs_matrix, axis=1)
+        sorted_gt_np = np.take_along_axis(gt_matrix, sorted_indices, axis=1)
+        cumsum = np.cumsum(sorted_gt_np, axis=1)
+    
+    # Compute AUCs
+    total_positives = np.sum(gt_matrix, axis=1)
+    actual_aucs = np.sum(cumsum, axis=1)
+    
+    # Maximum AUC: if all positives were ranked first
+    # max_auc = sum(n_hla - i for i in range(n_pos)) = n_pos * n_hla - n_pos*(n_pos-1)/2
+    max_aucs = total_positives * n_hla - (total_positives * (total_positives - 1)) / 2
+    
+    # Avoid division by zero
+    normalized_aucs = np.where(
+        max_aucs > 0,
+        actual_aucs / max_aucs,
+        0.0
+    )
+    
+    # Build curves
+    curves = []
+    for i in range(n_donors):
+        x = np.arange(n_hla + 1)
+        y = np.concatenate([[0], cumsum[i]])
+        curves.append((x, y))
+    
+    return {
+        'donors': common_donors,
+        'curves': curves,
+        'aucs': normalized_aucs.tolist(),
+        'n_hla': n_hla
+    }
+
+
+def plot_enrichment_curves(results: Dict, output_path: str, title: str):
+    """Plot enrichment curves for all patients with color coding."""
+    print(f"[VIZ] Plotting enrichment curves...")
+    
+    n_donors = len(results['donors'])
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Color by AUC value
+    cmap = plt.cm.viridis
+    aucs = np.array(results['aucs'])
+    norm = plt.Normalize(aucs.min(), aucs.max())
+    
+    for i, (x, y) in enumerate(results['curves']):
+        color = cmap(norm(results['aucs'][i]))
+        ax.plot(x, y, color=color, alpha=0.6, linewidth=1)
+    
+    # Add diagonal reference line (random expectation)
+    n_hla = results['n_hla']
+    mean_positives = np.mean([c[1][-1] for c in results['curves']])
+    ax.plot([0, n_hla], [0, mean_positives], 'k--', alpha=0.5, 
+            label='Random expectation')
+    
+    # Colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    cbar = plt.colorbar(sm, ax=ax)
+    cbar.set_label('Normalized AUC', fontsize=10)
+    
+    ax.set_xlabel('Rank (sorted by predicted probability)', fontsize=12)
+    ax.set_ylabel('Cumulative Hits (True Positives)', fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+def plot_auc_barplot(results: Dict, output_path: str, title: str):
+    """Plot AUC bar plot for all patients, sorted by AUC."""
+    print(f"[VIZ] Plotting AUC bar plot...")
+    
+    # Sort by AUC
+    sorted_idx = np.argsort(results['aucs'])[::-1]
+    sorted_donors = [results['donors'][i] for i in sorted_idx]
+    sorted_aucs = [results['aucs'][i] for i in sorted_idx]
+    
+    n_donors = len(sorted_donors)
+    fig_width = max(12, n_donors * 0.25)
+    
+    fig, ax = plt.subplots(figsize=(fig_width, 6))
+    
+    # Color gradient based on AUC
+    colors = plt.cm.viridis(np.array(sorted_aucs))
+    
+    x = np.arange(n_donors)
+    bars = ax.bar(x, sorted_aucs, color=colors, edgecolor='black', linewidth=0.3)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(sorted_donors, rotation=90, fontsize=7)
+    ax.set_xlabel('Donors (sorted by AUC)', fontsize=12)
+    ax.set_ylabel('Normalized Enrichment AUC', fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_ylim(0, 1.05)
+    ax.axhline(y=np.mean(sorted_aucs), color='red', linestyle='--', 
+               linewidth=2, label=f'Mean AUC: {np.mean(sorted_aucs):.3f}')
+    ax.legend(loc='upper right')
+    ax.grid(True, axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+# ============================================================================
+# HLA-LEVEL METRICS
+# ============================================================================
+def compute_hla_metrics_vectorized(agg_df: pd.DataFrame, gt_df: pd.DataFrame,
+                                    hla_cols: List[str], threshold: float,
+                                    use_gpu: bool) -> pd.DataFrame:
+    """
+    Compute metrics for each HLA allele (vectorized where possible).
+    Metrics: Precision, Recall, F1, AUC
+    """
+    print(f"[METRICS] Computing HLA-level metrics (threshold={threshold})...")
+    
+    # Align dataframes
+    common_donors = sorted(set(agg_df['donor_id']) & set(gt_df['donor_id']))
+    
+    agg_aligned = agg_df[agg_df['donor_id'].isin(common_donors)].copy()
+    agg_aligned = agg_aligned.set_index('donor_id').loc[common_donors]
+    
+    gt_aligned = gt_df[gt_df['donor_id'].isin(common_donors)].copy()
+    gt_aligned = gt_aligned.set_index('donor_id').loc[common_donors]
+    
+    common_hla = [col for col in hla_cols if col in gt_aligned.columns]
+    
+    probs_matrix = agg_aligned[common_hla].values.astype(np.float32)
+    gt_matrix = gt_aligned[common_hla].values.astype(np.float32)
+    pred_matrix = (probs_matrix >= threshold).astype(np.float32)
+    
+    n_donors, n_hla = gt_matrix.shape
+    
+    metrics_list = []
+    
+    for j, hla in enumerate(common_hla):
+        y_true = gt_matrix[:, j]
+        y_prob = probs_matrix[:, j]
+        y_pred = pred_matrix[:, j]
         
-        # Build metrics DataFrame
-        metrics_df = pd.DataFrame({
-            'allele': predictions.columns,
-            'n_positive': tp + fn,
-            'n_negative': tn + fp,
-            'prevalence': prevalence,
-            'true_positives': tp,
-            'false_positives': fp,
-            'true_negatives': tn,
-            'false_negatives': fn,
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'sensitivity': recall,
-            'specificity': specificity,
-            'auc_roc': auc_roc,
-            'auc_pr': auc_pr,
-            'avg_precision': avg_precision
+        n_pos = int(np.sum(y_true))
+        n_neg = n_donors - n_pos
+        
+        # Handle edge cases
+        if n_pos == 0 or n_pos == n_donors:
+            metrics_list.append({
+                'HLA': hla,
+                'Precision': np.nan,
+                'Recall': np.nan,
+                'F1': np.nan,
+                'AUC': np.nan,
+                'N_positive': n_pos,
+                'N_negative': n_neg,
+                'N_predicted_positive': int(np.sum(y_pred))
+            })
+            continue
+        
+        # Compute metrics
+        tp = np.sum((y_pred == 1) & (y_true == 1))
+        fp = np.sum((y_pred == 1) & (y_true == 0))
+        fn = np.sum((y_pred == 0) & (y_true == 1))
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        try:
+            auc = roc_auc_score(y_true, y_prob)
+        except ValueError:
+            auc = np.nan
+        
+        metrics_list.append({
+            'HLA': hla,
+            'Precision': precision,
+            'Recall': recall,
+            'F1': f1,
+            'AUC': auc,
+            'N_positive': n_pos,
+            'N_negative': n_neg,
+            'N_predicted_positive': int(np.sum(y_pred))
         })
-        
-        # Save with method name if provided
-        suffix = f"_{method_name}" if method_name else ""
-        metrics_file = self.metrics_dir / f"per_allele_metrics{suffix}.csv"
-        metrics_df.to_csv(metrics_file, index=False)
-        print(f"Saved metrics to {metrics_file}")
-        
-        return metrics_df
     
-    def plot_per_patient_heatmaps(
-        self,
-        predictions: pd.DataFrame,
-        ground_truth: pd.DataFrame = None,
-        n_patients: int = 50,
-        n_alleles: int = 30,
-        figsize: Tuple[int, int] = (16, 12),
-        method_name: str = ""
-    ):
-        """
-        Generate per-patient heatmaps showing aggregated HLA scores.
-        
-        Parameters:
-            predictions: Donor-level predictions DataFrame
-            ground_truth: Optional ground truth for comparison
-            n_patients: Number of patients to show
-            n_alleles: Number of top HLA alleles to show
-            figsize: Figure size
-            method_name: Name for file suffix
-        """
-        print("Generating per-patient heatmaps...")
-        
-        # Select top alleles by variance (most informative)
-        allele_variance = predictions.var(axis=0).sort_values(ascending=False)
-        top_alleles = allele_variance.head(n_alleles).index.tolist()
-        
-        # Select subset of patients
-        patient_subset = predictions.index[:n_patients]
-        pred_subset = predictions.loc[patient_subset, top_alleles]
-        
-        suffix = f"_{method_name}" if method_name else ""
-        
-        # Heatmap 1: Predictions only
-        fig, ax = plt.subplots(figsize=figsize)
-        sns.heatmap(
-            pred_subset,
-            cmap='YlOrRd',
-            vmin=0, vmax=1,
-            xticklabels=True,
-            yticklabels=True,
-            cbar_kws={'label': 'Aggregated Score'},
-            ax=ax
-        )
-        ax.set_xlabel('HLA Allele')
-        ax.set_ylabel('Patient ID')
-        ax.set_title(f'Per-Patient HLA Prediction Scores{" (" + method_name + ")" if method_name else ""}')
-        plt.xticks(rotation=45, ha='right', fontsize=8)
-        plt.yticks(fontsize=8)
-        plt.tight_layout()
-        plt.savefig(self.heatmaps_dir / f"patient_hla_scores{suffix}.png", dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        # Heatmap 2: If ground truth provided, show side-by-side comparison
-        if ground_truth is not None:
-            common_patients = pred_subset.index.intersection(ground_truth.index)
-            common_alleles = pred_subset.columns.intersection(ground_truth.columns)
-            
-            if len(common_patients) > 0 and len(common_alleles) > 0:
-                pred_aligned = pred_subset.loc[common_patients, common_alleles]
-                truth_aligned = ground_truth.loc[common_patients, common_alleles]
-                
-                fig, axes = plt.subplots(1, 2, figsize=(figsize[0] * 1.2, figsize[1]))
-                
-                # Predictions
-                sns.heatmap(
-                    pred_aligned,
-                    cmap='YlOrRd', vmin=0, vmax=1,
-                    xticklabels=True, yticklabels=True,
-                    cbar_kws={'label': 'Pred Score'}, ax=axes[0]
-                )
-                axes[0].set_title('Predictions')
-                axes[0].set_xlabel('HLA Allele')
-                axes[0].set_ylabel('Patient ID')
-                axes[0].tick_params(axis='x', rotation=45)
-                
-                # Ground truth
-                sns.heatmap(
-                    truth_aligned,
-                    cmap='Blues', vmin=0, vmax=1,
-                    xticklabels=True, yticklabels=True,
-                    cbar_kws={'label': 'True Label'}, ax=axes[1]
-                )
-                axes[1].set_title('Ground Truth')
-                axes[1].set_xlabel('HLA Allele')
-                axes[1].set_ylabel('Patient ID')
-                axes[1].tick_params(axis='x', rotation=45)
-                
-                plt.tight_layout()
-                plt.savefig(self.heatmaps_dir / f"patient_comparison{suffix}.png", dpi=300, bbox_inches='tight')
-                plt.close()
-                
-                # Heatmap 3: Difference (prediction - truth)
-                diff = pred_aligned.values - truth_aligned.values
-                diff_df = pd.DataFrame(diff, index=pred_aligned.index, columns=pred_aligned.columns)
-                
-                fig, ax = plt.subplots(figsize=figsize)
-                sns.heatmap(
-                    diff_df,
-                    cmap='RdBu_r', center=0, vmin=-1, vmax=1,
-                    xticklabels=True, yticklabels=True,
-                    cbar_kws={'label': 'Prediction - Truth'}, ax=ax
-                )
-                ax.set_title(f'Prediction Error (Red=FP, Blue=FN){" (" + method_name + ")" if method_name else ""}')
-                ax.set_xlabel('HLA Allele')
-                ax.set_ylabel('Patient ID')
-                plt.xticks(rotation=45, ha='right', fontsize=8)
-                plt.yticks(fontsize=8)
-                plt.tight_layout()
-                plt.savefig(self.heatmaps_dir / f"patient_error{suffix}.png", dpi=300, bbox_inches='tight')
-                plt.close()
-        
-        # Heatmap 4: Clustered heatmap
-        fig = plt.figure(figsize=(figsize[0], figsize[1] + 2))
-        g = sns.clustermap(
-            pred_subset,
-            cmap='YlOrRd', vmin=0, vmax=1,
-            method='ward',
-            figsize=figsize,
-            cbar_kws={'label': 'Score'},
-            xticklabels=True,
-            yticklabels=True
-        )
-        g.ax_heatmap.set_xlabel('HLA Allele')
-        g.ax_heatmap.set_ylabel('Patient ID')
-        plt.suptitle(f'Clustered Patient-HLA Heatmap{" (" + method_name + ")" if method_name else ""}', y=1.02)
-        plt.savefig(self.heatmaps_dir / f"patient_clustered{suffix}.png", dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"Saved heatmaps to {self.heatmaps_dir}")
+    metrics_df = pd.DataFrame(metrics_list)
     
-    def plot_roc_curves(
-        self,
-        predictions: pd.DataFrame,
-        ground_truth: pd.DataFrame,
-        selected_alleles: List[str] = None,
-        n_alleles: int = 10,
-        method_name: str = ""
-    ):
-        """Plot ROC curves for selected HLA alleles."""
-        if selected_alleles is None:
-            prevalences = ground_truth.sum(axis=0) / len(ground_truth)
-            selected_alleles = prevalences.nlargest(n_alleles).index.tolist()
-        
-        n_plots = min(len(selected_alleles), 10)
-        n_cols = min(5, n_plots)
-        n_rows = (n_plots + n_cols - 1) // n_cols
-        
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
-        axes = np.atleast_2d(axes).flatten()
-        
-        for idx, allele in enumerate(selected_alleles[:n_plots]):
-            ax = axes[idx]
-            y_true = ground_truth[allele].values
-            y_scores = predictions[allele].values
-            
-            if len(np.unique(y_true)) > 1:
-                fpr, tpr, _ = roc_curve(y_true, y_scores)
-                roc_auc = auc(fpr, tpr)
-                ax.plot(fpr, tpr, lw=2, label=f'AUC = {roc_auc:.3f}')
-                ax.plot([0, 1], [0, 1], 'k--', lw=1)
-                ax.legend(loc='lower right')
-            else:
-                ax.text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=ax.transAxes)
-            
-            ax.set_xlabel('FPR')
-            ax.set_ylabel('TPR')
-            ax.set_title(f'{allele}')
-            ax.grid(True, alpha=0.3)
-        
-        # Hide unused axes
-        for idx in range(n_plots, len(axes)):
-            axes[idx].set_visible(False)
-        
-        plt.tight_layout()
-        suffix = f"_{method_name}" if method_name else ""
-        plt.savefig(self.plots_dir / f"roc_curves{suffix}.png", dpi=300, bbox_inches='tight')
-        plt.close()
+    # Sort by AUC descending
+    metrics_df = metrics_df.sort_values('AUC', ascending=False, na_position='last')
     
-    def plot_precision_recall_curves(
-        self,
-        predictions: pd.DataFrame,
-        ground_truth: pd.DataFrame,
-        selected_alleles: List[str] = None,
-        n_alleles: int = 10,
-        method_name: str = ""
-    ):
-        """Plot Precision-Recall curves for selected HLA alleles."""
-        if selected_alleles is None:
-            prevalences = ground_truth.sum(axis=0) / len(ground_truth)
-            selected_alleles = prevalences.nlargest(n_alleles).index.tolist()
-        
-        n_plots = min(len(selected_alleles), 10)
-        n_cols = min(5, n_plots)
-        n_rows = (n_plots + n_cols - 1) // n_cols
-        
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
-        axes = np.atleast_2d(axes).flatten()
-        
-        for idx, allele in enumerate(selected_alleles[:n_plots]):
-            ax = axes[idx]
-            y_true = ground_truth[allele].values
-            y_scores = predictions[allele].values
-            
-            if len(np.unique(y_true)) > 1:
-                prec, rec, _ = precision_recall_curve(y_true, y_scores)
-                ap = average_precision_score(y_true, y_scores)
-                ax.plot(rec, prec, lw=2, label=f'AP = {ap:.3f}')
-                ax.legend(loc='lower left')
-            else:
-                ax.text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=ax.transAxes)
-            
-            ax.set_xlabel('Recall')
-            ax.set_ylabel('Precision')
-            ax.set_title(f'{allele}')
-            ax.grid(True, alpha=0.3)
-        
-        for idx in range(n_plots, len(axes)):
-            axes[idx].set_visible(False)
-        
-        plt.tight_layout()
-        suffix = f"_{method_name}" if method_name else ""
-        plt.savefig(self.plots_dir / f"pr_curves{suffix}.png", dpi=300, bbox_inches='tight')
-        plt.close()
+    return metrics_df
+
+
+def plot_hla_metrics_summary(metrics_df: pd.DataFrame, output_path: str, title: str):
+    """Plot summary of HLA-level metrics."""
+    print(f"[VIZ] Plotting HLA metrics summary...")
     
-    def plot_performance_summary(self, metrics_df: pd.DataFrame, method_name: str = ""):
-        """Create summary visualizations of performance across all alleles."""
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        
-        # 1. AUC-ROC distribution
-        ax = axes[0, 0]
-        valid_aucs = metrics_df['auc_roc'].dropna()
-        ax.hist(valid_aucs, bins=30, edgecolor='black', alpha=0.7)
-        ax.axvline(valid_aucs.mean(), color='red', linestyle='--', label=f'Mean: {valid_aucs.mean():.3f}')
-        ax.set_xlabel('AUC-ROC')
-        ax.set_ylabel('Number of Alleles')
-        ax.set_title('AUC-ROC Distribution')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # 2. Precision vs Prevalence
-        ax = axes[0, 1]
-        ax.scatter(metrics_df['prevalence'], metrics_df['precision'], alpha=0.6)
-        ax.set_xlabel('Allele Prevalence')
-        ax.set_ylabel('Precision')
-        ax.set_title('Precision vs Prevalence')
-        ax.grid(True, alpha=0.3)
-        
-        mask = metrics_df['prevalence'].notna() & metrics_df['precision'].notna()
-        if mask.sum() > 2:
-            corr, pval = stats.pearsonr(metrics_df.loc[mask, 'prevalence'], metrics_df.loc[mask, 'precision'])
-            ax.text(0.05, 0.95, f'ρ = {corr:.3f}\np = {pval:.2e}', transform=ax.transAxes, va='top',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
-        # 3. Sensitivity vs Specificity
-        ax = axes[0, 2]
-        ax.scatter(metrics_df['specificity'], metrics_df['sensitivity'], alpha=0.6)
-        ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-        ax.set_xlabel('Specificity')
-        ax.set_ylabel('Sensitivity')
-        ax.set_title('Sensitivity vs Specificity')
-        ax.grid(True, alpha=0.3)
-        
-        # 4. Performance by HLA locus
-        ax = axes[1, 0]
-        metrics_df = metrics_df.copy()
-        metrics_df['locus'] = metrics_df['allele'].str.split('*').str[0]
-        locus_auc = metrics_df.groupby('locus')['auc_roc'].mean().sort_values()
-        locus_auc.plot(kind='barh', ax=ax)
-        ax.set_xlabel('Mean AUC-ROC')
-        ax.set_title('Performance by HLA Locus')
-        ax.grid(True, alpha=0.3, axis='x')
-        
-        # 5. Sample size vs AUC
-        ax = axes[1, 1]
-        ax.scatter(metrics_df['n_positive'], metrics_df['auc_roc'], alpha=0.6)
-        ax.set_xlabel('Number of Positive Samples')
-        ax.set_ylabel('AUC-ROC')
-        ax.set_title('AUC-ROC vs Sample Size')
-        ax.set_xscale('log')
-        ax.grid(True, alpha=0.3)
-        
-        # 6. Top/bottom alleles
-        ax = axes[1, 2]
-        top5 = metrics_df.nlargest(5, 'auc_roc')[['allele', 'auc_roc']]
-        bottom5 = metrics_df.nsmallest(5, 'auc_roc')[['allele', 'auc_roc']]
-        combined = pd.concat([top5, bottom5])
-        colors = ['green'] * 5 + ['red'] * 5
-        ax.barh(range(len(combined)), combined['auc_roc'].values, color=colors, alpha=0.6)
-        ax.set_yticks(range(len(combined)))
-        ax.set_yticklabels(combined['allele'].values)
-        ax.set_xlabel('AUC-ROC')
-        ax.set_title('Top 5 / Bottom 5 Alleles')
-        ax.grid(True, alpha=0.3, axis='x')
-        
-        plt.tight_layout()
-        suffix = f"_{method_name}" if method_name else ""
-        plt.savefig(self.plots_dir / f"performance_summary{suffix}.png", dpi=300, bbox_inches='tight')
-        plt.close()
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    def compare_aggregation_methods(
-        self,
-        parquet_file: str,
-        ground_truth: pd.DataFrame,
-        methods: List[str] = None,
-        top_k_values: List[int] = None,
-        threshold: float = 0.5,
-        generate_plots: bool = True
-    ) -> pd.DataFrame:
-        """
-        Compare different aggregation methods efficiently (single data load).
-        """
-        if methods is None:
-            methods = ['max', 'mean', 'top_k_mean']
-        if top_k_values is None:
-            top_k_values = [5, 10, 20]
-        
-        print("\n" + "=" * 60)
-        print("COMPARING AGGREGATION METHODS")
-        print("=" * 60)
-        
-        # Load data once
-        tcr_data, hla_cols = self.load_tcr_predictions(parquet_file)
-        
-        results = []
-        all_predictions = {}
-        all_metrics = {}
-        
-        for method in methods:
-            if method == 'top_k_mean':
-                for k in top_k_values:
-                    method_name = f'{method}_k{k}'
-                    print(f"\nEvaluating: {method_name}")
-                    
-                    predictions = self.aggregate_tcr_to_donor(
-                        tcr_data, aggregation_method=method, top_k=k, hla_cols=hla_cols
-                    )
-                    pred_aligned, truth_aligned = self.align_predictions_and_truth(predictions, ground_truth)
-                    metrics = self.evaluate_all_alleles(pred_aligned, truth_aligned, threshold, method_name)
-                    
-                    all_predictions[method_name] = pred_aligned
-                    all_metrics[method_name] = metrics
-                    
-                    results.append({
-                        'method': method_name,
-                        'mean_auc_roc': metrics['auc_roc'].mean(),
-                        'median_auc_roc': metrics['auc_roc'].median(),
-                        'std_auc_roc': metrics['auc_roc'].std(),
-                        'mean_precision': metrics['precision'].mean(),
-                        'mean_recall': metrics['recall'].mean(),
-                        'mean_accuracy': metrics['accuracy'].mean(),
-                        'mean_specificity': metrics['specificity'].mean()
-                    })
-                    
-                    if generate_plots:
-                        self.plot_per_patient_heatmaps(pred_aligned, truth_aligned, method_name=method_name)
-            else:
-                print(f"\nEvaluating: {method}")
-                
-                predictions = self.aggregate_tcr_to_donor(
-                    tcr_data, aggregation_method=method, hla_cols=hla_cols
-                )
-                pred_aligned, truth_aligned = self.align_predictions_and_truth(predictions, ground_truth)
-                metrics = self.evaluate_all_alleles(pred_aligned, truth_aligned, threshold, method)
-                
-                all_predictions[method] = pred_aligned
-                all_metrics[method] = metrics
-                
-                results.append({
-                    'method': method,
-                    'mean_auc_roc': metrics['auc_roc'].mean(),
-                    'median_auc_roc': metrics['auc_roc'].median(),
-                    'std_auc_roc': metrics['auc_roc'].std(),
-                    'mean_precision': metrics['precision'].mean(),
-                    'mean_recall': metrics['recall'].mean(),
-                    'mean_accuracy': metrics['accuracy'].mean(),
-                    'mean_specificity': metrics['specificity'].mean()
-                })
-                
-                if generate_plots:
-                    self.plot_per_patient_heatmaps(pred_aligned, truth_aligned, method_name=method)
-        
-        comparison_df = pd.DataFrame(results).sort_values('mean_auc_roc', ascending=False)
-        comparison_df.to_csv(self.metrics_dir / "aggregation_comparison.csv", index=False)
-        
-        # Generate comparison visualization
-        self._plot_method_comparison(comparison_df)
-        
-        print(f"\nSaved comparison to {self.metrics_dir / 'aggregation_comparison.csv'}")
-        return comparison_df
+    # Filter valid metrics
+    valid_df = metrics_df.dropna(subset=['AUC'])
     
-    def _plot_method_comparison(self, comparison_df: pd.DataFrame):
-        """Visualize comparison of aggregation methods."""
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        
-        # AUC-ROC comparison
-        ax = axes[0]
-        x = range(len(comparison_df))
-        ax.bar(x, comparison_df['mean_auc_roc'], yerr=comparison_df['std_auc_roc'], capsize=3, alpha=0.7)
-        ax.set_xticks(x)
-        ax.set_xticklabels(comparison_df['method'], rotation=45, ha='right')
-        ax.set_ylabel('Mean AUC-ROC')
-        ax.set_title('AUC-ROC by Method')
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        # Precision/Recall comparison
-        ax = axes[1]
-        width = 0.35
-        ax.bar([i - width/2 for i in x], comparison_df['mean_precision'], width, label='Precision', alpha=0.7)
-        ax.bar([i + width/2 for i in x], comparison_df['mean_recall'], width, label='Recall', alpha=0.7)
-        ax.set_xticks(x)
-        ax.set_xticklabels(comparison_df['method'], rotation=45, ha='right')
-        ax.set_ylabel('Score')
-        ax.set_title('Precision & Recall by Method')
-        ax.legend()
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        # Accuracy comparison
-        ax = axes[2]
-        ax.bar(x, comparison_df['mean_accuracy'], alpha=0.7, color='green')
-        ax.set_xticks(x)
-        ax.set_xticklabels(comparison_df['method'], rotation=45, ha='right')
-        ax.set_ylabel('Mean Accuracy')
-        ax.set_title('Accuracy by Method')
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        plt.tight_layout()
-        plt.savefig(self.plots_dir / "method_comparison.png", dpi=300, bbox_inches='tight')
-        plt.close()
+    # AUC distribution
+    ax = axes[0, 0]
+    ax.hist(valid_df['AUC'], bins=30, color='steelblue', edgecolor='black', alpha=0.7)
+    ax.axvline(valid_df['AUC'].mean(), color='red', linestyle='--', 
+               label=f"Mean: {valid_df['AUC'].mean():.3f}")
+    ax.axvline(0.5, color='gray', linestyle=':', label='Random (0.5)')
+    ax.set_xlabel('AUC')
+    ax.set_ylabel('Count')
+    ax.set_title('AUC Distribution')
+    ax.legend()
     
-    def generate_report(self, metrics_df: pd.DataFrame, method_name: str = ""):
-        """Generate a text report summarizing the evaluation."""
-        lines = [
-            "=" * 70,
-            f"HLA PREDICTION EVALUATION REPORT{' (' + method_name + ')' if method_name else ''}",
-            "=" * 70, "",
-            f"Total HLA alleles evaluated: {len(metrics_df)}",
-            f"Total donors: {int(metrics_df['n_positive'].iloc[0] + metrics_df['n_negative'].iloc[0])}",
-            "",
-            "OVERALL PERFORMANCE:",
-            "-" * 70,
-            f"Mean AUC-ROC:     {metrics_df['auc_roc'].mean():.4f} ± {metrics_df['auc_roc'].std():.4f}",
-            f"Median AUC-ROC:   {metrics_df['auc_roc'].median():.4f}",
-            f"Mean Precision:   {metrics_df['precision'].mean():.4f}",
-            f"Mean Recall:      {metrics_df['recall'].mean():.4f}",
-            f"Mean Accuracy:    {metrics_df['accuracy'].mean():.4f}",
-            f"Mean Specificity: {metrics_df['specificity'].mean():.4f}",
-            "",
-            "TOP 10 ALLELES (by AUC-ROC):",
-            "-" * 70
-        ]
-        
-        for _, row in metrics_df.nlargest(10, 'auc_roc').iterrows():
-            lines.append(f"  {row['allele']:20s}  AUC: {row['auc_roc']:.4f}  Prev: {row['prevalence']:.3f}  N+: {int(row['n_positive'])}")
-        
-        lines.extend(["", "BOTTOM 10 ALLELES (by AUC-ROC):", "-" * 70])
-        for _, row in metrics_df.nsmallest(10, 'auc_roc').iterrows():
-            lines.append(f"  {row['allele']:20s}  AUC: {row['auc_roc']:.4f}  Prev: {row['prevalence']:.3f}  N+: {int(row['n_positive'])}")
-        
-        # By HLA class
-        metrics_df = metrics_df.copy()
-        metrics_df['hla_class'] = metrics_df['allele'].apply(
-            lambda x: 'Class I' if x.split('*')[0] in ['A', 'B', 'C'] else 'Class II'
-        )
-        
-        lines.extend(["", "BY HLA CLASS:", "-" * 70])
-        for hla_class in ['Class I', 'Class II']:
-            subset = metrics_df[metrics_df['hla_class'] == hla_class]
-            if len(subset) > 0:
-                lines.append(f"{hla_class}: Mean AUC = {subset['auc_roc'].mean():.4f}, N alleles = {len(subset)}")
-        
-        lines.extend(["", "=" * 70])
-        
-        report_text = "\n".join(lines)
-        suffix = f"_{method_name}" if method_name else ""
-        report_file = self.output_dir / f"evaluation_report{suffix}.txt"
-        
-        with open(report_file, 'w') as f:
-            f.write(report_text)
-        
-        print("\n" + report_text)
-        print(f"\nSaved report to {report_file}")
+    # F1 distribution
+    ax = axes[0, 1]
+    ax.hist(valid_df['F1'], bins=30, color='forestgreen', edgecolor='black', alpha=0.7)
+    ax.axvline(valid_df['F1'].mean(), color='red', linestyle='--',
+               label=f"Mean: {valid_df['F1'].mean():.3f}")
+    ax.set_xlabel('F1 Score')
+    ax.set_ylabel('Count')
+    ax.set_title('F1 Score Distribution')
+    ax.legend()
+    
+    # Precision vs Recall scatter
+    ax = axes[1, 0]
+    scatter = ax.scatter(valid_df['Recall'], valid_df['Precision'], 
+                        c=valid_df['AUC'], cmap='viridis', alpha=0.7, s=30)
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.set_title('Precision vs Recall (colored by AUC)')
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    plt.colorbar(scatter, ax=ax, label='AUC')
+    
+    # N_positive vs AUC
+    ax = axes[1, 1]
+    ax.scatter(valid_df['N_positive'], valid_df['AUC'], 
+              alpha=0.6, s=30, color='purple')
+    ax.set_xlabel('Number of Positive Samples')
+    ax.set_ylabel('AUC')
+    ax.set_title('AUC vs Sample Size')
+    ax.axhline(0.5, color='gray', linestyle=':', alpha=0.7)
+    
+    plt.suptitle(title, fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+def run_analysis(agg_df: pd.DataFrame, gt_df: pd.DataFrame, hla_cols: List[str],
+                 common_hla: List[str], method_name: str, output_dir: Path,
+                 threshold: float, use_gpu: bool):
+    """Run full analysis pipeline for one aggregation method."""
+    print(f"\n{'='*60}")
+    print(f"[ANALYSIS] Running analysis for: {method_name}")
+    print(f"{'='*60}")
+    
+    # Save aggregated table
+    agg_path = output_dir / f'aggregated_{method_name}.csv'
+    agg_df.to_csv(agg_path, index=False)
+    print(f"[SAVE] Aggregated table: {agg_path}")
+    
+    # Plot heatmap
+    heatmap_path = output_dir / f'heatmap_{method_name}.png'
+    plot_heatmap(agg_df, hla_cols, str(heatmap_path),
+                 f'HLA Binding Probabilities ({method_name.replace("_", " ").title()})')
+    
+    # Enrichment analysis
+    enrichment = compute_enrichment_vectorized(agg_df, gt_df, common_hla, use_gpu)
+    
+    # Save enrichment AUCs
+    auc_df = pd.DataFrame({
+        'donor_id': enrichment['donors'],
+        'enrichment_auc': enrichment['aucs']
+    }).sort_values('enrichment_auc', ascending=False)
+    auc_path = output_dir / f'enrichment_auc_{method_name}.csv'
+    auc_df.to_csv(auc_path, index=False)
+    print(f"[SAVE] Enrichment AUCs: {auc_path}")
+    
+    # Plot enrichment curves
+    curves_path = output_dir / f'enrichment_curves_{method_name}.png'
+    plot_enrichment_curves(enrichment, str(curves_path),
+                          f'Enrichment Curves ({method_name.replace("_", " ").title()})')
+    
+    # Plot AUC barplot
+    barplot_path = output_dir / f'enrichment_auc_barplot_{method_name}.png'
+    plot_auc_barplot(enrichment, str(barplot_path),
+                    f'Enrichment AUC per Donor ({method_name.replace("_", " ").title()})')
+    
+    # HLA-level metrics
+    hla_metrics = compute_hla_metrics_vectorized(
+        agg_df, gt_df, common_hla, threshold, use_gpu
+    )
+    metrics_path = output_dir / f'hla_metrics_{method_name}.csv'
+    hla_metrics.to_csv(metrics_path, index=False)
+    print(f"[SAVE] HLA metrics: {metrics_path}")
+    
+    # Plot HLA metrics summary
+    metrics_plot_path = output_dir / f'hla_metrics_summary_{method_name}.png'
+    plot_hla_metrics_summary(hla_metrics, str(metrics_plot_path),
+                            f'HLA Metrics Summary ({method_name.replace("_", " ").title()})')
+    
+    # Print summary
+    valid_metrics = hla_metrics.dropna(subset=['AUC'])
+    print(f"\n[SUMMARY] {method_name.upper()} Results:")
+    print(f"  Donors analyzed: {len(enrichment['donors'])}")
+    print(f"  HLAs analyzed: {len(common_hla)}")
+    print(f"  Mean Enrichment AUC: {np.mean(enrichment['aucs']):.4f}")
+    print(f"  HLA Metrics (mean over {len(valid_metrics)} valid HLAs):")
+    print(f"    Precision: {valid_metrics['Precision'].mean():.4f}")
+    print(f"    Recall:    {valid_metrics['Recall'].mean():.4f}")
+    print(f"    F1:        {valid_metrics['F1'].mean():.4f}")
+    print(f"    AUC:       {valid_metrics['AUC'].mean():.4f}")
+    
+    return enrichment, hla_metrics
 
 
 def main():
-    import argparse
+    args = parse_args()
     
-    parser = argparse.ArgumentParser(
-        description='Evaluate donor-level HLA predictions (optimized TensorFlow version)'
+    print("\n" + "="*70)
+    print("TCR-HLA BINDING ANALYSIS PIPELINE")
+    print("="*70)
+    
+    # Setup output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[CONFIG] Output directory: {output_dir}")
+    print(f"[CONFIG] Top-K: {args.top_k}")
+    print(f"[CONFIG] Threshold: {args.threshold}")
+    
+    # Determine compute backend
+    use_gpu = args.use_gpu and GPU_AVAILABLE and tf is not None
+    print(f"[CONFIG] Backend: {'TensorFlow GPU' if use_gpu else 'NumPy CPU'}")
+    
+    # Load data
+    tcr_df, gt_df, hla_cols, common_hla = load_data(args.tcr_file, args.gt_file)
+    
+    # Perform aggregations
+    print("\n[AGG] Starting aggregation...")
+    agg_mean, agg_topk = aggregate_data(tcr_df, hla_cols, args.top_k, use_gpu)
+    
+    # Free memory
+    del tcr_df
+    import gc
+    gc.collect()
+    
+    # Run analysis for both aggregation methods
+    results = {}
+    
+    results['mean'] = run_analysis(
+        agg_mean, gt_df, hla_cols, common_hla,
+        'mean', output_dir, args.threshold, use_gpu
     )
-    parser.add_argument('tcr_predictions', help='Path to parquet file with TCR predictions')
-    parser.add_argument('ground_truth', help='Path to ground truth HLA typing')
-    parser.add_argument('output_dir', help='Output directory')
-    parser.add_argument('--aggregation-method', default='max',
-                        choices=['max', 'mean', 'top_k_mean', 'weighted_sum'])
-    parser.add_argument('--top-k', type=int, default=10)
-    parser.add_argument('--threshold', type=float, default=0.5)
-    parser.add_argument('--compare-methods', action='store_true')
-    parser.add_argument('--no-gpu', action='store_true')
-    parser.add_argument('--n-heatmap-patients', type=int, default=50)
-    parser.add_argument('--n-heatmap-alleles', type=int, default=30)
     
-    args = parser.parse_args()
+    results[f'top{args.top_k}'] = run_analysis(
+        agg_topk, gt_df, hla_cols, common_hla,
+        f'top{args.top_k}', output_dir, args.threshold, use_gpu
+    )
     
-    evaluator = DonorLevelHLAEvaluator(args.output_dir, use_gpu=not args.no_gpu)
-    ground_truth = evaluator.load_ground_truth(args.ground_truth)
+    # Comparative summary
+    print("\n" + "="*70)
+    print("COMPARATIVE SUMMARY")
+    print("="*70)
+    print(f"{'Metric':<25} {'Mean Agg':>15} {'Top-K Agg':>15}")
+    print("-"*55)
     
-    if args.compare_methods:
-        comparison = evaluator.compare_aggregation_methods(args.tcr_predictions, ground_truth)
-        print("\n" + "=" * 60)
-        print("AGGREGATION METHOD COMPARISON:")
-        print(comparison.to_string(index=False))
-    else:
-        print("\n" + "=" * 60)
-        print("DONOR-LEVEL HLA PREDICTION EVALUATION")
-        print("=" * 60)
-        
-        # Load data once
-        tcr_data, hla_cols = evaluator.load_tcr_predictions(args.tcr_predictions)
-        
-        # Aggregate
-        predictions = evaluator.aggregate_tcr_to_donor(
-            tcr_data,
-            aggregation_method=args.aggregation_method,
-            top_k=args.top_k if args.aggregation_method == 'top_k_mean' else None,
-            hla_cols=hla_cols
-        )
-        
-        # Save predictions
-        predictions.to_csv(evaluator.predictions_dir / "donor_predictions.csv")
-        
-        # Align and evaluate
-        pred_aligned, truth_aligned = evaluator.align_predictions_and_truth(predictions, ground_truth)
-        metrics_df = evaluator.evaluate_all_alleles(pred_aligned, truth_aligned, args.threshold)
-        
-        # Generate all visualizations
-        evaluator.plot_roc_curves(pred_aligned, truth_aligned)
-        evaluator.plot_precision_recall_curves(pred_aligned, truth_aligned)
-        evaluator.plot_performance_summary(metrics_df)
-        evaluator.plot_per_patient_heatmaps(
-            pred_aligned, truth_aligned,
-            n_patients=args.n_heatmap_patients,
-            n_alleles=args.n_heatmap_alleles
-        )
-        evaluator.generate_report(metrics_df)
+    mean_enrich_auc = np.mean(results['mean'][0]['aucs'])
+    topk_enrich_auc = np.mean(results[f'top{args.top_k}'][0]['aucs'])
+    print(f"{'Mean Enrichment AUC':<25} {mean_enrich_auc:>15.4f} {topk_enrich_auc:>15.4f}")
     
-    print("\n" + "=" * 60)
-    print(f"EVALUATION COMPLETE! Results: {args.output_dir}")
-    print("=" * 60)
+    mean_hla_auc = results['mean'][1]['AUC'].mean()
+    topk_hla_auc = results[f'top{args.top_k}'][1]['AUC'].mean()
+    print(f"{'Mean HLA AUC':<25} {mean_hla_auc:>15.4f} {topk_hla_auc:>15.4f}")
+    
+    mean_f1 = results['mean'][1]['F1'].mean()
+    topk_f1 = results[f'top{args.top_k}'][1]['F1'].mean()
+    print(f"{'Mean HLA F1':<25} {mean_f1:>15.4f} {topk_f1:>15.4f}")
+    
+    print("\n" + "="*70)
+    print(f"[DONE] All outputs saved to: {output_dir}")
+    print("="*70 + "\n")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
