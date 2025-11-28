@@ -245,6 +245,9 @@ class AttentionLayer(keras.layers.Layer):
                  resnet=True, return_att_weights=False, name='attention',
                  epsilon=1e-6, gate=True, mask_token=-1., pad_token=-2.,
                  use_rope=False, rope_max_seq_len=2048, rope_base=10000.0,
+                 kernel_initializer=keras.initializers.RandomNormal(mean=0, stddev=0.05, seed=42),
+                 bias_initializer=keras.initializers.Zeros(),
+                 gate_initializer=keras.initializers.RandomUniform(minval=-0.05, maxval=0.05, seed=42),
                  **kwargs):
         super().__init__(name=name, **kwargs)
         assert isinstance(query_dim, int) and isinstance(context_dim, int) and isinstance(output_dim, int)
@@ -263,6 +266,9 @@ class AttentionLayer(keras.layers.Layer):
         self.gate = gate
         self.mask_token = mask_token
         self.pad_token = pad_token
+        self.kernel_initializer = kernel_initializer
+        self.bias_initializer = bias_initializer
+        self.gate_initializer = gate_initializer
         self.att_dim = output_dim // heads  # Attention dimension per head
         
         # RoPE parameters
@@ -278,19 +284,19 @@ class AttentionLayer(keras.layers.Layer):
         # Projection weights
         self.q_proj = self.add_weight(
             shape=(self.heads, self.query_dim, self.att_dim),
-            initializer='glorot_uniform',
+            initializer=self.kernel_initializer,
             trainable=True,
             name=f'q_proj_{self.name}'
         )
         self.k_proj = self.add_weight(
             shape=(self.heads, self.context_dim, self.att_dim),
-            initializer='glorot_uniform',
+            initializer=self.kernel_initializer,
             trainable=True,
             name=f'k_proj_{self.name}'
         )
         self.v_proj = self.add_weight(
             shape=(self.heads, self.context_dim, self.att_dim),
-            initializer='glorot_uniform',
+            initializer=self.kernel_initializer,
             trainable=True,
             name=f'v_proj_{self.name}'
         )
@@ -298,7 +304,7 @@ class AttentionLayer(keras.layers.Layer):
         if self.gate:
             self.g = self.add_weight(
                 shape=(self.heads, self.query_dim, self.att_dim),
-                initializer='random_uniform',
+                initializer=self.gate_initializer,
                 trainable=True,
                 name=f'gate_{self.name}'
             )
@@ -349,13 +355,13 @@ class AttentionLayer(keras.layers.Layer):
         # Output projection
         self.out_w = self.add_weight(
             shape=(self.heads * self.att_dim, self.output_dim),
-            initializer='glorot_uniform',
+            initializer=self.kernel_initializer,
             trainable=True,
             name=f'outw_{self.name}'
         )
         self.out_b = self.add_weight(
             shape=(self.output_dim,),
-            initializer='zeros',
+            initializer=self.bias_initializer,
             trainable=True,
             name=f'outb_{self.name}'
         )
@@ -499,6 +505,9 @@ class AttentionLayer(keras.layers.Layer):
             'use_rope': self.use_rope,
             'rope_max_seq_len': self.rope_max_seq_len,
             'rope_base': self.rope_base,
+            'kernel_initializer': self.kernel_initializer,
+            'bias_initializer': self.bias_initializer,
+            'gate_initializer': self.gate_initializer
         })
         return config
 
@@ -506,12 +515,24 @@ class AttentionLayer(keras.layers.Layer):
 
 class Likelihood(keras.losses.Loss):
     def __init__(self, donor_mhc: tf.Tensor, 
-                 pad_token = -1, **kwargs):
+                 pad_token: int | float = -1, 
+                 test_mode: bool = False, 
+                 N : int = 702,
+                use_softmax_loss: bool = True,
+                softmax_loss_weight: float = 1.0,
+                softmax_temperature: float = 1.0,
+                **kwargs):
         super().__init__()
         self.donor_mhc = tf.constant(donor_mhc) #(N, A)
         self.pad_token = tf.cast(pad_token, tf.int32)
+        self.test_mode = test_mode
+        self.N = N # johannes said not to use this, bcz it is wrong. My idea was to use it to divide self.Na on it to decrease the magnitude of it.
         assert len(tf.shape(self.donor_mhc)) == 2, f'the shape of donor_mhc should be (donor, mhc_allele), found {tf.shape(donor_mhc)}'
         self.Na = tf.cast(tf.reduce_sum(self.donor_mhc, axis=0), tf.float32) #(A,)
+        self.use_softmax_loss = use_softmax_loss
+        self.softmax_loss_weight = softmax_loss_weight
+        self.softmax_temperature = softmax_temperature
+        #self.Na = tf.cast(tf.reduce_sum(self.donor_mhc, axis=0), tf.float32) / tf.cast(N, tf.float32)  # (A,)
 
     def call(self, gamma, q, gamma_donor_id):
         '''
@@ -521,35 +542,81 @@ class Likelihood(keras.losses.Loss):
         '''
         #### Calculate The second Term ####
         if len(tf.shape(q)) == 2: q = tf.squeeze(q, axis=-1) #(B,1) --> (B,)
-        gamma = tf.clip_by_value(gamma, 1e-7, 1.0 - 1e-7)
-        q = tf.clip_by_value(q, 1e-7, 1.0 - 1e-7)
-        # |Ni_size| * Sum^A( Na * gamma_ia )
+        #TODO clipping might be dangerous bcz the porbs can be so small. we should return in log space instead of probs
+        #gamma = tf.clip_by_value(gamma, 1e-7, 1.0 - 1e-7)
+        #q = tf.clip_by_value(q, 1e-7, 1.0 - 1e-7)
+        # |Ni_size| * q * Sum^A( Na * gamma_ia )
         Ni_size, Ni, gamma_donor_id_mask = self.calculate_Ni_Nisize(gamma_donor_id) #(B,) and (B, N_i, A) and (B, N_i)
-        second_term = q * Ni_size * tf.reduce_sum(self.Na[tf.newaxis, :] * gamma, axis=-1) #(B,) * (B,) * Sum^A ( (B, A) * (B, A)) --> (B,)
-
+        #second_term = q * Ni_size * tf.reduce_sum(self.Na[tf.newaxis, :] * gamma, axis=-1) #(B,) * (B,) * Sum^A ( (B, A) * (B, A)) --> (B,)
+        second_term = q * tf.reduce_sum(self.Na[tf.newaxis, :] * gamma, axis=-1) #
         #### Calculate The first Term ####
         # Sum^Ni (ln( qi*pni / 1 - qi*pni))
         ## calculate pni: 1 - Prod( 1 - gamma_ia) ** x_na
         pn = self.calculate_pni(Ni, gamma, gamma_donor_id_mask) # (B, N_i)
+        # TODO do in log space in the model
         numerator = tf.multiply(q[:, tf.newaxis], pn) # (B,1) * (B, N_i)
         denominator = 1. - numerator
-        first_term = tf.math.log(numerator + 1e-10) - tf.math.log(denominator + 1e-10)
+        first_term = tf.math.log(numerator) - tf.math.log(denominator + 1e-15)
         # apply mask, because padded ones are now log(0) == 1 
         first_term = first_term * gamma_donor_id_mask
         first_term = tf.reduce_sum(first_term, axis=-1) #(B, N_i) --> (B,)
-        
         LL_batch = first_term - second_term
-        return -tf.reduce_mean(LL_batch) #-tf.reduce_sum(LL_batch) 
-
+        # ===== SOFTMAX LOSS (optional) =====
+        if self.use_softmax_loss:
+            cce = self.softmax_loss(Ni, gamma, gamma_donor_id_mask)  # (B,)
+        else:
+            cce = tf.zeros_like(LL_batch)
+        if not self.test_mode:
+            return -tf.reduce_mean(LL_batch), self.softmax_loss_weight * tf.reduce_mean(cce)
+        else: #(B,) and (B, N_i, A) and (B, N_i), (B,)
+            return (Ni_size, #(B,) --> for each B, stores how many donors they have that sequence
+                    Ni, #(B,N_i,A) --> for each B, gathers all ohe of mhcs for each of their donors N_i. since it is padded, should be masked out by gamma_donor_id_mask
+                    gamma_donor_id_mask, #(B,N_i) --> for each B, lists all donor id masks, 0 for padded ones and 1 for not padded ones
+                    pn, # (B, N_i) for each B, and for each of their donors has calculate pn
+                    numerator, # (B, N_i) --> q * pn
+                    denominator, # (B, N_i) --> 1 - q * pn
+                    first_term, #(B,)
+                    second_term, #(B,)
+                    cce,) # (B,)
+         
+    def softmax_loss(self, Ni, gamma, gamma_donor_id_mask):
+        """
+        Compute cross-entropy between gamma predictions and empirical HLA distribution.
+        The target distribution is derived from the HLA profiles of donors containing
+        each TCR. Alleles appearing in more donors get higher target probability.
+        Args:
+            Ni: HLA profiles of donors, shape (B, N_i, A), binary values
+            gamma: Model predictions, shape (B, A), values in (0, 1)
+            gamma_donor_id_mask: Mask for valid donors, shape (B, N_i)
+        Returns:
+            Cross-entropy loss per sample, shape (B,)
+        """
+        # Sum HLA counts across donors: (B, N_i, A) -> (B, A)
+        # This gives the count of how many donors have each allele
+        hla_counts = tf.reduce_sum(Ni, axis=1)  # (B, A)
+        # Convert counts to soft target distribution using temperature-scaled softmax
+        # Lower temperature = sharper distribution (more confident about top alleles)
+        # Higher temperature = softer distribution (more uniform)
+        y_true = tf.nn.softmax(
+            tf.cast(hla_counts, tf.float32) / self.softmax_temperature, 
+            axis=-1
+        )  # (B, A)
+        # The model's gamma predictions serve as the predicted distribution
+        # Normalize gamma to be a proper distribution for cross-entropy
+        y_pred = gamma / (tf.reduce_sum(gamma, axis=-1, keepdims=True) + 1e-10)  # (B, A)
+        # Compute cross-entropy: -sum(y_true * log(y_pred))
+        cce = -tf.reduce_sum(y_true * tf.math.log(y_pred + 1e-10), axis=-1)  # (B,)
+        return cce
+        
     def calculate_Ni_Nisize(self, gamma_donor_id): #(B, max)
-        # calculate count of donors per each tcr
+        ## calculate count of donors per each tcr
         gamma_donor_id_count = tf.where(gamma_donor_id == self.pad_token, 0., 1.) #(B, pad_donor_id)
         Ni_size = tf.reduce_sum(gamma_donor_id_count, axis=-1) #(B,) each has the number of Ni 
         ## extract (Ni, A) from (N, A)
         # First, we need to create a masking for padded tokens
         gamma_donor_id_converted = tf.where(gamma_donor_id == self.pad_token, 0, gamma_donor_id) # just to make sure tf.gather does not raise error
         gamma_donor_id_converted = tf.cast(gamma_donor_id_converted, dtype=tf.int32)
-        gamma_donor_id_mask = tf.where(gamma_donor_id == self.pad_token, 0., 1) #(B,D_i) or (B,N_i)
+        gamma_donor_id_mask = tf.where(gamma_donor_id == self.pad_token, 0., 1) #(B,D_i) or (B,N_i) pads == 0, normal == 1
         Ni = tf.gather(self.donor_mhc, gamma_donor_id_converted, axis=0) # (N, A), (B,D_i) --> (B, N_i, A) N_i are simply gathered D_is , D_i is index and is padded. len(N_i) == len(D_i)
         Ni = tf.multiply(Ni, tf.cast(gamma_donor_id_mask[:, :, tf.newaxis], tf.int32)) #(B,N_i,A) masked out
         return tf.cast(Ni_size, tf.float32), tf.cast(Ni, tf.float32), gamma_donor_id_mask
@@ -571,7 +638,7 @@ class Likelihood(keras.losses.Loss):
         return pni
 
 
-@tf.keras.utils.register_keras_serializable(package="custom_layers")
+@tf.keras.utils.register_keras_serializable(package="custom_layers", name='MasedDense')
 class MaskedDense(keras.layers.Layer):
     def __init__(self, units, pad_token=-2., use_bias=True, name='maskeddense', **kwargs):
         super().__init__(**kwargs)
@@ -633,3 +700,261 @@ class MaskedDense(keras.layers.Layer):
             "name": self.name
         })
         return config
+
+
+@tf.keras.utils.register_keras_serializable(package="custom_layers", name='QDense')
+class QDense(tf.keras.layers.Layer):
+    def __init__(self, units, use_bias=True, kernel_initializer="glorot_uniform", bias_initializer="zeros",
+        name='QDense', bound=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.use_bias = use_bias
+        self.kernel_initializer = kernel_initializer
+        self.bias_initializer = bias_initializer
+        self.name = name
+        self.bound = bound
+        if self.bound:
+            self.bound = tf.constant(self.bound, dtype=tf.float32)
+    def build(self, input_shape):
+        # input_shape = (batch, features)
+        input_dim = int(input_shape[-1])
+
+        # Weight matrix W with Glorot (Xavier) initialization
+        self.W = self.add_weight(
+            shape=(input_dim, self.units),
+            initializer=self.kernel_initializer,
+            trainable=True,
+            name="kernel"
+        )
+        # Bias vector b
+        if self.use_bias:
+            self.b = self.add_weight(
+                shape=(self.units,),
+                initializer=self.bias_initializer,
+                trainable=True,
+                name="bias"
+            )
+        else:
+            self.b = None
+
+    def call(self, inputs):
+        # Compute XW
+        outputs = tf.matmul(inputs, self.W)
+
+        # Add bias if enabled
+        if self.b is not None:
+            outputs = outputs + self.b
+        if self.bound:
+            outputs = tf.multiply(outputs, self.bound)
+        outputs = tf.nn.sigmoid(outputs)
+        return outputs
+
+
+def log1mexp(x):
+    """
+    Compute log(1 - exp(x)) in a numerically stable way.
+    
+    This function handles two regimes:
+    - When x is very negative: exp(x) ≈ 0, so log(1 - exp(x)) ≈ log(1) = 0
+      Here we use log1p(-exp(x)) which is stable for small exp(x)
+    - When x is close to 0: exp(x) ≈ 1, so 1 - exp(x) ≈ 0
+      Here we use log(-expm1(x)) where expm1(x) = exp(x) - 1 is stable near 0
+    
+    The crossover point is at x = log(0.5) ≈ -0.693
+    
+    Args:
+        x: Input tensor, should be negative (since we're computing log(1 - p) where p < 1)
+    
+    Returns:
+        log(1 - exp(x))
+    """
+    threshold = tf.constant(-0.693, dtype=x.dtype)  # log(0.5)
+    
+    # Clip x to avoid edge cases at extreme values
+    x = tf.clip_by_value(x, -100.0, -1e-7)
+    
+    return tf.where(
+        x < threshold,
+        tf.math.log1p(-tf.exp(x)),     # Stable when exp(x) is small (x very negative)
+        tf.math.log(-tf.math.expm1(x))  # Stable when exp(x) is close to 1 (x close to 0)
+    )
+
+
+class LogSpaceLikelihood(keras.losses.Loss):
+    """
+    Numerically stable likelihood computation using log-space arithmetic.
+    
+    Instead of working with probabilities directly, this implementation
+    works with log-probabilities throughout, converting products to sums
+    and avoiding underflow/overflow issues.
+    """
+    
+    def __init__(
+        self, 
+        donor_mhc: tf.Tensor,
+        pad_token: int | float = -1,
+        test_mode: bool = False,
+        use_softmax_loss: bool = True,
+        softmax_loss_weight: float = 1.0,
+        softmax_temperature: float = 1.0,
+        **kwargs
+    ):
+        super().__init__()
+        self.donor_mhc = tf.cast(donor_mhc, dtype=tf.float32)
+        self.pad_token = tf.cast(pad_token, tf.int32)
+        self.test_mode = test_mode
+        self.use_softmax_loss = use_softmax_loss
+        self.softmax_loss_weight = softmax_loss_weight
+        self.softmax_temperature = softmax_temperature
+        
+        # Precompute Na and log(Na) for the second term
+        # Na is the count of donors carrying each allele, shape (A,)
+        self.Na = tf.reduce_sum(self.donor_mhc, axis=0)  # (A,)
+        self.log_Na = tf.math.log(self.Na + 1e-10)  # (A,)
+    
+    def call(self, gamma_logits, q_logits, gamma_donor_id):
+        # Ensure q_logits has correct shape
+        if len(tf.shape(q_logits)) == 2:
+            q_logits = tf.squeeze(q_logits, axis=-1)  # (B,)
+        
+        # Compute log probabilities in numerically stable way from logits:
+        # The aim is not to directly convert them to probabilities, because they can become too small
+        # Assume z is the logits
+        # log(γ) = log(sigmoid(z)) = log_sigmoid(z)
+        # log(1 - γ) = log(1 - sigmoid(z)) = log(sigmoid(-z))
+        log_gamma = tf.math.log_sigmoid(gamma_logits)  # (B, A)
+        log_one_minus_gamma = tf.math.log_sigmoid(-gamma_logits)  # (B, A)
+        log_q = tf.math.log_sigmoid(q_logits)  # (B,)
+        
+        # Get donor information
+        Ni_size, Ni, gamma_donor_id_mask = self.calculate_Ni_Nisize(gamma_donor_id)
+        
+        # ===== FIRST TERM: Sum over donors containing each TCR =====
+        # Compute log(p_ni) = log(1 - prod_a(1-γ)^x_na)
+        log_p_ni = self.calculate_log_pni(Ni, log_one_minus_gamma, gamma_donor_id_mask)
+        
+        # Compute log(q * p_ni) = log(q) + log(p_ni)
+        log_qp = log_q[:, tf.newaxis] + log_p_ni  # (B, N_i)
+        
+        # Compute log(1 - q * p_ni) using log1mexp
+        log_one_minus_qp = log1mexp(log_qp)  # (B, N_i)
+        
+        # Log-odds: log(qp / (1-qp)) = log(qp) - log(1-qp)
+        log_odds = log_qp - log_one_minus_qp  # (B, N_i)
+        
+        # Apply mask and sum over donors
+        first_term = log_odds * gamma_donor_id_mask  # (B, N_i)
+        first_term = tf.reduce_sum(first_term, axis=-1)  # (B,)
+
+        # ===== SECOND TERM: Penalty term =====
+        # q * sum_a(Na * γ)
+        # It's a sum (not a product) and is less numerically sensitive
+        # We compute: exp(log_q + logsumexp(log_Na + log_gamma))
+        #           = exp(log_q) * sum_a(exp(log_Na + log_gamma))
+        #           = q * sum_a(Na * γ)
+        # Note: self.log_Na has shape (A,), log_gamma has shape (B, A)
+        # Broadcasting: (A,) + (B, A) -> (B, A)
+        log_Na_gamma = self.log_Na[tf.newaxis, :] + log_gamma  # (B, A)
+        log_sum_Na_gamma = tf.reduce_logsumexp(log_Na_gamma, axis=-1)  # (B,)
+        log_second_term = log_q + log_sum_Na_gamma  # (B,)
+        second_term = tf.math.exp(log_second_term)  # (B,)
+
+        # ===== LIKELIHOOD =====
+        LL_batch = first_term - second_term  # (B,)
+
+        # ===== SOFTMAX LOSS (optional) =====
+        if self.use_softmax_loss:
+            cce = self.softmax_loss(Ni, gamma_logits)
+        else:
+            cce = tf.zeros_like(LL_batch)
+        
+        # ===== TOTAL LOSS =====
+        if not self.test_mode:
+            total_loss = (-tf.reduce_mean(LL_batch), self.softmax_loss_weight * tf.reduce_mean(cce))
+            return total_loss
+        else:
+            return (Ni_size, Ni, gamma_donor_id_mask, log_p_ni,
+                    log_qp, log_one_minus_qp, first_term, second_term, cce,
+                    log_gamma, log_one_minus_gamma)
+
+    def calculate_log_pni(self, Ni, log_one_minus_gamma, gamma_donor_id_mask):
+        """
+        Compute log(p_ni) = log(1 - prod_a(1-γ)^x_na) in a numerically stable way.
+
+        Args:
+            Ni: HLA profiles of donors, shape (B, N_i, A), binary values
+            log_one_minus_gamma: log(1-γ), shape (B, A)
+            gamma_donor_id_mask: Mask for valid donors, shape (B, N_i) --> pads are zero, rest are 1
+        
+        Returns:
+            log(p_ni), shape (B, N_i)
+        """
+        # p_ni = 1 - prod_a(1-γ_ia)^x_na
+        # log(p_ni) = log(1 - exp(sum_a(x_na * log(1-γ_ia))))
+
+        # Expand log(1-γ) from (B, A) to (B, N_i, A) for element-wise multiplication with Ni
+        log_omg_expanded = tf.expand_dims(log_one_minus_gamma, axis=1)  # (B, 1, A)
+        log_omg_expanded = tf.broadcast_to(log_omg_expanded, tf.shape(Ni))  # (B, N_i, A)
+        
+        # log(prod_a(1-γ)^x_na) = sum_a(x_na * log(1-γ))
+        # Ni contains x_na values (0 or 1), so this selects only alleles the donor has
+        log_prod = tf.reduce_sum(Ni * log_omg_expanded, axis=-1)  # (B, N_i)
+        
+        # log(p_ni) = log(1 - exp(log_prod)) = log1mexp(log_prod)
+        log_p_ni = log1mexp(log_prod)  # (B, N_i)
+        
+        # Mask out log_p_ni for donors that do not exist, by setting them to -100.0
+        # This represents effectively log(0) and will be masked out in the sum
+        # gamma_donor_id_mask stores pads as 0. and valid donors as 1.
+        log_p_ni = tf.where(
+            gamma_donor_id_mask > 0.5, 
+            log_p_ni, 
+            tf.constant(-100.0, dtype=log_p_ni.dtype)
+        )
+        
+        return log_p_ni  # masked out with dim (B, N_i)
+
+    def calculate_Ni_Nisize(self, gamma_donor_id):
+        """Calculate donor counts and gather HLA profiles."""
+        gamma_donor_id_count = tf.where(gamma_donor_id == self.pad_token, 0., 1.)
+        Ni_size = tf.reduce_sum(gamma_donor_id_count, axis=-1)
+        
+        gamma_donor_id_safe = tf.where(gamma_donor_id == self.pad_token, 0, gamma_donor_id)
+        gamma_donor_id_safe = tf.cast(gamma_donor_id_safe, tf.int32)
+        gamma_donor_id_mask = tf.where(gamma_donor_id == self.pad_token, 0., 1.)
+        
+        Ni = tf.gather(self.donor_mhc, gamma_donor_id_safe, axis=0)
+        Ni = Ni * tf.cast(gamma_donor_id_mask[:, :, tf.newaxis], Ni.dtype)
+        
+        return tf.cast(Ni_size, tf.float32), tf.cast(Ni, tf.float32), gamma_donor_id_mask
+
+    def softmax_loss(self, Ni, gamma_logits):
+        """
+        Cross-entropy loss between gamma predictions and empirical HLA distribution.
+        
+        Args:
+            Ni: HLA profiles of donors, shape (B, N_i, A)
+            gamma_logits: Pre-sigmoid logits, shape (B, A)
+        
+        Returns:
+            Cross-entropy loss per sample, shape (B,)
+        """
+        # Sum HLA counts across donors to get empirical distribution
+        hla_counts = tf.reduce_sum(Ni, axis=1)  # (B, A)
+        
+        # Convert gamma logits to probabilities for normalization
+        gamma = tf.nn.sigmoid(gamma_logits)
+        
+        # Target distribution from HLA counts (temperature-scaled)
+        y_true = tf.nn.softmax(
+            tf.cast(hla_counts, tf.float32) / self.softmax_temperature,
+            axis=-1
+        )
+        
+        # Predicted distribution (normalized gamma)
+        y_pred = gamma / (tf.reduce_sum(gamma, axis=-1, keepdims=True) + 1e-10)
+        
+        # Cross-entropy: -sum(y_true * log(y_pred))
+        cce = -tf.reduce_sum(y_true * tf.math.log(y_pred + 1e-10), axis=-1)
+        
+        return cce

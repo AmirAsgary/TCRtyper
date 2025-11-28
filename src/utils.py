@@ -645,16 +645,16 @@ class TCRFileManager:
             num_parallel_reads=num_parallel_reads
         )
         
+        # Shuffle if requested
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size=self.shuffle_buffer_size)
+
         # Parse examples
         dataset = dataset.map(
             self._tcr_parse, 
             num_parallel_calls=tf.data.AUTOTUNE
         )
-        
-        # Shuffle if requested
-        if shuffle:
-            dataset = dataset.shuffle(buffer_size=self.shuffle_buffer_size)
-        
+
         # Batch with ragged tensors (variable-length sequences)
         # ragged_batch creates batches where sequences can have different lengths
         dataset = dataset.ragged_batch(
