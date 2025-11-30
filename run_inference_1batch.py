@@ -8,12 +8,17 @@ of the trained model outputs to diagnose issues like:
 - Gradient flow problems
 - Distribution mismatches between true and predicted probabilities
 - Reconstruction quality analysis
+
+CHANGELOG:
+    - Added EXACT_LIKELIHOOD flag to switch between Equation 8 (simplified) and 
+      Equation 4 (exact) likelihood computation.
+    - Added visualization for log_p_ni_all when using exact likelihood
 """
 
 import keras
 import tensorflow as tf
 from keras import layers
-from src.model_utils import LogSpaceLikelihood
+from src.model_utils import LogSpaceLikelihood, LogSpaceExactLikelihood  # NEW: Import both
 from src.utils import TCRFileManager
 import numpy as np
 import os
@@ -29,14 +34,25 @@ from datetime import datetime
 PAD_TOKEN = -2.
 MASK_TOKEN = -1.
 BATCH_SIZE = 1000
-MODEL_PATH = 'checkpoints/larger_buffer/model_epoch_8.keras'
+MODEL_PATH = 'checkpoints/exactloss_q+gamma+recon+reg/model_epoch_5.keras'
 OUTPUT_PATH = 'output/model_diagnostics_' + datetime.now().strftime('%Y%m%d_%H%M%S')
 PATIENT_TO_HLA = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/processed/patient_to_hla.csv'
 SOFTMAX_LOSS = True
 SOFTMAX_WEIGHTS = 0.5
 SOFTMAX_TEMP = 3.
 ATT_MODE = True  # Must match training configuration
-NUM_BATCHES_TO_ANALYZE = 1  # Number of batches to analyze
+NUM_BATCHES_TO_ANALYZE = 2  # Number of batches to analyze
+
+# =============================================================================
+# NEW: EXACT LIKELIHOOD FLAG - Must match training configuration!
+# =============================================================================
+# If True: Use Equation 4 (exact) - sums over ALL N donors for second term
+# If False: Use Equation 8 (simplified) - approximates second term
+EXACT_LIKELIHOOD = True
+
+# Number of actual valid donors (not the expanded array size)
+NUM_VALID_DONORS = 702.
+# =============================================================================
 
 # Amino acid mapping for reconstruction visualization
 AA_VOCAB = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 
@@ -75,6 +91,7 @@ for j, patient_id in enumerate(patient_ids):
 
 donor_mhc = tf.constant(max_donor_mhc, dtype=tf.int32)
 print(f"✓ Donor MHC shape: {donor_mhc.shape}")
+print(f"✓ Number of actual valid donors: {len(patient_ids)}")
 
 # Load HLA names
 hla_df = pd.read_csv(PATIENT_TO_HLA)
@@ -90,14 +107,42 @@ tcr_manager = TCRFileManager(
     pad_token=PAD_TOKEN
 )
 
-loss_func = LogSpaceLikelihood(
-    donor_mhc, 
-    pad_token=PAD_TOKEN, 
-    test_mode=True,                 
-    use_softmax_loss=SOFTMAX_LOSS,
-    softmax_loss_weight=SOFTMAX_WEIGHTS,
-    softmax_temperature=SOFTMAX_TEMP,
-)
+# =============================================================================
+# NEW: Conditional loss function selection based on EXACT_LIKELIHOOD flag
+# =============================================================================
+print("\n" + "-"*40)
+if EXACT_LIKELIHOOD:
+    print(">>> Using EXACT likelihood (Equation 4)")
+    print(f"    - Computes exact sum over all {NUM_VALID_DONORS:.0f} donors for second term")
+    print(f"    - No approximation assumptions")
+    
+    loss_func = LogSpaceExactLikelihood(
+        donor_mhc=donor_mhc,
+        pad_token=PAD_TOKEN,
+        test_mode=True,  # Always True for inference/diagnostics
+        use_softmax_loss=SOFTMAX_LOSS,
+        softmax_loss_weight=SOFTMAX_WEIGHTS,
+        softmax_temperature=SOFTMAX_TEMP,
+        fix_q=True,
+        num_mhc=358,
+        N=NUM_VALID_DONORS,
+    )
+else:
+    print(">>> Using SIMPLIFIED likelihood (Equation 8)")
+    print(f"    - Approximates second term as q * Σ(Na * γ)")
+    
+    loss_func = LogSpaceLikelihood(
+        donor_mhc=donor_mhc,
+        pad_token=PAD_TOKEN,
+        test_mode=True,  # Always True for inference/diagnostics
+        use_softmax_loss=SOFTMAX_LOSS,
+        softmax_loss_weight=SOFTMAX_WEIGHTS,
+        softmax_temperature=SOFTMAX_TEMP,
+        fix_q=True,
+        num_mhc=358,
+    )
+print("-"*40)
+# =============================================================================
 
 # Initialize CCE loss function for reconstruction analysis
 cce_loss_fn = keras.losses.CategoricalCrossentropy(reduction='none')
@@ -134,7 +179,7 @@ def compute_reconstruction_loss(tcr_seqs, recon_output, pad_token):
     
     # Prepare input tokens
     input_tokens_safe = tf.where(tcr_seqs == pad_token, 0.0, tcr_seqs)
-    input_tokens_safe = tf.cast(input_tokens_safe, tf.int64)  # Changed to int64
+    input_tokens_safe = tf.cast(input_tokens_safe, tf.int64)
     
     # One-hot encode targets
     one_hot_input = tf.one_hot(input_tokens_safe, depth=21)
@@ -148,7 +193,7 @@ def compute_reconstruction_loss(tcr_seqs, recon_output, pad_token):
     final_loss = tf.reduce_sum(masked_loss) / tf.maximum(num_valid_tokens, 1.0)
     
     # Compute accuracy
-    pred_tokens = tf.argmax(recon_output, axis=-1)  # Returns int64 by default
+    pred_tokens = tf.argmax(recon_output, axis=-1)
     correct = tf.cast(pred_tokens == input_tokens_safe, tf.float32) * mask
     accuracy = tf.reduce_sum(correct) / tf.maximum(num_valid_tokens, 1.0)
     
@@ -186,6 +231,7 @@ stats_content = f"""
 ALLELE FREQUENCY ANALYSIS
 {'='*60}
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Likelihood Type: {'EXACT (Equation 4)' if EXACT_LIKELIHOOD else 'SIMPLIFIED (Equation 8)'}
 
 SUMMARY STATISTICS
 ------------------
@@ -283,18 +329,30 @@ for batch_idx, data in enumerate(dataset, start=1):
     tcr_seq_mask = tf.where(tcr_seqs == PAD_TOKEN, PAD_TOKEN, 1.)
     tcr_seq_mask = tf.cast(tcr_seq_mask, tf.float32)
     
-    # Forward pass - updated for new model outputs
+    # Forward pass
     if ATT_MODE:
         gamma_logits, q_logits, att_score, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
     else:
         gamma_logits, q_logits, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
         att_score = None
     
-    # Loss computation (test_mode returns all intermediates)
+    # ==========================================================================
+    # NEW: Handle different test_mode outputs based on EXACT_LIKELIHOOD
+    # ==========================================================================
     loss_outputs = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
-    (Ni_size, Ni, gamma_donor_id_mask, log_p_ni,
-     log_qp, log_one_minus_qp, first_term, second_term, bce,
-     log_gamma, log_one_minus_gamma, true_probs, pred_probs) = loss_outputs
+    
+    if EXACT_LIKELIHOOD:
+        # Exact likelihood returns additional log_p_ni_all tensor
+        (Ni_size, Ni, gamma_donor_id_mask, log_p_ni, log_p_ni_all,
+         log_qp, log_one_minus_qp, first_term, second_term, bce,
+         log_gamma, log_one_minus_gamma, true_probs, pred_probs) = loss_outputs
+    else:
+        # Simplified likelihood
+        (Ni_size, Ni, gamma_donor_id_mask, log_p_ni,
+         log_qp, log_one_minus_qp, first_term, second_term, bce,
+         log_gamma, log_one_minus_gamma, true_probs, pred_probs) = loss_outputs
+        log_p_ni_all = None  # Not available in simplified version
+    # ==========================================================================
     
     # Convert to numpy arrays
     gamma_probs = tf.nn.sigmoid(gamma_logits).numpy()
@@ -555,29 +613,25 @@ for batch_idx, data in enumerate(dataset, start=1):
     axes[0,0].scatter(first_np, second_np, alpha=0.3, s=10)
     axes[0,0].set_xlabel('First Term (log-odds sum)', fontsize=12)
     axes[0,0].set_ylabel('Second Term (penalty)', fontsize=12)
-    axes[0,0].set_title('Loss Components per TCR')
+    axes[0,0].set_title(f'Loss Components per TCR\n({"Exact" if EXACT_LIKELIHOOD else "Simplified"} Likelihood)')
     
     # BCE - handle both (B,) and (B, A) shapes
     bce_np = bce.numpy()
     
     if len(bce_np.shape) == 1:
-        # bce is (B,) - per-sample scalar loss
         axes[0,1].hist(bce_np, bins=50, edgecolor='black', alpha=0.7, color='purple')
         axes[0,1].set_xlabel('BCE Loss per TCR', fontsize=12)
         axes[0,1].set_ylabel('Count', fontsize=12)
         axes[0,1].set_title(f'BCE Loss Distribution\nMean={np.mean(bce_np):.4f}')
-        
-        bce_per_sample = bce_np  # Already per-sample
+        bce_per_sample = bce_np
         bce_per_allele = None
     else:
-        # bce is (B, A) - per-sample, per-allele loss
         sns.heatmap(bce_np[:100], ax=axes[0,1], cmap='Reds', vmin=0)
         axes[0,1].set_xlabel('Allele', fontsize=12)
         axes[0,1].set_ylabel('TCR', fontsize=12)
         axes[0,1].set_title(f'BCE Loss per TCR-Allele (first 100 TCRs)\nMean={np.mean(bce_np):.4f}')
-        
-        bce_per_sample = np.sum(bce_np, axis=1)  # Sum over alleles -> (B,)
-        bce_per_allele = np.mean(bce_np, axis=0)  # Mean over samples -> (A,)
+        bce_per_sample = np.sum(bce_np, axis=1)
+        bce_per_allele = np.mean(bce_np, axis=0)
     
     # BCE per-sample histogram
     axes[0,2].hist(bce_per_sample, bins=50, edgecolor='black', alpha=0.7, color='purple')
@@ -586,7 +640,7 @@ for batch_idx, data in enumerate(dataset, start=1):
     axes[0,2].set_title(f'BCE Loss per TCR\nMean={np.mean(bce_per_sample):.4f}, Std={np.std(bce_per_sample):.4f}')
     
     # Likelihood
-    ll_np = first_np - second_np
+    ll_np = first_np + second_np if EXACT_LIKELIHOOD else first_np - second_np
     axes[1,0].hist(ll_np, bins=50, edgecolor='black', alpha=0.7, color='teal')
     axes[1,0].set_xlabel('Log-Likelihood', fontsize=12)
     axes[1,0].set_ylabel('Count', fontsize=12)
@@ -599,7 +653,7 @@ for batch_idx, data in enumerate(dataset, start=1):
     axes[1,1].set_ylabel('Count', fontsize=12)
     axes[1,1].set_title(f'Donors per TCR\nMean={np.mean(ni_size_np):.1f}, Max={np.max(ni_size_np):.0f}')
     
-    # BCE per-allele (only if bce is 2D)
+    # BCE per-allele
     if bce_per_allele is not None:
         axes[1,2].bar(range(len(bce_per_allele)), bce_per_allele, width=1.0, alpha=0.7, color='purple')
         axes[1,2].set_xlabel('Allele index', fontsize=12)
@@ -612,13 +666,90 @@ for batch_idx, data in enumerate(dataset, start=1):
     
     plt.tight_layout()
     save_fig(fig, f'06_loss_components_batch{batch_idx}')
+    
     # =========================================================================
-    # 2.7: RECONSTRUCTION ANALYSIS (NEW)
+    # NEW 2.6b: EXACT LIKELIHOOD SPECIFIC ANALYSIS
+    # =========================================================================
+    if EXACT_LIKELIHOOD and log_p_ni_all is not None:
+        print("  Generating exact likelihood specific plots...")
+        
+        log_p_ni_all_np = log_p_ni_all.numpy()
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        
+        # Heatmap of log_p_ni_all (first 50 TCRs, first 200 donors)
+        display_tcrs = min(50, log_p_ni_all_np.shape[0])
+        display_donors = min(200, log_p_ni_all_np.shape[1])
+        sns.heatmap(log_p_ni_all_np[:display_tcrs, :display_donors], 
+                    ax=axes[0,0], cmap='viridis', vmin=-10, vmax=0)
+        axes[0,0].set_title(f'log(p_ni) for ALL donors\n(first {display_tcrs} TCRs, {display_donors} donors)', fontsize=12)
+        axes[0,0].set_xlabel('Donor index')
+        axes[0,0].set_ylabel('TCR index')
+        
+        # Distribution of log_p_ni_all
+        valid_mask = loss_func.valid_donor_mask.numpy() > 0.5
+        valid_log_pni = log_p_ni_all_np[:, valid_mask].flatten()
+        axes[0,1].hist(valid_log_pni, bins=50, edgecolor='black', alpha=0.7, color='teal')
+        axes[0,1].set_xlabel('log(p_ni)', fontsize=12)
+        axes[0,1].set_ylabel('Count', fontsize=12)
+        axes[0,1].set_title(f'Distribution of log(p_ni) over ALL valid donors\nMean={np.mean(valid_log_pni):.4f}')
+        
+        # Compare p_ni distributions: N_i donors vs all donors
+        log_p_ni_Ni_np = log_p_ni.numpy()
+        # Flatten and filter valid
+        mask_Ni = gamma_donor_id_mask.numpy() > 0.5
+        valid_log_pni_Ni = log_p_ni_Ni_np[mask_Ni].flatten()
+        
+        axes[0,2].hist(valid_log_pni_Ni, bins=50, alpha=0.5, label='Donors in N_i', color='blue')
+        axes[0,2].hist(valid_log_pni, bins=50, alpha=0.5, label='ALL donors', color='red')
+        axes[0,2].set_xlabel('log(p_ni)', fontsize=12)
+        axes[0,2].set_ylabel('Count', fontsize=12)
+        axes[0,2].set_title('Comparison: N_i donors vs ALL donors')
+        axes[0,2].legend()
+        
+        # Per-donor mean log_p_ni
+        per_donor_mean = np.mean(log_p_ni_all_np, axis=0)
+        axes[1,0].bar(range(len(per_donor_mean)), per_donor_mean, width=1.0, alpha=0.7)
+        axes[1,0].set_xlabel('Donor index', fontsize=12)
+        axes[1,0].set_ylabel('Mean log(p_ni)', fontsize=12)
+        axes[1,0].set_title('Mean log(p_ni) per Donor (across all TCRs)')
+        
+        # Second term breakdown: contribution from each donor
+        # log_one_minus_qp_all = log(1 - q*p_ni) for all donors
+        log_q_np = tf.math.log_sigmoid(q_logits).numpy()
+        log_qp_all_np = log_q_np[:, np.newaxis] + log_p_ni_all_np
+        
+        # Approximate log(1 - exp(x)) for visualization
+        qp_all = np.exp(np.clip(log_qp_all_np, -100, 0))
+        one_minus_qp_all = np.clip(1 - qp_all, 1e-10, 1)
+        log_one_minus_qp_all_np = np.log(one_minus_qp_all)
+        
+        # Mask invalid donors
+        log_one_minus_qp_all_np[:, ~valid_mask] = 0
+        
+        per_donor_contribution = np.mean(log_one_minus_qp_all_np, axis=0)
+        axes[1,1].bar(range(len(per_donor_contribution)), per_donor_contribution, width=1.0, alpha=0.7, color='purple')
+        axes[1,1].set_xlabel('Donor index', fontsize=12)
+        axes[1,1].set_ylabel('Mean ln(1-q*p_ni)', fontsize=12)
+        axes[1,1].set_title('Mean Second Term Contribution per Donor')
+        
+        # Scatter: first term vs exact second term
+        axes[1,2].scatter(first_np, second_np, alpha=0.3, s=10, c='teal')
+        axes[1,2].set_xlabel('First Term', fontsize=12)
+        axes[1,2].set_ylabel('Second Term (Exact)', fontsize=12)
+        axes[1,2].set_title(f'First vs Second Term (Exact)\nCorr={np.corrcoef(first_np, second_np)[0,1]:.3f}')
+        
+        plt.tight_layout()
+        save_fig(fig, f'06b_exact_likelihood_analysis_batch{batch_idx}')
+    # =========================================================================
+    
+    # =========================================================================
+    # 2.7: RECONSTRUCTION ANALYSIS
     # =========================================================================
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
     # Reconstruction loss distribution per token
-    valid_losses = per_token_loss_np[per_token_loss_np > 0]  # Non-masked positions
+    valid_losses = per_token_loss_np[per_token_loss_np > 0]
     axes[0,0].hist(valid_losses.flatten(), bins=50, edgecolor='black', alpha=0.7, color='green')
     axes[0,0].set_xlabel('Per-token CE Loss', fontsize=12)
     axes[0,0].set_ylabel('Count', fontsize=12)
@@ -632,16 +763,14 @@ for batch_idx, data in enumerate(dataset, start=1):
     axes[0,1].set_ylabel('Mean CE Loss', fontsize=12)
     axes[0,1].set_title('Reconstruction Loss by Position')
     
-    # Confusion matrix for amino acid predictions (sampled)
-    pred_tokens = np.argmax(recon_out_np, axis=-1)  # (B, S)
+    # Confusion matrix
+    pred_tokens = np.argmax(recon_out_np, axis=-1)
     true_tokens = tcr_seqs.numpy().astype(int)
     
-    # Flatten and filter out padding
     mask_flat = (tcr_seqs.numpy() != PAD_TOKEN).flatten()
     pred_flat = pred_tokens.flatten()[mask_flat]
     true_flat = true_tokens.flatten()[mask_flat.astype(bool)]
     
-    # Create confusion matrix (sample if too large)
     if len(pred_flat) > 50000:
         sample_idx = np.random.choice(len(pred_flat), 50000, replace=False)
         pred_flat = pred_flat[sample_idx]
@@ -652,7 +781,6 @@ for batch_idx, data in enumerate(dataset, start=1):
         if 0 <= p < 21 and 0 <= t < 21:
             conf_matrix[t, p] += 1
     
-    # Normalize by row (true class)
     conf_matrix_norm = conf_matrix / (conf_matrix.sum(axis=1, keepdims=True) + 1e-10)
     
     sns.heatmap(conf_matrix_norm, ax=axes[0,2], cmap='Blues', 
@@ -679,7 +807,6 @@ for batch_idx, data in enumerate(dataset, start=1):
         true_seq = tokens_to_sequence(tcr_seqs[i].numpy(), PAD_TOKEN)
         pred_seq = tokens_to_sequence(pred_tokens[i], PAD_TOKEN)
         
-        # Mark differences
         diff_markers = ""
         for t, p in zip(true_seq, pred_seq):
             diff_markers += "^" if t != p else " "
@@ -696,7 +823,7 @@ for batch_idx, data in enumerate(dataset, start=1):
     axes[1,1].set_title('Sample Reconstructions')
     
     # Prediction confidence distribution
-    pred_confidences = np.max(recon_out_np, axis=-1)  # (B, S)
+    pred_confidences = np.max(recon_out_np, axis=-1)
     valid_confidences = pred_confidences[tcr_seqs.numpy() != PAD_TOKEN]
     axes[1,2].hist(valid_confidences.flatten(), bins=50, edgecolor='black', alpha=0.7, color='blue')
     axes[1,2].set_xlabel('Prediction Confidence (max softmax)', fontsize=12)
@@ -707,16 +834,15 @@ for batch_idx, data in enumerate(dataset, start=1):
     save_fig(fig, f'07_reconstruction_analysis_batch{batch_idx}')
     
     # =========================================================================
-    # 2.8: ATTENTION VISUALIZATION (if available)
+    # 2.8: ATTENTION VISUALIZATION
     # =========================================================================
     if att_score is not None:
-        att_np = att_score.numpy()  # Shape: (B, heads, seq, seq)
+        att_np = att_score.numpy()
         
         fig, axes = plt.subplots(2, 4, figsize=(20, 10))
         
-        # Show attention for first TCR, all heads
         sample_idx = 0
-        if len(att_np.shape) == 4:  # (B, heads, seq, seq)
+        if len(att_np.shape) == 4:
             num_heads = min(8, att_np.shape[1])
             for h in range(num_heads):
                 row, col = h // 4, h % 4
@@ -734,6 +860,7 @@ for batch_idx, data in enumerate(dataset, start=1):
     batch_stats = {
         'batch': batch_idx,
         'num_samples': true_probs_np.shape[0],
+        'exact_likelihood': EXACT_LIKELIHOOD,
         'gamma_mean': np.mean(gamma_probs),
         'gamma_std': np.std(gamma_probs),
         'gamma_max': np.max(gamma_probs),
@@ -749,11 +876,19 @@ for batch_idx, data in enumerate(dataset, start=1):
         'bce_mean': np.mean(bce_np),
         'bce_per_sample_mean': np.mean(bce_per_sample),
         'll_mean': np.mean(ll_np),
+        'first_term_mean': np.mean(first_np),
+        'second_term_mean': np.mean(second_np),
         'per_allele_corr_mean': np.nanmean(allele_corrs),
         'recon_loss': recon_loss_np,
         'recon_accuracy': recon_acc_np,
         'recon_confidence_mean': np.mean(valid_confidences),
     }
+    
+    # Add exact likelihood specific stats
+    if EXACT_LIKELIHOOD and log_p_ni_all is not None:
+        batch_stats['log_p_ni_all_mean'] = np.mean(valid_log_pni)
+        batch_stats['log_p_ni_all_std'] = np.std(valid_log_pni)
+    
     all_stats.append(batch_stats)
 
 # =============================================================================
@@ -773,6 +908,8 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Model: {MODEL_PATH}
 Batches analyzed: {NUM_BATCHES_TO_ANALYZE}
 Batch size: {BATCH_SIZE}
+Likelihood Type: {'EXACT (Equation 4)' if EXACT_LIKELIHOOD else 'SIMPLIFIED (Equation 8)'}
+Number of Valid Donors: {NUM_VALID_DONORS}
 
 {'='*60}
 1. ALLELE FREQUENCY ISSUE (Na=0 Bug)
@@ -799,11 +936,6 @@ Expected by chance:
 - Top-5 overlap: ~0.07/5 (for 358 classes)
 - Top-10 overlap: ~0.28/10 (for 358 classes)
 
-INTERPRETATION:
-- Overlap >> chance: Model is learning meaningful patterns
-- Overlap ~ chance: Model not learning or mode collapse
-- Check mode collapse plots for concentration on few alleles
-
 STATUS: {'✓ Good overlap - model learning' if np.mean([s['top5_overlap_mean'] for s in all_stats]) > 2 else '⚠️ Low overlap - check mode collapse'}
 
 {'='*60}
@@ -814,11 +946,6 @@ True probs std:           {np.mean([s['true_probs_std'] for s in all_stats]):.6f
 Pred probs std:           {np.mean([s['pred_probs_std'] for s in all_stats]):.6f}
 Delta logits std:         {np.mean([s['delta_logits_std'] for s in all_stats]):.6f}
 Per-allele correlation:   {np.mean([s['per_allele_corr_mean'] for s in all_stats]):.4f}
-
-INTERPRETATION:
-- If pred_probs_std << true_probs_std: Model predictions too uniform
-- If delta_logits_std is low: Model not differentiating alleles
-- Per-allele correlation should be positive if model is learning
 
 {'='*60}
 4. MODEL OUTPUT STATISTICS
@@ -831,28 +958,39 @@ Q (Sampling probability):
   Mean: {np.mean([s['q_mean'] for s in all_stats]):.8f}
   Max:  {np.mean([s['q_max'] for s in all_stats]):.8f}
 
-INTERPRETATION:
-- Very low Q values (< 0.001) may indicate model is "giving up"
-- Gamma values should vary across alleles if model is discriminating
-
 {'='*60}
 5. LOSS COMPONENTS
 {'='*60}
 BCE Loss (mean per element):    {np.mean([s['bce_mean'] for s in all_stats]):.4f}
 BCE Loss (mean per sample):     {np.mean([s['bce_per_sample_mean'] for s in all_stats]):.4f}
 Log-Likelihood (mean):          {np.mean([s['ll_mean'] for s in all_stats]):.4f}
+First Term (mean):              {np.mean([s['first_term_mean'] for s in all_stats]):.4f}
+Second Term (mean):             {np.mean([s['second_term_mean'] for s in all_stats]):.4f}
+"""
 
+# Add exact likelihood specific stats
+if EXACT_LIKELIHOOD and 'log_p_ni_all_mean' in all_stats[0]:
+    summary_report += f"""
 {'='*60}
-6. RECONSTRUCTION QUALITY (NEW)
+5b. EXACT LIKELIHOOD SPECIFIC STATISTICS
+{'='*60}
+log(p_ni) over ALL donors:
+  Mean: {np.mean([s['log_p_ni_all_mean'] for s in all_stats]):.4f}
+  Std:  {np.mean([s['log_p_ni_all_std'] for s in all_stats]):.4f}
+
+INTERPRETATION:
+- Exact likelihood computes Σ_n ln(1 - q*p_ni) over ALL N donors
+- This avoids the approximation assumptions in Equation 8
+- Second term should be more accurate for cross-reactive TCRs
+"""
+
+summary_report += f"""
+{'='*60}
+6. RECONSTRUCTION QUALITY
 {'='*60}
 Reconstruction Loss:            {np.mean([s['recon_loss'] for s in all_stats]):.4f}
 Reconstruction Accuracy:        {np.mean([s['recon_accuracy'] for s in all_stats]):.4f}
 Mean Prediction Confidence:     {np.mean([s['recon_confidence_mean'] for s in all_stats]):.4f}
-
-INTERPRETATION:
-- High reconstruction accuracy (>0.8) indicates good sequence encoding
-- Low accuracy may suggest the encoder is not capturing sequence information
-- This auxiliary task helps prevent mode collapse in the latent space
 
 STATUS: {'✓ Good reconstruction' if np.mean([s['recon_accuracy'] for s in all_stats]) > 0.7 else '⚠️ Low reconstruction accuracy - check encoder'}
 
@@ -861,51 +999,26 @@ STATUS: {'✓ Good reconstruction' if np.mean([s['recon_accuracy'] for s in all_
 {'='*60}
 """
 
-# Add recommendations based on analysis
+# Add recommendations
 recommendations = []
 
 if np.mean([s['na0_in_true_top5'] for s in all_stats]) > 100:
-    recommendations.append("""
-- ⚠️ FIX Na=0 BUG: Apply valid_allele_mask in delta_loss():
-  
-  valid_allele_mask = tf.cast(self.Na > 0, tf.float32)  # (A,)
-  log_Eia = tf.where(
-      valid_allele_mask[tf.newaxis, :] > 0.5,
-      log_Eia,
-      tf.constant(-100., dtype=log_Eia.dtype)
-  )
-""")
+    recommendations.append("- ⚠️ FIX Na=0 BUG: Apply valid_allele_mask in delta_loss()")
 
 if np.mean([s['top5_overlap_mean'] for s in all_stats]) < 2:
-    recommendations.append("""
-- ⚠️ LOW OVERLAP: Consider:
-  - Increasing softmax_loss_weight
-  - Lowering softmax_temperature (e.g., 0.1-0.5)
-  - Training longer
-  - Checking gradient flow to delta_logits layer
-""")
+    recommendations.append("- ⚠️ LOW OVERLAP: Consider increasing softmax_loss_weight or lowering temperature")
 
 if np.mean([s['per_allele_corr_mean'] for s in all_stats]) < 0.1:
-    recommendations.append("""
-- ⚠️ LOW CORRELATION: Per-allele correlation is very low
-  - Model may not be learning TCR-specific patterns
-  - Check if true labels have sufficient variation
-""")
+    recommendations.append("- ⚠️ LOW CORRELATION: Model may not be learning TCR-specific patterns")
 
 if np.mean([s['recon_accuracy'] for s in all_stats]) < 0.7:
-    recommendations.append("""
-- ⚠️ LOW RECONSTRUCTION ACCURACY: 
-  - Increase RECON_WEIGHT to prioritize sequence learning
-  - Check if encoder capacity is sufficient
-  - Verify reconstruction branch architecture
-""")
+    recommendations.append("- ⚠️ LOW RECONSTRUCTION: Increase RECON_WEIGHT or check encoder capacity")
+
+if EXACT_LIKELIHOOD:
+    recommendations.append(f"- ℹ️ Using EXACT likelihood - compare with SIMPLIFIED to verify improvement")
 
 if not recommendations:
-    recommendations.append("""
-- ✓ No critical issues detected
-- Continue monitoring training progress
-- Consider fine-tuning hyperparameters for better performance
-""")
+    recommendations.append("- ✓ No critical issues detected")
 
 summary_report += '\n'.join(recommendations)
 
@@ -920,7 +1033,6 @@ for f in sorted(os.listdir(OUTPUT_PATH)):
 
 write_stats('00_SUMMARY_REPORT.txt', summary_report)
 
-# Also print summary to console
 print(summary_report)
 
 print("\n" + "="*80)
@@ -937,9 +1049,8 @@ print("="*80)
 
 # Which alleles have high gamma across all TCRs?
 gamma_probs = tf.nn.sigmoid(gamma_logits).numpy()
-allele_means = np.mean(gamma_probs, axis=0)  # Mean gamma per allele
+allele_means = np.mean(gamma_probs, axis=0)
 
-# Top 10 alleles by average gamma
 top_gamma_alleles = np.argsort(allele_means)[::-1][:10]
 print("\nTop 10 alleles by mean gamma:", top_gamma_alleles)
 print("Their Na values:", [loss_func.Na[a].numpy() for a in top_gamma_alleles])
@@ -950,6 +1061,7 @@ first_np = first_term.numpy()
 second_np = second_term.numpy()
 print(f"\nFirst term: mean={np.mean(first_np):.2f}, std={np.std(first_np):.2f}")
 print(f"Second term: mean={np.mean(second_np):.2f}, std={np.std(second_np):.2f}")
+print(f"Likelihood type: {'EXACT' if EXACT_LIKELIHOOD else 'SIMPLIFIED'}")
 
 # Check which alleles appear in most TCR donor pools
 allele_presence = tf.reduce_sum(tf.cast(tf.reduce_sum(Ni, axis=1) > 0, tf.float32), axis=0).numpy()
@@ -965,44 +1077,37 @@ print(f"  Accuracy: {recon_acc_np:.4f}")
 print(f"  Confidence: {np.mean(valid_confidences):.4f}")
 
 # =============================================================================
-# SECTION 5: EMBEDDING SPACE ANALYSIS (Optional)
+# SECTION 5: EMBEDDING SPACE ANALYSIS
 # =============================================================================
 print("\n" + "="*80)
 print("SECTION 5: EMBEDDING SPACE ANALYSIS")
 print("="*80)
 
-# Get pooled representations (if accessible)
 try:
-    # Create a model that outputs the pooled layer
     pooled_model = keras.Model(
         inputs=model.inputs,
         outputs=model.get_layer('pool').output
     )
     
-    # Get pooled representations
     pooled_output = pooled_model([tcr_seqs, tcr_seq_mask]).numpy()
     
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
-    # Pooled representation statistics
     axes[0].hist(pooled_output.flatten(), bins=50, edgecolor='black', alpha=0.7)
     axes[0].set_xlabel('Pooled activation value', fontsize=12)
     axes[0].set_ylabel('Count', fontsize=12)
     axes[0].set_title(f'Pooled Representation Distribution\nMean={np.mean(pooled_output):.4f}, Std={np.std(pooled_output):.4f}')
     
-    # Per-dimension variance
     dim_vars = np.var(pooled_output, axis=0)
     axes[1].bar(range(len(dim_vars)), dim_vars, width=1.0, alpha=0.7)
     axes[1].set_xlabel('Dimension', fontsize=12)
     axes[1].set_ylabel('Variance', fontsize=12)
     axes[1].set_title('Variance per Embedding Dimension')
     
-    # 2D projection using PCA
     from sklearn.decomposition import PCA
     pca = PCA(n_components=2)
-    pooled_2d = pca.fit_transform(pooled_output[:500])  # First 500 samples
+    pooled_2d = pca.fit_transform(pooled_output[:500])
     
-    # Color by Ni_size
     axes[2].scatter(pooled_2d[:, 0], pooled_2d[:, 1], c=ni_size_np[:500], 
                     cmap='viridis', alpha=0.5, s=10)
     axes[2].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%})', fontsize=12)

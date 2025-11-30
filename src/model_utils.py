@@ -1122,3 +1122,594 @@ class LogSpaceLikelihood(keras.losses.Loss):
         return invalid_gamma_penalty
     
 
+
+
+
+
+
+class LogSpaceExactLikelihood(keras.losses.Loss):
+    """
+    ===================================================================================
+    EXACT LIKELIHOOD COMPUTATION (EQUATION 4)
+    ===================================================================================
+    
+    From the document, Equation 4:
+    
+        LL_i = Σ_{n ∈ N_i} ln(q_i * p_ni / (1 - q_i * p_ni)) + Σ_{n=1}^{N} ln(1 - q_i * p_ni)
+               \___________ First Term ___________________/   \____ Second Term ____/
+    
+    Where:
+        - N_i = set of donors whose sample contains TCR sequence i
+        - p_ni = probability that TCR i can bind to an HLA allotype in donor n
+        - q_i = probability of observing TCR i given donor has the right HLA
+        - N = total number of donors (702 in our case)
+    
+    And p_ni is defined by Equation 1:
+    
+        p_ni = 1 - Π_{a=1}^{A} (1 - γ_ia)^{x_na}
+    
+    Where:
+        - γ_ia = probability that TCR i binds to HLA allele a
+        - x_na = 1 if donor n has allele a, 0 otherwise
+    
+    ===================================================================================
+    DIFFERENCE FROM EQUATION 8 (SIMPLIFIED LIKELIHOOD)
+    ===================================================================================
+    
+    Equation 8 approximates the second term:
+    
+        Σ_{n=1}^{N} ln(1 - q_i * p_ni) ≈ -q_i * Σ_{a=1}^{A} N_a * γ_ia
+    
+    This approximation assumes:
+        1. q_i * p_ni << 1 for all donors (so ln(1-x) ≈ -x)
+        2. Each TCR binds to only ONE HLA allele (for product-to-sum conversion)
+    
+    YOUR CONCERN: These assumptions may not hold!
+        - For public TCRs with |N_i|=10, q_i ≈ 0.26 (not small!)
+        - Cross-reactive TCRs bind multiple alleles
+    
+    THIS CLASS: Computes the EXACT second term by summing over ALL N donors.
+    
+    ===================================================================================
+    COMPLEXITY TRADE-OFF
+    ===================================================================================
+    
+    Simplified (Eq 8): O(B * |N_i| * A) for first term + O(B * A) for second term
+    Exact (Eq 4):      O(B * |N_i| * A) for first term + O(B * N * A) for second term
+    
+    For B=5000, N=702, A=358: exact version adds ~1.3 billion operations per batch
+    """
+    
+    def __init__(
+        self, 
+        donor_mhc: tf.Tensor,
+        pad_token: int | float = -2,
+        test_mode: bool = False,
+        use_softmax_loss: bool = True,
+        softmax_loss_weight: float = 1.0,
+        softmax_temperature: float = 1.0,
+        fix_q: bool = True,
+        num_mhc: int = 358,
+        N: float = 702.,
+        **kwargs
+    ):
+        """
+        Initialize the exact likelihood loss.
+        
+        Args:
+            donor_mhc: Binary tensor of shape (N_expanded, A) where:
+                - N_expanded = max_patient_id + 1 (may include zero rows for missing IDs)
+                - A = number of HLA alleles
+                - donor_mhc[n, a] = 1 if donor n has allele a, 0 otherwise
+                
+                IMPORTANT: In your code, donor_mhc is expanded to handle non-contiguous
+                patient IDs. Many rows may be all zeros (invalid donors).
+                
+            pad_token: Value used to pad variable-length donor ID lists (default: -2)
+            
+            test_mode: If True, return intermediate tensors for debugging
+            
+            use_softmax_loss: If True, compute auxiliary BCE loss on delta_logits
+            
+            softmax_loss_weight: Weight for the auxiliary loss
+            
+            softmax_temperature: Temperature for softmax in auxiliary loss
+            
+            fix_q: If True, use fixed formula for q_i instead of learning it:
+                   q_i = |N_i| * A / (|N_i| * A + 24N)
+                   
+            num_mhc: Total number of HLA alleles (A = 358)
+            
+            N: ACTUAL number of valid donors (702), NOT the expanded array size!
+               CHANGE FROM ORIGINAL: Made this an explicit parameter instead of inferring
+               from donor_mhc.shape[0], which would give wrong value for expanded arrays.
+        """
+        super().__init__()
+        
+        # Store donor HLA profiles
+        # Shape: (N_expanded, A) where N_expanded >= N (may have zero rows)
+        self.donor_mhc = tf.cast(donor_mhc, dtype=tf.float32)
+        
+        self.pad_token = tf.cast(pad_token, tf.int32)
+        self.test_mode = test_mode
+        self.use_softmax_loss = use_softmax_loss
+        self.softmax_loss_weight = softmax_loss_weight
+        self.softmax_temperature = softmax_temperature
+        self.fix_q = fix_q
+        
+        # CHANGE: Use explicit N parameter, not inferred from array
+        # Original code had: self.N = 702. (hardcoded)
+        # We keep this behavior but make it a parameter
+        self.N = N
+        
+        # Precompute N_a = number of donors carrying each allele
+        # Used in: auxiliary loss (delta_loss) and regularization
+        # Shape: (A,)
+        self.Na = tf.reduce_sum(self.donor_mhc, axis=0)
+        self.log_Na = tf.math.log(self.Na + 1e-10)
+        
+        # Mask for valid alleles (those present in at least one donor)
+        # Shape: (A,) - 1.0 if Na > 0, else 0.0
+        self.valid_allele_mask = tf.cast(self.Na > 0, tf.float32)
+        
+        # =========================================================================
+        # NEW: Precompute valid donor mask
+        # =========================================================================
+        # Problem: donor_mhc may have rows that are all zeros (invalid donors)
+        # These occur because patient IDs are non-contiguous and we expanded the array
+        # 
+        # For invalid donors:
+        #   - All x_na = 0
+        #   - p_ni = 1 - Π(1-γ)^0 = 1 - 1 = 0
+        #   - ln(1 - q*0) = ln(1) = 0 (contributes nothing to second term)
+        #
+        # But numerically, we need to handle this carefully to avoid log1mexp(0) issues
+        #
+        # Shape: (N_expanded,) - 1.0 if donor has at least one allele, else 0.0
+        donor_allele_count = tf.reduce_sum(self.donor_mhc, axis=-1)  # (N_expanded,)
+        self.valid_donor_mask = tf.cast(donor_allele_count > 0, tf.float32)
+        self.num_valid_donors = tf.reduce_sum(self.valid_donor_mask)
+        # =========================================================================
+        
+        self.BCE = keras.losses.BinaryCrossentropy(from_logits=True, reduction='none')
+        self.A = tf.constant(num_mhc, dtype=tf.float32)
+        self.log_A = tf.math.log(self.A)
+    
+    def call(self, gamma_logits, q_logits, gamma_donor_id, delta_logits):
+        """
+        Compute the exact negative log-likelihood loss.
+        
+        =======================================================================
+        INPUT SHAPES
+        =======================================================================
+        
+        gamma_logits: (B, A)
+            - B = batch size (number of TCR sequences in this batch)
+            - A = number of HLA alleles (358)
+            - These are LOGITS, not probabilities!
+            - γ_ia = sigmoid(gamma_logits[i, a])
+            
+        q_logits: (B,) or (B, 1)
+            - LOGITS for q_i probability
+            - q_i = sigmoid(q_logits[i])
+            - If fix_q=True, these are ignored and q is computed from formula
+            
+        gamma_donor_id: (B, max_Ni)
+            - For each TCR i, lists the donor IDs that contain this TCR
+            - max_Ni = maximum number of donors for any TCR in this batch
+            - Padded with pad_token (-2) for TCRs with fewer donors
+            - Example: TCR 0 appears in donors [5, 12, 47], TCR 1 in [3, 8]
+              gamma_donor_id = [[5, 12, 47], [3, 8, -2]]
+              
+        delta_logits: (B, A)
+            - Auxiliary output for BCE loss (helps training)
+            - Not used in main likelihood computation
+        
+        =======================================================================
+        OUTPUT
+        =======================================================================
+        
+        If test_mode=False:
+            Returns: (negative_LL + regularization, auxiliary_BCE_loss)
+            Both have shape (B,)
+            
+        If test_mode=True:
+            Returns tuple of intermediate tensors for debugging
+        """
+        
+        # =====================================================================
+        # STEP 1: Prepare q_logits shape
+        # =====================================================================
+        # Model may output (B, 1), we need (B,)
+        if len(tf.shape(q_logits)) == 2:
+            q_logits = tf.squeeze(q_logits, axis=-1)
+        # q_logits shape: (B,)
+        
+        # =====================================================================
+        # STEP 2: Convert logits to log-probabilities (numerically stable)
+        # =====================================================================
+        # We work in LOG SPACE to avoid underflow/overflow
+        #
+        # For logits z:
+        #   γ = sigmoid(z) = 1 / (1 + exp(-z))
+        #   log(γ) = log(sigmoid(z)) = -log(1 + exp(-z)) = log_sigmoid(z)
+        #   log(1-γ) = log(1 - sigmoid(z)) = log(sigmoid(-z)) = log_sigmoid(-z)
+        #
+        # TensorFlow's log_sigmoid is numerically stable for all z values
+        
+        log_gamma = tf.math.log_sigmoid(gamma_logits)
+        # Shape: (B, A)
+        # Values: negative (since γ < 1, log(γ) < 0)
+        # Example: if γ = 0.01, log(γ) ≈ -4.6
+        
+        log_one_minus_gamma = tf.math.log_sigmoid(-gamma_logits)
+        # Shape: (B, A)
+        # Values: negative (since 1-γ < 1)
+        # Example: if γ = 0.01, log(1-γ) ≈ -0.01
+        
+        log_q = tf.math.log_sigmoid(q_logits)
+        # Shape: (B,)
+        
+        # =====================================================================
+        # STEP 3: Get donor information for N_i (donors containing each TCR)
+        # =====================================================================
+        Ni_size, Ni, gamma_donor_id_mask = self.calculate_Ni_Nisize(gamma_donor_id)
+        #
+        # Ni_size: (B,)
+        #   - Number of donors for each TCR (|N_i|)
+        #   - Example: [3, 2] if TCR 0 has 3 donors, TCR 1 has 2
+        #
+        # Ni: (B, max_Ni, A)
+        #   - HLA profiles of donors in N_i
+        #   - Ni[i, j, a] = 1 if j-th donor of TCR i has allele a
+        #   - Padded rows are all zeros
+        #
+        # gamma_donor_id_mask: (B, max_Ni)
+        #   - 1.0 for valid donors, 0.0 for padded positions
+        #   - Example: [[1, 1, 1], [1, 1, 0]] for above example
+        
+        # =====================================================================
+        # STEP 4: Compute q_i (optionally fixed to formula)
+        # =====================================================================
+        if self.fix_q:
+            # Use formula from document:
+            # q_i = |N_i| * A / (|N_i| * A + 24N)
+            #
+            # In log space:
+            # log(q_i) = log(|N_i| * A) - log(|N_i| * A + 24N)
+            #          = log(|N_i|) + log(A) - log(|N_i| * A + 24N)
+            #
+            # For the denominator, use logsumexp for stability:
+            # log(a + b) = logsumexp([log(a), log(b)])
+            
+            log_q = tf.zeros_like(log_q)  # Zero out learned q
+            
+            log_numerator = tf.math.log(Ni_size + 1e-10) + self.log_A
+            # Shape: (B,)
+            # = log(|N_i|) + log(A)
+            
+            log_N_times_24 = tf.math.log(24.0) + tf.math.log(self.N)
+            # Scalar: log(24 * 702) ≈ 9.73
+            
+            log_N_times_24 = tf.broadcast_to(log_N_times_24, tf.shape(log_numerator))
+            # Shape: (B,)
+            
+            # log(|N_i|*A + 24N) = logsumexp([log(|N_i|*A), log(24N)])
+            log_denominator = tf.math.reduce_logsumexp(
+                tf.stack([log_numerator, log_N_times_24], axis=-1), 
+                axis=-1
+            )
+            # Shape: (B,)
+            
+            log_q = log_numerator - log_denominator
+            # Shape: (B,)
+            # Example: |N_i|=2, A=358, N=702
+            #   numerator = 2 * 358 = 716
+            #   denominator = 716 + 24*702 = 716 + 16848 = 17564
+            #   q = 716/17564 ≈ 0.041
+            #   log(q) ≈ -3.2
+        
+        # =====================================================================
+        # STEP 5: Compute FIRST TERM (sum over donors in N_i)
+        # =====================================================================
+        # First term: Σ_{n ∈ N_i} ln(q_i * p_ni / (1 - q_i * p_ni))
+        #           = Σ_{n ∈ N_i} [ln(q_i * p_ni) - ln(1 - q_i * p_ni)]
+        #           = Σ_{n ∈ N_i} [log_q + log_p_ni - ln(1 - exp(log_q + log_p_ni))]
+        
+        # Step 5a: Compute log(p_ni) for donors in N_i
+        log_p_ni_Ni = self.calculate_log_pni(Ni, log_one_minus_gamma, gamma_donor_id_mask)
+        # Shape: (B, max_Ni)
+        # Values: negative (since p_ni < 1)
+        # Padded positions: -100 (represents log(0))
+        
+        # Step 5b: Compute log(q * p_ni) = log(q) + log(p_ni)
+        log_qp_Ni = log_q[:, tf.newaxis] + log_p_ni_Ni
+        # Shape: (B, max_Ni)
+        # Broadcast: (B, 1) + (B, max_Ni) -> (B, max_Ni)
+        
+        # Step 5c: Compute log(1 - q * p_ni) using log1mexp
+        # Since log_qp_Ni = log(q*p), we have q*p = exp(log_qp_Ni)
+        # So log(1 - q*p) = log(1 - exp(log_qp_Ni)) = log1mexp(log_qp_Ni)
+        log_one_minus_qp_Ni = log1mexp(log_qp_Ni)
+        # Shape: (B, max_Ni)
+        
+        # Step 5d: Compute log-odds
+        log_odds_Ni = log_qp_Ni - log_one_minus_qp_Ni
+        # Shape: (B, max_Ni)
+        # = ln(q*p / (1 - q*p))
+        
+        # Step 5e: Apply mask and sum
+        first_term = tf.reduce_sum(log_odds_Ni * gamma_donor_id_mask, axis=-1)
+        # Shape: (B,)
+        # Mask zeros out padded positions before summing
+        
+        # =====================================================================
+        # STEP 6: Compute SECOND TERM (sum over ALL donors) - THIS IS THE KEY CHANGE!
+        # =====================================================================
+        # Second term: Σ_{n=1}^{N} ln(1 - q_i * p_ni)
+        #
+        # ORIGINAL (Eq 8): Approximated as -q_i * Σ_a N_a * γ_ia
+        # NEW (Eq 4): Compute EXACTLY by summing over all N donors
+        #
+        # Step 6a: Compute log(p_ni) for ALL donors
+        log_p_ni_all = self.calculate_log_pni_all_donors(log_one_minus_gamma)
+        # Shape: (B, N_expanded)
+        # For each TCR in batch, compute p_ni for every donor in the cohort
+        
+        # Step 6b: Compute log(q * p_ni) for all donors
+        log_qp_all = log_q[:, tf.newaxis] + log_p_ni_all
+        # Shape: (B, N_expanded)
+        
+        # Step 6c: Compute log(1 - q * p_ni) for all donors
+        log_one_minus_qp_all = log1mexp(log_qp_all)
+        # Shape: (B, N_expanded)
+        
+        # Step 6d: Apply valid donor mask
+        # For invalid donors (zero rows in donor_mhc):
+        #   - p_ni = 0 (no alleles to bind)
+        #   - ln(1 - q*0) = ln(1) = 0 (no contribution)
+        # We explicitly mask to avoid numerical issues from log1mexp
+        log_one_minus_qp_all = log_one_minus_qp_all * self.valid_donor_mask[tf.newaxis, :]
+        # Shape: (B, N_expanded)
+        # Invalid donors now contribute 0 to the sum
+        
+        # Step 6e: Sum over all donors
+        second_term = tf.reduce_sum(log_one_minus_qp_all, axis=-1)
+        # Shape: (B,)
+        # This is NEGATIVE (sum of log values < 0)
+        
+        # =====================================================================
+        # STEP 7: Compute total log-likelihood
+        # =====================================================================
+        # LL = first_term + second_term
+        #
+        # SIGN CONVENTION:
+        # - first_term: can be positive or negative (log-odds)
+        # - second_term: NEGATIVE (sum of ln(1-x) where x > 0)
+        #
+        # In Equation 8, second term was SUBTRACTED as positive penalty: LL = first - penalty
+        # In Equation 4, second term is ADDED as negative value: LL = first + negative
+        # Mathematically equivalent, but be careful with signs!
+        
+        LL_batch = first_term + second_term
+        # Shape: (B,)
+        
+        # =====================================================================
+        # STEP 8: Auxiliary losses (same as original)
+        # =====================================================================
+        if self.use_softmax_loss:
+            true_probs = self.delta_loss(Ni)  # (B, A)
+            bce = self.BCE(true_probs, delta_logits)  # (B,)
+        else:
+            bce = tf.zeros_like(LL_batch)
+        
+        reg_term = self.regularization_term(gamma_logits)  # (B,)
+        
+        # =====================================================================
+        # STEP 9: Return loss
+        # =====================================================================
+        if not self.test_mode:
+            # Return NEGATIVE log-likelihood (for minimization)
+            return -LL_batch + reg_term, self.softmax_loss_weight * bce
+        else:
+            return (Ni_size, Ni, gamma_donor_id_mask, log_p_ni_Ni, log_p_ni_all,
+                    log_qp_Ni, log_one_minus_qp_Ni, first_term, second_term, bce,
+                    log_gamma, log_one_minus_gamma, true_probs, tf.nn.sigmoid(delta_logits))
+    
+    def calculate_log_pni_all_donors(self, log_one_minus_gamma):
+        """
+        =======================================================================
+        NEW METHOD: Compute log(p_ni) for ALL donors (for exact second term)
+        =======================================================================
+        
+        This is the KEY ADDITION for exact likelihood.
+        
+        Recall:
+            p_ni = 1 - Π_{a=1}^{A} (1 - γ_ia)^{x_na}
+        
+        In log space:
+            log(Π (1-γ)^x) = Σ x * log(1-γ)   [product -> sum]
+            
+        Let log_prod = Σ_a x_na * log(1-γ_ia)
+        Then p_ni = 1 - exp(log_prod)
+        And log(p_ni) = log(1 - exp(log_prod)) = log1mexp(log_prod)
+        
+        Args:
+            log_one_minus_gamma: log(1-γ), shape (B, A)
+        
+        Returns:
+            log(p_ni) for all donors, shape (B, N_expanded)
+        
+        Tensor operations:
+            donor_mhc:           (N_expanded, A)  - all donor HLA profiles
+            log_one_minus_gamma: (B, A)           - model predictions
+            
+            Broadcast multiply:  (1, N_expanded, A) * (B, 1, A) -> (B, N_expanded, A)
+            Sum over alleles:    (B, N_expanded, A) -> (B, N_expanded)
+        """
+        # Expand dimensions for broadcasting
+        log_omg_expanded = tf.expand_dims(log_one_minus_gamma, axis=1)
+        # Shape: (B, 1, A)
+        
+        donor_mhc_expanded = tf.expand_dims(self.donor_mhc, axis=0)
+        # Shape: (1, N_expanded, A)
+        
+        # Compute log(Π (1-γ)^x) = Σ x * log(1-γ)
+        # Only positions where x_na = 1 contribute (binary multiplication)
+        log_prod = tf.reduce_sum(donor_mhc_expanded * log_omg_expanded, axis=-1)
+        # Shape: (B, N_expanded)
+        #
+        # For valid donors: log_prod < 0 (sum of negative terms)
+        # For INVALID donors (all x_na = 0): log_prod = 0 (empty sum)
+        
+        # Handle invalid donors to avoid log1mexp(0) issues
+        # When log_prod = 0: exp(0) = 1, so p_ni = 1-1 = 0, log(0) = -inf
+        # We set log_prod to -100 for invalid donors, then mask the result
+        log_prod = tf.where(
+            self.valid_donor_mask[tf.newaxis, :] > 0.5,  # (1, N_expanded)
+            log_prod,
+            tf.constant(-100.0, dtype=log_prod.dtype)
+        )
+        # Shape: (B, N_expanded)
+        
+        # Compute log(p_ni) = log(1 - exp(log_prod))
+        log_p_ni = log1mexp(log_prod)
+        # Shape: (B, N_expanded)
+        
+        return log_p_ni
+    
+    def calculate_log_pni(self, Ni, log_one_minus_gamma, gamma_donor_id_mask):
+        """
+        Compute log(p_ni) for donors in N_i only (for first term).
+        
+        SAME AS ORIGINAL - no changes needed.
+        
+        Args:
+            Ni: HLA profiles of donors in N_i
+                Shape: (B, max_Ni, A)
+                Values: 0 or 1 (binary)
+                Padded rows: all zeros
+                
+            log_one_minus_gamma: log(1-γ)
+                Shape: (B, A)
+                
+            gamma_donor_id_mask: Mask for valid donors
+                Shape: (B, max_Ni)
+                Values: 1.0 for valid, 0.0 for padded
+        
+        Returns:
+            log(p_ni)
+            Shape: (B, max_Ni)
+            Padded positions: -100 (log(0))
+        """
+        # Expand log(1-γ) for broadcasting
+        log_omg_expanded = tf.expand_dims(log_one_minus_gamma, axis=1)
+        # Shape: (B, 1, A)
+        
+        log_omg_expanded = tf.broadcast_to(log_omg_expanded, tf.shape(Ni))
+        # Shape: (B, max_Ni, A)
+        
+        # Compute log(Π (1-γ)^x) = Σ x * log(1-γ)
+        log_prod = tf.reduce_sum(Ni * log_omg_expanded, axis=-1)
+        # Shape: (B, max_Ni)
+        
+        # Compute log(p_ni) = log(1 - exp(log_prod))
+        log_p_ni = log1mexp(log_prod)
+        # Shape: (B, max_Ni)
+        
+        # Mask padded positions
+        log_p_ni = tf.where(
+            gamma_donor_id_mask > 0.5,
+            log_p_ni,
+            tf.constant(-100.0, dtype=log_p_ni.dtype)  # log(0)
+        )
+        
+        return log_p_ni
+    
+    def calculate_Ni_Nisize(self, gamma_donor_id):
+        """
+        Calculate donor counts and gather HLA profiles for N_i.
+        
+        SAME AS ORIGINAL - no changes needed.
+        
+        Args:
+            gamma_donor_id: Donor IDs for each TCR
+                Shape: (B, max_Ni)
+                Values: donor indices, or pad_token (-2) for padding
+        
+        Returns:
+            Ni_size: (B,) - number of valid donors per TCR
+            Ni: (B, max_Ni, A) - HLA profiles, masked
+            gamma_donor_id_mask: (B, max_Ni) - mask (1=valid, 0=pad)
+        """
+        # Count valid donors per TCR
+        gamma_donor_id_count = tf.where(gamma_donor_id == self.pad_token, 0., 1.)
+        Ni_size = tf.reduce_sum(gamma_donor_id_count, axis=-1)
+        # Shape: (B,)
+        
+        # Create safe indices for gather (replace pad_token with 0)
+        gamma_donor_id_safe = tf.where(gamma_donor_id == self.pad_token, 0, gamma_donor_id)
+        gamma_donor_id_safe = tf.cast(gamma_donor_id_safe, tf.int32)
+        
+        # Create mask
+        gamma_donor_id_mask = tf.where(gamma_donor_id == self.pad_token, 0., 1.)
+        # Shape: (B, max_Ni)
+        
+        # Gather HLA profiles
+        Ni = tf.gather(self.donor_mhc, gamma_donor_id_safe, axis=0)
+        # Shape: (B, max_Ni, A)
+        
+        # Apply mask
+        Ni = Ni * tf.cast(gamma_donor_id_mask[:, :, tf.newaxis], Ni.dtype)
+        
+        return tf.cast(Ni_size, tf.float32), tf.cast(Ni, tf.float32), gamma_donor_id_mask
+    
+    def delta_loss(self, Ni):
+        """
+        Compute auxiliary target probabilities based on HLA enrichment.
+        
+        SAME AS ORIGINAL - no changes needed.
+        """
+        N = self.N
+        log_Na = self.log_Na
+        
+        log_Nia = tf.math.log(tf.reduce_sum(Ni, axis=1) + 1e-7)
+        
+        mask_valid = tf.reduce_any(tf.not_equal(Ni, 0), axis=-1)
+        mask_valid = tf.cast(mask_valid, tf.float32)
+        Ni_valid = tf.reduce_sum(mask_valid, axis=1, keepdims=True)
+        
+        log_fa = log_Na - tf.math.log(N)
+        log_fa = tf.clip_by_value(log_fa, -100., 0.0)
+        
+        log_pia = log_Nia - tf.math.log(Ni_valid + 1e-7)
+        log_pia = tf.clip_by_value(log_pia, -100., 0.0)
+        
+        log_Eia = log_pia - tf.expand_dims(log_fa, axis=0)
+        
+        log_Eia = tf.where(
+            self.valid_allele_mask[tf.newaxis, :] > 0.5,
+            log_Eia,
+            tf.constant(-100., dtype=log_Eia.dtype)
+        )
+        
+        log_Eia_max = tf.reduce_max(log_Eia, axis=-1, keepdims=True)
+        log_scaled = log_Eia - log_Eia_max
+        true_probs = tf.exp(log_scaled)
+        
+        return true_probs
+    
+    def regularization_term(self, gamma_logits):
+        """
+        Penalize non-zero gamma for alleles not present in cohort.
+        
+        SAME AS ORIGINAL - no changes needed.
+        """
+        invalid_mask = 1.0 - self.valid_allele_mask
+        gamma_probs = tf.nn.sigmoid(gamma_logits)
+        
+        invalid_gamma_penalty = tf.reduce_mean(
+            gamma_probs * invalid_mask[tf.newaxis, :],
+            axis=-1
+        )
+        return invalid_gamma_penalty

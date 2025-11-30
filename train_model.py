@@ -11,6 +11,10 @@ Usage:
 Configuration:
     Modify the constants at the top of the script to change training parameters,
     data paths, and operating mode (TEST_MODE vs. production training).
+    
+CHANGELOG:
+    - Added EXACT_LIKELIHOOD flag to switch between Equation 8 (simplified) and 
+      Equation 4 (exact) likelihood computation.
 """
 
 import keras
@@ -23,6 +27,7 @@ from src.model_utils import (
     AttentionLayer, 
     MaskedDense,
     LogSpaceLikelihood,
+    LogSpaceExactLikelihood,  # NEW: Import exact likelihood
     SpatialTemporalDropout1D,
     MaskedEmbeddingOHE
 )
@@ -38,7 +43,6 @@ from keras.layers import Activation
 from keras.utils import get_custom_objects
 
 # Custom bounded activation for q logits
-# This bounds the logits to a reasonable range for numerical stability
 def bounded_activation_fn(x):
     return -42.0 + 37.0 * tf.nn.sigmoid(x)
 
@@ -52,25 +56,83 @@ get_custom_objects().update({
 PAD_TOKEN = -2.
 MASK_TOKEN = -1.
 BATCH_SIZE = 5000
-EPOCH = 100
+EPOCH = 5
 TEST_MODE = False
 ATT_MODE = True
 TEST_MODE_OUTPUT_DIR = 'output/test_mode_Nov27_3'
-PARQUET_DIR = "training_logs2"
-GRAD_CLIP = True
-DECOUPLE_TRAINING = True
+PARQUET_DIR = "checkpoints/logs"
+GRAD_CLIP = False
+DECOUPLE_TRAINING = False
 CONTINUE_TRAINING = False
-MODEL_PATH = 'checkpoints/model_epoch_2.keras'
-q_ampl = 0.0
+MODEL_PATH = 'checkpoints/larger_buffer3/model_epoch_5.keras'
+q_ampl = 1.0
 gamma_ampl = 1.0
-CHECKPOINT_PATH = 'checkpoints/larger_buffer'
+CHECKPOINT_PATH = 'checkpoints/exactloss_q+gamma+recon+reg'
 SOFTMAX_LOSS = False
 SOFTMAX_WEIGHTS = 0.
 SOFTMAX_TEMP = 3.
 LL_WEIGHTS = 1.
-REG_WEIGHT = 0.
+REG_WEIGHT = 1.
 DROPOUT_RATE = 0.1
-RECON_WEIGHT = 1.0  # Weight for reconstruction loss
+RECON_WEIGHT = 1.
+FIX_Q = False
+EXACT_LIKELIHOOD = True
+NUM_VALID_DONORS = 702.
+
+################# Write configs
+config = {
+    "PAD_TOKEN": PAD_TOKEN,
+    "MASK_TOKEN": MASK_TOKEN,
+    "BATCH_SIZE": BATCH_SIZE,
+    "EPOCH": EPOCH,
+    "TEST_MODE": TEST_MODE,
+    "ATT_MODE": ATT_MODE,
+    "TEST_MODE_OUTPUT_DIR": TEST_MODE_OUTPUT_DIR,
+    "PARQUET_DIR": PARQUET_DIR,
+    "GRAD_CLIP": GRAD_CLIP,
+    "DECOUPLE_TRAINING": DECOUPLE_TRAINING,
+    "CONTINUE_TRAINING": CONTINUE_TRAINING,
+    "MODEL_PATH": MODEL_PATH,
+    "q_ampl": q_ampl,
+    "gamma_ampl": gamma_ampl,
+    "CHECKPOINT_PATH": CHECKPOINT_PATH,
+    "SOFTMAX_LOSS": SOFTMAX_LOSS,
+    "SOFTMAX_WEIGHTS": SOFTMAX_WEIGHTS,
+    "SOFTMAX_TEMP": SOFTMAX_TEMP,
+    "LL_WEIGHTS": LL_WEIGHTS,
+    "REG_WEIGHT": REG_WEIGHT,
+    "DROPOUT_RATE": DROPOUT_RATE,
+    "RECON_WEIGHT": RECON_WEIGHT,
+    "FIX_Q": FIX_Q,
+    "EXACT_LIKELIHOOD": EXACT_LIKELIHOOD,
+    "NUM_VALID_DONORS": NUM_VALID_DONORS
+}
+
+# Create checkpoint directory if missing
+os.makedirs(CHECKPOINT_PATH, exist_ok=True)
+
+# Save JSON
+config_path = os.path.join(CHECKPOINT_PATH, "config.json")
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=4)
+
+print("Config saved to:", config_path)
+# =============================================================================
+# NEW: EXACT LIKELIHOOD FLAG
+# =============================================================================
+# If True: Use Equation 4 (exact) - sums over ALL N donors for second term
+#          Avoids approximation assumptions but is more computationally expensive
+#          O(B * N * A) for second term
+#
+# If False: Use Equation 8 (simplified) - approximates second term as q * Σ(Na * γ)
+#           Faster but assumes: (1) q*p_ni << 1, (2) single-allele restriction
+#           O(B * A) for second term
+
+
+# Number of actual valid donors (not the expanded array size)
+# This is used by LogSpaceExactLikelihood
+
+# =============================================================================
 
 # Data paths
 train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_train1.tfrecord'
@@ -99,6 +161,8 @@ print(f"SOFTMAX_WEIGHTS: {SOFTMAX_WEIGHTS}")
 print(f"SOFTMAX_TEMP: {SOFTMAX_TEMP}")
 print(f"DECOUPLE_TRAINING: {DECOUPLE_TRAINING}")
 print(f"gamma_ampl: {gamma_ampl}, q_ampl: {q_ampl}")
+print(f"EXACT_LIKELIHOOD: {EXACT_LIKELIHOOD}")  # NEW: Print this setting
+print(f"NUM_VALID_DONORS: {NUM_VALID_DONORS}")  # NEW: Print this setting
 print("=" * 80)
 
 # =============================================================================
@@ -121,6 +185,7 @@ for j, patient_id in enumerate(patient_ids):
 
 donor_mhc = tf.constant(max_donor_mhc, dtype=tf.int32)
 print(f"Donor MHC shape after adding removed patients: {donor_mhc.shape}")
+print(f"Number of actual valid donors: {len(patient_ids)}")  # NEW: Verify donor count
 
 
 # =============================================================================
@@ -223,8 +288,8 @@ def define_model(
         name='gamma_logits', 
         kernel_initializer=gamma_init_weights, 
         bias_initializer=gamma_init_bias,
-        kernel_regularizer=keras.regularizers.L2(l2=1e-5), 
-        bias_regularizer=keras.regularizers.L2(l2=1e-5)
+        kernel_regularizer=keras.regularizers.L2(l2=1e-3), 
+        bias_regularizer=keras.regularizers.L2(l2=1e-3)
     )(pooled_gamma)
     
     pooled_q = layers.Dense(embedding_dim, activation='relu', name='pooled_q')(pooled)
@@ -298,36 +363,15 @@ def define_model(
 def compute_reconstruction_loss(tcr_seqs, recon_output, pad_token, cce_loss_fn):
     """
     Compute masked reconstruction loss.
-    
-    Args:
-        tcr_seqs: Input sequences (B, S)
-        recon_output: Reconstruction output (B, S, vocab_size)
-        pad_token: Padding token value
-        cce_loss_fn: Categorical cross-entropy loss function
-    
-    Returns:
-        Scalar reconstruction loss
     """
-    # Create mask for valid tokens
     mask = tf.cast(tcr_seqs != pad_token, tf.float32)
-    
-    # Prepare input tokens (replace pad with 0 for one-hot encoding)
     input_tokens_safe = tf.where(tcr_seqs == pad_token, 0.0, tcr_seqs)
     input_tokens_safe = tf.cast(input_tokens_safe, tf.int32)
-    
-    # One-hot encode targets
     one_hot_input = tf.one_hot(input_tokens_safe, depth=21)
-    
-    # Compute per-token loss
     loss_per_token = cce_loss_fn(one_hot_input, recon_output)
-    
-    # Apply mask and compute mean
     masked_loss = loss_per_token * mask
     num_valid_tokens = tf.reduce_sum(mask)
-    
-    # Avoid division by zero
     final_loss = tf.reduce_sum(masked_loss) / tf.maximum(num_valid_tokens, 1.0)
-    
     return final_loss
 
 
@@ -354,7 +398,7 @@ lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
     decay_rate=0.999,
     staircase=False
 )
-optimizer = tf.keras.optimizers.Lion(learning_rate=lr_schedule)
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 model.compile(optimizer=optimizer)
 
 if CONTINUE_TRAINING:
@@ -369,14 +413,44 @@ print(model.summary())
 # INITIALIZE LOSS FUNCTION AND DATA MANAGERS
 # =============================================================================
 print("\nInitializing loss function...")
-loss_func = LogSpaceLikelihood(
-    donor_mhc, 
-    pad_token=PAD_TOKEN, 
-    test_mode=TEST_MODE,                 
-    use_softmax_loss=SOFTMAX_LOSS,
-    softmax_loss_weight=SOFTMAX_WEIGHTS,
-    softmax_temperature=SOFTMAX_TEMP,
-)
+
+# =============================================================================
+# NEW: Conditional loss function selection based on EXACT_LIKELIHOOD flag
+# =============================================================================
+if EXACT_LIKELIHOOD:
+    print(">>> Using EXACT likelihood (Equation 4)")
+    print(f"    - Computes exact sum over all {NUM_VALID_DONORS:.0f} donors for second term")
+    print(f"    - No approximation assumptions")
+    print(f"    - Higher computational cost: O(B * N * A)")
+    
+    loss_func = LogSpaceExactLikelihood(
+        donor_mhc=donor_mhc,
+        pad_token=PAD_TOKEN,
+        test_mode=TEST_MODE,
+        use_softmax_loss=SOFTMAX_LOSS,
+        softmax_loss_weight=SOFTMAX_WEIGHTS,
+        softmax_temperature=SOFTMAX_TEMP,
+        fix_q=FIX_Q,  # Use formula for q_i
+        num_mhc=358,
+        N=NUM_VALID_DONORS,  # Pass actual number of valid donors
+    )
+else:
+    print(">>> Using SIMPLIFIED likelihood (Equation 8)")
+    print(f"    - Approximates second term as q * Σ(Na * γ)")
+    print(f"    - Assumes: (1) q*p_ni << 1, (2) single-allele restriction")
+    print(f"    - Lower computational cost: O(B * A)")
+    
+    loss_func = LogSpaceLikelihood(
+        donor_mhc=donor_mhc,
+        pad_token=PAD_TOKEN,
+        test_mode=TEST_MODE,
+        use_softmax_loss=SOFTMAX_LOSS,
+        softmax_loss_weight=SOFTMAX_WEIGHTS,
+        softmax_temperature=SOFTMAX_TEMP,
+        fix_q=FIX_Q,
+        num_mhc=358,
+    )
+# =============================================================================
 
 # Initialize CCE loss function once (outside the training loop)
 cce_loss_fn = keras.losses.CategoricalCrossentropy(reduction='none')
@@ -440,10 +514,17 @@ for epoch in range(EPOCH):
             # Forward pass
             if TEST_MODE:
                 gamma_logits, q_logits, att_score, me, pe, mlp1, pooled = model([tcr_seqs, tcr_seq_mask])
-                loss_components = loss_func.call(gamma_logits, q_logits, tcr_donor_ids)
-                (Ni_size, Ni, gamma_donor_id_mask, log_p_ni,
-                 log_qp, log_one_minus_qp, first_term, second_term, bce,
-                 log_gamma, log_one_minus_gamma) = loss_components
+                loss_components = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits=None)
+                # Note: TEST_MODE returns different outputs depending on EXACT_LIKELIHOOD
+                # Both return similar structure, but exact has additional log_p_ni_all
+                if EXACT_LIKELIHOOD:
+                    (Ni_size, Ni, gamma_donor_id_mask, log_p_ni, log_p_ni_all,
+                     log_qp, log_one_minus_qp, first_term, second_term, bce,
+                     log_gamma, log_one_minus_gamma, true_probs, delta_probs) = loss_components
+                else:
+                    (Ni_size, Ni, gamma_donor_id_mask, log_p_ni,
+                     log_qp, log_one_minus_qp, first_term, second_term, bce,
+                     log_gamma, log_one_minus_gamma, true_probs, delta_probs) = loss_components
             elif ATT_MODE:
                 gamma_logits, q_logits, att_score, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
                 ll_loss, bce_loss = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
@@ -521,10 +602,11 @@ for epoch in range(EPOCH):
         
         print(statement)
         
-        # Log to parquet
+        # Log to parquet - NEW: Add likelihood type to logs
         log_row = {
             "epoch": epoch + 1,
             "step": step,
+            "exact_likelihood": EXACT_LIKELIHOOD,  # NEW: Log which likelihood is used
             "total_loss": float(total_loss.numpy()),
             "ll_loss": float(ll_loss.numpy()),
             "bce_loss": float(bce_loss_r.numpy()) if SOFTMAX_LOSS else 0.0,
@@ -578,7 +660,7 @@ for epoch in range(EPOCH):
         else:
             gamma_logits, q_logits, delta_logits, recon = model([tcr_seqs, tcr_seq_mask], training=False)
         
-        # Reconstruction loss - FIX: use `recon` not `recon_out`
+        # Reconstruction loss
         val_recon_loss = compute_reconstruction_loss(tcr_seqs, recon, PAD_TOKEN, cce_loss_fn)
         
         # Likelihood loss
@@ -635,7 +717,7 @@ if TEST_MODE:
     p_ni = tf.exp(log_p_ni)
     
     # Print tensor shapes for reference
-    visualizer.print_tensor_shapes({
+    tensor_dict = {
         'tcr_seqs': tcr_seqs,
         'tcr_ids': tcr_ids,
         'tcr_donor_ids': tcr_donor_ids,
@@ -657,7 +739,13 @@ if TEST_MODE:
         'first_term': first_term,
         'second_term': second_term,
         'bce': bce,
-    })
+    }
+    
+    # NEW: Add log_p_ni_all if using exact likelihood
+    if EXACT_LIKELIHOOD:
+        tensor_dict['log_p_ni_all'] = log_p_ni_all
+    
+    visualizer.print_tensor_shapes(tensor_dict)
     
     print("\n--- Generating Plots ---")
     
@@ -709,10 +797,12 @@ if not TEST_MODE:
     final_model_path = os.path.join(CHECKPOINT_PATH, 'final_model.keras')
     model.save(final_model_path)
     
-    # Save training history
+    # Save training history - NEW: Include likelihood type
     history_dict = {
         'train': [float(loss) for loss in train_hist],
-        'val': [float(loss) for loss in val_hist]
+        'val': [float(loss) for loss in val_hist],
+        'exact_likelihood': EXACT_LIKELIHOOD,  # NEW: Record which likelihood was used
+        'num_valid_donors': NUM_VALID_DONORS,
     }
     with open('train_hist.json', 'w') as f:
         json.dump(history_dict, f, indent=2)
@@ -720,4 +810,5 @@ if not TEST_MODE:
     print(f"✓ Training completed successfully!")
     print(f"✓ Final model saved: {final_model_path}")
     print(f"✓ Training history saved: train_hist.json")
+    print(f"✓ Likelihood type used: {'EXACT (Eq. 4)' if EXACT_LIKELIHOOD else 'SIMPLIFIED (Eq. 8)'}")
     print("=" * 80)
