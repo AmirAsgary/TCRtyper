@@ -50,35 +50,64 @@ get_custom_objects().update({
     "bounded_activation_fn": Activation(bounded_activation_fn)
 })
 
+def tf_logit(p, epsilon=1e-7): # reverse sigmoid
+    p = tf.clip_by_value(p, epsilon, 1.0 - epsilon)
+    return tf.math.log(p / (1.0 - p))
+
+def calculate_frequencies(mhc_donors): #(N,A)
+    mhc_counts = tf.reduce_sum(mhc_donors, axis=0) #(A,)
+    total_count = tf.reduce_sum(mhc_counts) #scalar
+    mhc_counts = tf.cast(mhc_counts, tf.float32)
+    total_count = tf.cast(total_count, tf.float32)
+    freqs = mhc_counts / (total_count + 1e-9) #(A,)
+    return freqs #(A,)
+
+def normalize_gamma_logits(gamma_logits, freqs):
+    freqs = tf.cast(freqs, dtype=gamma_logits.dtype)
+    mask = tf.where(freqs == 0., 0., 1.)
+    epsilon = 1e-7
+    freqs_clipped = tf.clip_by_value(freqs, epsilon, 1.0 - epsilon)
+    freq_logits = tf.math.log(freqs_clipped / (1.0 - freqs_clipped))
+    freq_logits *= mask
+    return gamma_logits - freq_logits
+
 # =============================================================================
 # CONFIGURATION CONSTANTS
 # =============================================================================
 PAD_TOKEN = -2.
 MASK_TOKEN = -1.
 BATCH_SIZE = 5000
-EPOCH = 5
+EPOCH = 10
 TEST_MODE = False
 ATT_MODE = True
 TEST_MODE_OUTPUT_DIR = 'output/test_mode_Nov27_3'
-PARQUET_DIR = "checkpoints/logs"
-GRAD_CLIP = False
+GRAD_CLIP = True
 DECOUPLE_TRAINING = False
 CONTINUE_TRAINING = False
 MODEL_PATH = 'checkpoints/larger_buffer3/model_epoch_5.keras'
 q_ampl = 1.0
 gamma_ampl = 1.0
-CHECKPOINT_PATH = 'checkpoints/exactloss_q+gamma+recon+reg'
-SOFTMAX_LOSS = False
-SOFTMAX_WEIGHTS = 0.
+CHECKPOINT_PATH = 'checkpoints/exactloss_q+gamma+recon+reg+L1RegOngamma+NoAdjustLogit+REG_ON_Q+ADJUST_LOGITS2'
+SOFTMAX_LOSS = True
+SOFTMAX_WEIGHTS = 0.01
 SOFTMAX_TEMP = 3.
 LL_WEIGHTS = 1.
 REG_WEIGHT = 1.
-DROPOUT_RATE = 0.1
+DROPOUT_RATE = 0.3
 RECON_WEIGHT = 1.
 FIX_Q = False
 EXACT_LIKELIHOOD = True
-NUM_VALID_DONORS = 702.
-
+NUM_VALID_DONORS = 705.
+PARQUET_DIR = os.path.join(CHECKPOINT_PATH, 'logs')
+REG_ON_GAMMA = True
+L1_REG_LAMBDA = 0.01
+ADJUST_LOGITS = True
+L1_REG_Q = True
+REG_ON_Q = 0.001
+# Data paths
+train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_train1.tfrecord'
+val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_valid1.tfrecord'
+patient_id_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/patients_index_process.tsv'
 ################# Write configs
 config = {
     "PAD_TOKEN": PAD_TOKEN,
@@ -105,7 +134,16 @@ config = {
     "RECON_WEIGHT": RECON_WEIGHT,
     "FIX_Q": FIX_Q,
     "EXACT_LIKELIHOOD": EXACT_LIKELIHOOD,
-    "NUM_VALID_DONORS": NUM_VALID_DONORS
+    "NUM_VALID_DONORS": NUM_VALID_DONORS,
+    "REG_ON_GAMMA":REG_ON_GAMMA,
+    "L1_REG_LAMBDA": L1_REG_LAMBDA,
+    "ADJUST_LOGITS": ADJUST_LOGITS,
+    "L1_REG_Q": L1_REG_Q,
+    "REG_ON_Q": REG_ON_Q,
+    "train_path":train_path,
+    "val_path":val_path,
+    "patient_id_path":patient_id_path
+
 }
 
 # Create checkpoint directory if missing
@@ -134,10 +172,7 @@ print("Config saved to:", config_path)
 
 # =============================================================================
 
-# Data paths
-train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_train1.tfrecord'
-val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_valid1.tfrecord'
-patient_id_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/patients_index_process.tsv'
+
 
 # =============================================================================
 # STARTUP BANNER
@@ -145,7 +180,7 @@ patient_id_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_No
 os.makedirs(PARQUET_DIR, exist_ok=True)
 assert isinstance(GRAD_CLIP, (float, int, bool))
 if GRAD_CLIP == True: 
-    GRAD_CLIP = 5.0
+    GRAD_CLIP = 7.0
     print(f'GRAD_CLIP Active with {GRAD_CLIP}')
 print("=" * 80)
 print("TCRtyper Model Training")
@@ -186,7 +221,7 @@ for j, patient_id in enumerate(patient_ids):
 donor_mhc = tf.constant(max_donor_mhc, dtype=tf.int32)
 print(f"Donor MHC shape after adding removed patients: {donor_mhc.shape}")
 print(f"Number of actual valid donors: {len(patient_ids)}")  # NEW: Verify donor count
-
+freqs = calculate_frequencies(donor_mhc)
 
 # =============================================================================
 # MODEL DEFINITION
@@ -228,7 +263,7 @@ def define_model(
         name='masked_embedding_ohe'
     )(input_layer, mask_input)
     
-    me = SpatialTemporalDropout1D(feature_rate=DROPOUT_RATE, timestep_rate=DROPOUT_RATE, name='dropout1')(me)
+    me = layers.Dropout(DROPOUT_RATE, name='dropout1')(me)
     me = layers.Dense(embedding_dim, 'relu', use_bias=False, name='mlp_embedding')(me)
     
     # Add positional encoding
@@ -266,7 +301,7 @@ def define_model(
         att1 = att_output
         att_score = None
 
-    att1 = SpatialTemporalDropout1D(feature_rate=DROPOUT_RATE, timestep_rate=DROPOUT_RATE, name='dropout2')(att1)
+    att1 = layers.Dropout(DROPOUT_RATE, name='dropout2')(att1)
     
     # MLP transformation with relu
     mlp1 = MaskedDense(
@@ -489,6 +524,8 @@ print("=" * 80)
 train_hist = []
 val_hist = []
 
+l1_reg_loss = tf.constant(0., dtype=tf.float32) # will be replaced later if True
+l1_reg_q_loss = tf.constant(0., dtype=tf.float32)
 for epoch in range(EPOCH):
     print(f"\n{'=' * 80}")
     print(f"EPOCH {epoch + 1}/{EPOCH}")
@@ -497,6 +534,7 @@ for epoch in range(EPOCH):
     # Get training dataset for this epoch
     dataset = tcr_manager.get_dataset(shuffle=True)
     epoch_losses = []
+    ll_loss_hist = []
     step = 0
     
     for step, data in enumerate(dataset, start=1):
@@ -514,6 +552,7 @@ for epoch in range(EPOCH):
             # Forward pass
             if TEST_MODE:
                 gamma_logits, q_logits, att_score, me, pe, mlp1, pooled = model([tcr_seqs, tcr_seq_mask])
+                if ADJUST_LOGITS: gamma_logits = normalize_gamma_logits(gamma_logits, freqs)
                 loss_components = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits=None)
                 # Note: TEST_MODE returns different outputs depending on EXACT_LIKELIHOOD
                 # Both return similar structure, but exact has additional log_p_ni_all
@@ -527,24 +566,32 @@ for epoch in range(EPOCH):
                      log_gamma, log_one_minus_gamma, true_probs, delta_probs) = loss_components
             elif ATT_MODE:
                 gamma_logits, q_logits, att_score, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
+                if ADJUST_LOGITS: gamma_logits = normalize_gamma_logits(gamma_logits, freqs)
                 ll_loss, bce_loss = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
             else:
                 gamma_logits, q_logits, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
+                if ADJUST_LOGITS: gamma_logits = normalize_gamma_logits(gamma_logits, freqs)
                 ll_loss, bce_loss = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
             
             # Reconstruction loss
             final_recon_loss = compute_reconstruction_loss(tcr_seqs, recon_out, PAD_TOKEN, cce_loss_fn)
-
+            # L1 regularization on loss
+            if REG_ON_GAMMA:
+                l1_reg_loss = tf.reduce_mean(tf.reduce_sum(tf.nn.sigmoid(gamma_logits), axis=-1))
+            if REG_ON_Q:
+                l1_reg_q_loss = tf.reduce_sum(tf.nn.sigmoid(q_logits))
             # Regularization losses from model layers
             reg_loss = tf.reduce_sum(model.losses) if model.losses else 0.0
-            
+        
             # Total loss
             bce_loss_r = tf.reduce_mean(bce_loss)
             ll_loss = tf.reduce_mean(ll_loss)
             total_loss = (LL_WEIGHTS * ll_loss + 
                          SOFTMAX_WEIGHTS * bce_loss_r + 
                          REG_WEIGHT * reg_loss + 
-                         RECON_WEIGHT * final_recon_loss)
+                         RECON_WEIGHT * final_recon_loss +
+                         L1_REG_LAMBDA * l1_reg_loss +
+                         L1_REG_Q * l1_reg_q_loss)
         
         # In TEST_MODE, we only process one batch for visualization
         if TEST_MODE:
@@ -576,6 +623,7 @@ for epoch in range(EPOCH):
             model.optimizer.apply_gradients(zip(grads, model.trainable_variables))
         
         epoch_losses.append(total_loss.numpy())
+        ll_loss_hist.append(ll_loss.numpy())
         
         # Compute gamma and q probabilities for logging
         gamma_probs = tf.nn.sigmoid(gamma_logits)
@@ -594,7 +642,9 @@ for epoch in range(EPOCH):
             f"MinGamma: {tf.reduce_min(gamma_probs).numpy():.6f} | "
             f"MaxQ: {tf.reduce_max(q_probs).numpy():.6f} | "
             f"MinQ: {tf.reduce_min(q_probs).numpy():.6f} | "
-            f"ReconLoss: {final_recon_loss.numpy():.6f}"
+            f"ReconLoss: {final_recon_loss.numpy():.6f} | " 
+            f"L1 RegGAMMA: {l1_reg_loss.numpy():.6f} | "
+            f"L1 RegQ: {l1_reg_q_loss.numpy():.6f}"
         )
         
         if SOFTMAX_LOSS:
@@ -638,6 +688,7 @@ for epoch in range(EPOCH):
     print(f"    Average Loss: {avg_loss:.4f}")
     print(f"    Min Loss:     {min_loss:.4f}")
     print(f"    Max Loss:     {max_loss:.4f}")
+    print(f"    LL Loss:      {np.mean(ll_loss_hist):.4f}")
     print(f"    Total Steps:  {step}")
     
     # =========================================================================
@@ -661,6 +712,7 @@ for epoch in range(EPOCH):
             gamma_logits, q_logits, delta_logits, recon = model([tcr_seqs, tcr_seq_mask], training=False)
         
         # Reconstruction loss
+        if ADJUST_LOGITS: gamma_logits = normalize_gamma_logits(gamma_logits, freqs)
         val_recon_loss = compute_reconstruction_loss(tcr_seqs, recon, PAD_TOKEN, cce_loss_fn)
         
         # Likelihood loss

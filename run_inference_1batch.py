@@ -27,6 +27,27 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from collections import Counter
 from datetime import datetime
+import shutil
+def tf_logit(p, epsilon=1e-7): # reverse sigmoid
+    p = tf.clip_by_value(p, epsilon, 1.0 - epsilon)
+    return tf.math.log(p / (1.0 - p))
+
+def calculate_frequencies(mhc_donors): #(N,A)
+    mhc_counts = tf.reduce_sum(mhc_donors, axis=0) #(A,)
+    total_count = tf.reduce_sum(mhc_counts) #scalar
+    mhc_counts = tf.cast(mhc_counts, tf.float32)
+    total_count = tf.cast(total_count, tf.float32)
+    freqs = mhc_counts / (total_count + 1e-9) #(A,)
+    return freqs #(A,)
+
+def normalize_gamma_logits(gamma_logits, freqs):
+    freqs = tf.cast(freqs, dtype=gamma_logits.dtype)
+    mask = tf.where(freqs == 0., 0., 1.)
+    epsilon = 1e-7
+    freqs_clipped = tf.clip_by_value(freqs, epsilon, 1.0 - epsilon)
+    freq_logits = tf.math.log(freqs_clipped / (1.0 - freqs_clipped))
+    freq_logits *= mask
+    return gamma_logits - freq_logits
 
 # =============================================================================
 # CONFIGURATION
@@ -34,15 +55,16 @@ from datetime import datetime
 PAD_TOKEN = -2.
 MASK_TOKEN = -1.
 BATCH_SIZE = 1000
-MODEL_PATH = 'checkpoints/exactloss_q+gamma+recon+reg/model_epoch_5.keras'
-OUTPUT_PATH = 'output/model_diagnostics_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+MODEL_PATH = 'checkpoints/exactloss_q+gamma+recon+reg+L1RegOngamma+NoAdjustLogit+REG_ON_Q+ADJUST_LOGITS2/model_epoch_3.keras'
+OUTPUT_PATH = 'output/model_diagnostics_' + datetime.now().strftime('%Y%m%d_%H%M%S') + "_exactloss_q+gamma+recon+reg+L1RegOngamma+NoAdjustLogit+REG_ON_Q+ADJUST_LOGITS2"
 PATIENT_TO_HLA = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/processed/patient_to_hla.csv'
 SOFTMAX_LOSS = True
 SOFTMAX_WEIGHTS = 0.5
 SOFTMAX_TEMP = 3.
 ATT_MODE = True  # Must match training configuration
 NUM_BATCHES_TO_ANALYZE = 2  # Number of batches to analyze
-
+ADJUST_LOGITS = True
+CONFIG_PATH = os.path.join(os.path.dirname(MODEL_PATH), 'config.json')
 # =============================================================================
 # NEW: EXACT LIKELIHOOD FLAG - Must match training configuration!
 # =============================================================================
@@ -62,8 +84,9 @@ AA_VOCAB = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L',
 train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_train1.tfrecord'
 val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_valid1.tfrecord'
 patient_id_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/patients_index_process.tsv'
-
+assert os.path.exists(CONFIG_PATH)
 os.makedirs(OUTPUT_PATH, exist_ok=True)
+shutil.copy(CONFIG_PATH, os.path.join(OUTPUT_PATH, 'config.json'))
 print(f"Output directory: {OUTPUT_PATH}")
 
 # =============================================================================
@@ -92,7 +115,7 @@ for j, patient_id in enumerate(patient_ids):
 donor_mhc = tf.constant(max_donor_mhc, dtype=tf.int32)
 print(f"✓ Donor MHC shape: {donor_mhc.shape}")
 print(f"✓ Number of actual valid donors: {len(patient_ids)}")
-
+freqs = calculate_frequencies(donor_mhc)
 # Load HLA names
 hla_df = pd.read_csv(PATIENT_TO_HLA)
 hla_names = [i for i in hla_df.columns if i != 'donor_id']
@@ -339,6 +362,7 @@ for batch_idx, data in enumerate(dataset, start=1):
     # ==========================================================================
     # NEW: Handle different test_mode outputs based on EXACT_LIKELIHOOD
     # ==========================================================================
+    if ADJUST_LOGITS: gamma_logits = normalize_gamma_logits(gamma_logits, freqs)
     loss_outputs = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
     
     if EXACT_LIKELIHOOD:
@@ -717,7 +741,7 @@ for batch_idx, data in enumerate(dataset, start=1):
         # Second term breakdown: contribution from each donor
         # log_one_minus_qp_all = log(1 - q*p_ni) for all donors
         log_q_np = tf.math.log_sigmoid(q_logits).numpy()
-        log_qp_all_np = log_q_np[:, np.newaxis] + log_p_ni_all_np
+        log_qp_all_np = log_q_np + log_p_ni_all_np
         
         # Approximate log(1 - exp(x)) for visualization
         qp_all = np.exp(np.clip(log_qp_all_np, -100, 0))
@@ -725,6 +749,15 @@ for batch_idx, data in enumerate(dataset, start=1):
         log_one_minus_qp_all_np = np.log(one_minus_qp_all)
         
         # Mask invalid donors
+        print('====================================================')
+        print("log_p_ni_all_np:", log_p_ni_all_np.shape)
+        print("log_one_minus_qp_all_np:", log_one_minus_qp_all_np.shape)
+        print("valid_mask:", valid_mask.shape)
+        print("q_logits: ", q_logits.shape)
+        print("log_q_np: ", log_q_np.shape)
+        print("log_qp_all_np: ", log_qp_all_np.shape)
+        print('====================================================')
+
         log_one_minus_qp_all_np[:, ~valid_mask] = 0
         
         per_donor_contribution = np.mean(log_one_minus_qp_all_np, axis=0)
