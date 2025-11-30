@@ -1,44 +1,87 @@
+"""
+TCRtyper Model Inference & Diagnostics Script
+
+This script performs comprehensive visualization and statistical analysis
+of the trained model outputs to diagnose issues like:
+- Mode collapse in predictions
+- Na=0 allele bug
+- Gradient flow problems
+- Distribution mismatches between true and predicted probabilities
+- Reconstruction quality analysis
+"""
+
 import keras
 import tensorflow as tf
-import src
 from keras import layers
-from src.model_utils import (
-    PositionalEncoding, 
-    MaskedEmbedding, 
-    AttentionLayer, 
-    Likelihood, 
-    MaskedDense,
-    QDense
-)
+from src.model_utils import LogSpaceLikelihood
 from src.utils import TCRFileManager
-from src.visualization_utils import TestModeVisualizer
 import numpy as np
 import os
 import pandas as pd
-import json
-import pyarrow as pa
-import pyarrow.parquet as pq
 import seaborn as sns
 import matplotlib.pyplot as plt
+from collections import Counter
+from datetime import datetime
 
-
-
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 PAD_TOKEN = -2.
 MASK_TOKEN = -1.
-BATCH_SIZE = 100
-TEST_MODE_OUTPUT_DIR = 'output/test_mode_Nov27_3'
-MODEL_PATH = 'checkpoints/model_epoch_1.keras'
-OUTPUT_PATH = 'output/model_train_Nov28_gammaandq_initializedsmall_Ni_removed_2'
+BATCH_SIZE = 1000
+MODEL_PATH = 'checkpoints/larger_buffer/model_epoch_8.keras'
+OUTPUT_PATH = 'output/model_diagnostics_' + datetime.now().strftime('%Y%m%d_%H%M%S')
 PATIENT_TO_HLA = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/processed/patient_to_hla.csv'
+SOFTMAX_LOSS = True
+SOFTMAX_WEIGHTS = 0.5
+SOFTMAX_TEMP = 3.
+ATT_MODE = True  # Must match training configuration
+NUM_BATCHES_TO_ANALYZE = 1  # Number of batches to analyze
+
+# Amino acid mapping for reconstruction visualization
+AA_VOCAB = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 
+            'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'X']  # 21 amino acids
+
 # Data paths
-train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/train1.tfrecord'
-val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/val1.tfrecord'
+train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_train1.tfrecord'
+val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_valid1.tfrecord'
 patient_id_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/patients_index_process.tsv'
-STEP_JUMP = [10]
+
 os.makedirs(OUTPUT_PATH, exist_ok=True)
+print(f"Output directory: {OUTPUT_PATH}")
+
+# =============================================================================
+# LOAD MODEL AND DATA
+# =============================================================================
+print("\n" + "="*80)
+print("LOADING MODEL AND DATA")
+print("="*80)
 
 model = keras.saving.load_model(MODEL_PATH)
+print(f"✓ Model loaded from: {MODEL_PATH}")
+print(f"  Model outputs: {[o.name for o in model.outputs]}")
 
+# Load donor MHC data
+patient_tsv = pd.read_csv(patient_id_path, sep='\t')
+max_num_patients = np.max(patient_tsv.sample_id.tolist())
+
+mhc_file = np.load('data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/processed/donor_mhc.npz')
+donor_mhc = mhc_file['array']
+max_donor_mhc = np.zeros(shape=(max_num_patients + 1, donor_mhc.shape[1]))
+patient_ids = np.array([int(i) for i in mhc_file['patient_id']])
+
+for j, patient_id in enumerate(patient_ids):
+    max_donor_mhc[patient_id] = donor_mhc[j]
+
+donor_mhc = tf.constant(max_donor_mhc, dtype=tf.int32)
+print(f"✓ Donor MHC shape: {donor_mhc.shape}")
+
+# Load HLA names
+hla_df = pd.read_csv(PATIENT_TO_HLA)
+hla_names = [i for i in hla_df.columns if i != 'donor_id']
+hla_with_counts = [f'{name}_{int(np.sum(hla_df[name]))}' for name in hla_names]
+
+# Initialize managers
 tcr_manager = TCRFileManager(
     tcr_path=train_path,
     batch_size=BATCH_SIZE,
@@ -47,44 +90,934 @@ tcr_manager = TCRFileManager(
     pad_token=PAD_TOKEN
 )
 
-val_manager = TCRFileManager(
-    tcr_path=val_path,
-    batch_size=BATCH_SIZE,
-    tcr_length=70,
-    shuffle_buffer_size=1000,
-    pad_token=PAD_TOKEN
+loss_func = LogSpaceLikelihood(
+    donor_mhc, 
+    pad_token=PAD_TOKEN, 
+    test_mode=True,                 
+    use_softmax_loss=SOFTMAX_LOSS,
+    softmax_loss_weight=SOFTMAX_WEIGHTS,
+    softmax_temperature=SOFTMAX_TEMP,
 )
-hla_df = pd.read_csv(PATIENT_TO_HLA)
-hla = [i for i in hla_df.columns if i != 'donor_id']
-hla = [f'{i}_{int(np.sum(hla_df[i]))}' for i in hla]
+
+# Initialize CCE loss function for reconstruction analysis
+cce_loss_fn = keras.losses.CategoricalCrossentropy(reduction='none')
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def save_fig(fig, name, dpi=300):
+    """Save figure and close."""
+    path = os.path.join(OUTPUT_PATH, f'{name}.png')
+    fig.savefig(path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved: {name}.png")
+
+def write_stats(filename, content):
+    """Write statistics to a text file."""
+    path = os.path.join(OUTPUT_PATH, filename)
+    with open(path, 'w') as f:
+        f.write(content)
+    print(f"  Saved: {filename}")
+
+def compute_reconstruction_loss(tcr_seqs, recon_output, pad_token):
+    """
+    Compute masked reconstruction loss and accuracy.
+    
+    Returns:
+        loss: Scalar reconstruction loss
+        accuracy: Per-position accuracy
+        per_token_loss: Loss per token (B, S)
+    """
+    # Create mask for valid tokens
+    mask = tf.cast(tcr_seqs != pad_token, tf.float32)
+    
+    # Prepare input tokens
+    input_tokens_safe = tf.where(tcr_seqs == pad_token, 0.0, tcr_seqs)
+    input_tokens_safe = tf.cast(input_tokens_safe, tf.int64)  # Changed to int64
+    
+    # One-hot encode targets
+    one_hot_input = tf.one_hot(input_tokens_safe, depth=21)
+    
+    # Compute per-token loss
+    loss_per_token = cce_loss_fn(one_hot_input, recon_output)
+    
+    # Apply mask
+    masked_loss = loss_per_token * mask
+    num_valid_tokens = tf.reduce_sum(mask)
+    final_loss = tf.reduce_sum(masked_loss) / tf.maximum(num_valid_tokens, 1.0)
+    
+    # Compute accuracy
+    pred_tokens = tf.argmax(recon_output, axis=-1)  # Returns int64 by default
+    correct = tf.cast(pred_tokens == input_tokens_safe, tf.float32) * mask
+    accuracy = tf.reduce_sum(correct) / tf.maximum(num_valid_tokens, 1.0)
+    
+    return final_loss, accuracy, masked_loss
+
+def tokens_to_sequence(tokens, pad_token):
+    """Convert token indices to amino acid sequence string."""
+    seq = []
+    for t in tokens:
+        if t == pad_token:
+            break
+        if 0 <= int(t) < len(AA_VOCAB):
+            seq.append(AA_VOCAB[int(t)])
+        else:
+            seq.append('?')
+    return ''.join(seq)
+
+# =============================================================================
+# SECTION 1: ALLELE FREQUENCY ANALYSIS (Na=0 Bug Check)
+# =============================================================================
+print("\n" + "="*80)
+print("SECTION 1: ALLELE FREQUENCY ANALYSIS")
+print("="*80)
+
+Na = loss_func.Na.numpy()
+log_Na = loss_func.log_Na.numpy()
+N = loss_func.N
+
+# Find problematic alleles
+zero_alleles = np.where(Na == 0)[0]
+low_freq_alleles = np.where((Na > 0) & (Na < 5))[0]
+high_freq_alleles = np.where(Na > 50)[0]
+
+stats_content = f"""
+ALLELE FREQUENCY ANALYSIS
+{'='*60}
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+SUMMARY STATISTICS
+------------------
+Total number of alleles: {len(Na)}
+Total number of donors (N): {N}
+Alleles with Na=0 (PROBLEMATIC): {len(zero_alleles)}
+Alleles with Na < 5: {len(low_freq_alleles)}
+Alleles with Na > 50: {len(high_freq_alleles)}
+
+Na distribution:
+  Min: {np.min(Na):.0f}
+  Max: {np.max(Na):.0f}
+  Mean: {np.mean(Na):.2f}
+  Median: {np.median(Na):.0f}
+  Std: {np.std(Na):.2f}
+
+PROBLEMATIC ALLELES (Na=0)
+--------------------------
+These alleles have NO donors in the cohort and will cause
+division-by-zero issues in enrichment calculations.
+
+Indices: {zero_alleles.tolist()[:20]}{'...' if len(zero_alleles) > 20 else ''}
+
+If using HLA names:
+{[hla_names[i] for i in zero_alleles[:10]]}{'...' if len(zero_alleles) > 10 else ''}
+
+INTERPRETATION
+--------------
+If Na=0 alleles appear in your top predictions, the valid_allele_mask
+is NOT working correctly. These alleles should be masked out to have
+near-zero probability after softmax normalization.
+
+ACTION REQUIRED: Verify that valid_allele_mask is being applied in delta_loss()
+"""
+
+write_stats('01_allele_frequency_analysis.txt', stats_content)
+
+# Plot Na distribution
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# Histogram of Na
+axes[0].hist(Na, bins=50, edgecolor='black', alpha=0.7)
+axes[0].axvline(x=0.5, color='red', linestyle='--', label=f'Na=0 ({len(zero_alleles)} alleles)')
+axes[0].set_xlabel('Number of donors (Na)', fontsize=12)
+axes[0].set_ylabel('Count', fontsize=12)
+axes[0].set_title('Distribution of Allele Frequencies', fontsize=14)
+axes[0].legend()
+
+# Bar plot of top 20 most frequent alleles
+top_alleles = np.argsort(Na)[::-1][:20]
+axes[1].barh(range(20), Na[top_alleles], color='steelblue')
+axes[1].set_yticks(range(20))
+axes[1].set_yticklabels([f'{i} ({hla_names[i][:15]})' for i in top_alleles], fontsize=8)
+axes[1].set_xlabel('Number of donors (Na)', fontsize=12)
+axes[1].set_title('Top 20 Most Frequent Alleles', fontsize=14)
+axes[1].invert_yaxis()
+
+# Bar plot of alleles with Na=0
+if len(zero_alleles) > 0:
+    display_zeros = zero_alleles[:20]
+    axes[2].barh(range(len(display_zeros)), [0]*len(display_zeros), color='red')
+    axes[2].set_yticks(range(len(display_zeros)))
+    axes[2].set_yticklabels([f'{i} ({hla_names[i][:15]})' for i in display_zeros], fontsize=8)
+    axes[2].set_xlabel('Na (all zero)', fontsize=12)
+    axes[2].set_title(f'Alleles with Na=0 ({len(zero_alleles)} total)', fontsize=14)
+    axes[2].invert_yaxis()
+else:
+    axes[2].text(0.5, 0.5, 'No alleles with Na=0', ha='center', va='center', fontsize=14)
+    axes[2].set_title('Alleles with Na=0', fontsize=14)
+
+plt.tight_layout()
+save_fig(fig, '01_allele_frequency_distribution')
+
+# =============================================================================
+# SECTION 2: MODEL OUTPUT ANALYSIS (Per Batch)
+# =============================================================================
+print("\n" + "="*80)
+print("SECTION 2: MODEL OUTPUT ANALYSIS")
+print("="*80)
 
 dataset = tcr_manager.get_dataset(shuffle=True)
-for step, data in enumerate(dataset, start=1):
-    if step in STEP_JUMP:
-        # Unpack and cast data
-        tcr_seqs, tcr_ids, tcr_donor_ids = data
-        tcr_seqs = tf.cast(tcr_seqs, tf.float32)
-        tcr_ids = tf.cast(tcr_ids, tf.int32)
-        tcr_donor_ids = tf.cast(tcr_donor_ids, tf.int32)
+all_stats = []
+
+for batch_idx, data in enumerate(dataset, start=1):
+    if batch_idx > NUM_BATCHES_TO_ANALYZE:
+        break
+    
+    print(f"\n--- Analyzing Batch {batch_idx} ---")
+    
+    # Prepare data
+    tcr_seqs, tcr_ids, tcr_donor_ids = data
+    tcr_seqs = tf.cast(tcr_seqs, tf.float32)
+    tcr_ids = tf.cast(tcr_ids, tf.int32)
+    tcr_donor_ids = tf.cast(tcr_donor_ids, tf.int32)
+    tcr_seq_mask = tf.where(tcr_seqs == PAD_TOKEN, PAD_TOKEN, 1.)
+    tcr_seq_mask = tf.cast(tcr_seq_mask, tf.float32)
+    
+    # Forward pass - updated for new model outputs
+    if ATT_MODE:
+        gamma_logits, q_logits, att_score, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
+    else:
+        gamma_logits, q_logits, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
+        att_score = None
+    
+    # Loss computation (test_mode returns all intermediates)
+    loss_outputs = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
+    (Ni_size, Ni, gamma_donor_id_mask, log_p_ni,
+     log_qp, log_one_minus_qp, first_term, second_term, bce,
+     log_gamma, log_one_minus_gamma, true_probs, pred_probs) = loss_outputs
+    
+    # Convert to numpy arrays
+    gamma_probs = tf.nn.sigmoid(gamma_logits).numpy()
+    q_probs = tf.nn.sigmoid(q_logits).numpy()
+    true_probs_np = true_probs.numpy()
+    pred_probs_np = pred_probs.numpy()
+    delta_logits_np = delta_logits.numpy()
+    recon_out_np = recon_out.numpy()
+    
+    # Compute reconstruction metrics
+    recon_loss, recon_acc, per_token_loss = compute_reconstruction_loss(tcr_seqs, recon_out, PAD_TOKEN)
+    recon_loss_np = recon_loss.numpy()
+    recon_acc_np = recon_acc.numpy()
+    per_token_loss_np = per_token_loss.numpy()
+    
+    # =========================================================================
+    # 2.1: GAMMA VISUALIZATION
+    # =========================================================================
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # Heatmap
+    sns.heatmap(gamma_probs[:100], ax=axes[0,0], cmap='viridis', vmin=0, vmax=0.5)
+    axes[0,0].set_title(f'Gamma (HLA binding) - First 100 TCRs', fontsize=12)
+    axes[0,0].set_xlabel('Allele')
+    axes[0,0].set_ylabel('TCR')
+    
+    # Distribution histogram
+    axes[0,1].hist(gamma_probs.flatten(), bins=50, edgecolor='black', alpha=0.7)
+    axes[0,1].set_xlabel('Gamma probability', fontsize=12)
+    axes[0,1].set_ylabel('Count', fontsize=12)
+    axes[0,1].set_title(f'Distribution of Gamma values\nMean={np.mean(gamma_probs):.4f}, Std={np.std(gamma_probs):.4f}')
+    
+    # Per-allele mean
+    allele_means = np.mean(gamma_probs, axis=0)
+    axes[1,0].bar(range(len(allele_means)), allele_means, width=1.0, alpha=0.7)
+    axes[1,0].set_xlabel('Allele index', fontsize=12)
+    axes[1,0].set_ylabel('Mean gamma', fontsize=12)
+    axes[1,0].set_title('Mean Gamma per Allele (across all TCRs)')
+    
+    # Per-TCR max
+    tcr_maxs = np.max(gamma_probs, axis=1)
+    axes[1,1].hist(tcr_maxs, bins=50, edgecolor='black', alpha=0.7)
+    axes[1,1].set_xlabel('Max gamma per TCR', fontsize=12)
+    axes[1,1].set_ylabel('Count', fontsize=12)
+    axes[1,1].set_title(f'Distribution of Max Gamma per TCR\nMean={np.mean(tcr_maxs):.4f}')
+    
+    plt.tight_layout()
+    save_fig(fig, f'02_gamma_analysis_batch{batch_idx}')
+    
+    # =========================================================================
+    # 2.2: Q PROBABILITY VISUALIZATION
+    # =========================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    q_flat = q_probs.flatten()
+    axes[0].hist(q_flat, bins=50, edgecolor='black', alpha=0.7, color='orange')
+    axes[0].set_xlabel('Q probability', fontsize=12)
+    axes[0].set_ylabel('Count', fontsize=12)
+    axes[0].set_title(f'Distribution of Q (sampling probability)\nMean={np.mean(q_flat):.6f}, Max={np.max(q_flat):.6f}')
+    
+    axes[1].plot(range(len(q_flat)), np.sort(q_flat)[::-1], 'o-', markersize=1, alpha=0.5)
+    axes[1].set_xlabel('TCR (sorted by Q)', fontsize=12)
+    axes[1].set_ylabel('Q probability', fontsize=12)
+    axes[1].set_title('Q values sorted descending')
+    
+    plt.tight_layout()
+    save_fig(fig, f'02_q_analysis_batch{batch_idx}')
+    
+    # =========================================================================
+    # 2.3: TRUE VS PREDICTED PROBABILITIES (Delta Loss)
+    # =========================================================================
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # Heatmaps
+    sns.heatmap(true_probs_np[:100], ax=axes[0,0], cmap='viridis', vmin=0, vmax=0.5)
+    axes[0,0].set_title('True Probs (Enrichment-based)', fontsize=12)
+    axes[0,0].set_xlabel('Allele')
+    axes[0,0].set_ylabel('TCR')
+    
+    sns.heatmap(pred_probs_np[:100], ax=axes[0,1], cmap='viridis', vmin=0, vmax=0.5)
+    axes[0,1].set_title('Pred Probs (Model sigmoid(delta))', fontsize=12)
+    axes[0,1].set_xlabel('Allele')
+    axes[0,1].set_ylabel('TCR')
+    
+    # Difference
+    diff = true_probs_np - pred_probs_np
+    sns.heatmap(diff[:100], ax=axes[0,2], cmap='RdBu_r', center=0, vmin=-0.3, vmax=0.3)
+    axes[0,2].set_title('Difference (True - Pred)', fontsize=12)
+    axes[0,2].set_xlabel('Allele')
+    axes[0,2].set_ylabel('TCR')
+    
+    # Distribution comparison
+    axes[1,0].hist(true_probs_np.flatten(), bins=50, alpha=0.5, label='True', color='blue')
+    axes[1,0].hist(pred_probs_np.flatten(), bins=50, alpha=0.5, label='Pred', color='red')
+    axes[1,0].set_xlabel('Probability', fontsize=12)
+    axes[1,0].set_ylabel('Count', fontsize=12)
+    axes[1,0].set_title('Distribution Comparison')
+    axes[1,0].legend()
+    
+    # Scatter plot: true vs pred (sample of points)
+    num_points = min(10000, len(true_probs_np.flatten()))
+    sample_idx = np.random.choice(len(true_probs_np.flatten()), size=num_points, replace=False)
+    axes[1,1].scatter(true_probs_np.flatten()[sample_idx], pred_probs_np.flatten()[sample_idx], 
+                      alpha=0.1, s=1)
+    axes[1,1].plot([0, 0.5], [0, 0.5], 'r--', label='y=x')
+    axes[1,1].set_xlabel('True probability', fontsize=12)
+    axes[1,1].set_ylabel('Predicted probability', fontsize=12)
+    axes[1,1].set_title('True vs Predicted (sample)')
+    axes[1,1].legend()
+    
+    # Per-allele correlation
+    allele_corrs = []
+    for a in range(true_probs_np.shape[1]):
+        if np.std(true_probs_np[:, a]) > 1e-6 and np.std(pred_probs_np[:, a]) > 1e-6:
+            corr = np.corrcoef(true_probs_np[:, a], pred_probs_np[:, a])[0, 1]
+            allele_corrs.append(corr)
+        else:
+            allele_corrs.append(0)
+    
+    axes[1,2].bar(range(len(allele_corrs)), allele_corrs, width=1.0, alpha=0.7)
+    axes[1,2].axhline(y=0, color='red', linestyle='--')
+    axes[1,2].set_xlabel('Allele index', fontsize=12)
+    axes[1,2].set_ylabel('Correlation', fontsize=12)
+    axes[1,2].set_title(f'Per-Allele Correlation (True vs Pred)\nMean={np.nanmean(allele_corrs):.3f}')
+    
+    plt.tight_layout()
+    save_fig(fig, f'03_true_vs_pred_batch{batch_idx}')
+    
+    # =========================================================================
+    # 2.4: MODE COLLAPSE ANALYSIS
+    # =========================================================================
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    
+    # Top-k overlap analysis
+    overlaps_top5 = []
+    overlaps_top10 = []
+    for i in range(true_probs_np.shape[0]):
+        true_top5 = set(np.argsort(true_probs_np[i])[::-1][:5])
+        pred_top5 = set(np.argsort(pred_probs_np[i])[::-1][:5])
+        true_top10 = set(np.argsort(true_probs_np[i])[::-1][:10])
+        pred_top10 = set(np.argsort(pred_probs_np[i])[::-1][:10])
+        overlaps_top5.append(len(true_top5 & pred_top5))
+        overlaps_top10.append(len(true_top10 & pred_top10))
+    
+    axes[0,0].hist(overlaps_top5, bins=range(7), edgecolor='black', alpha=0.7, align='left')
+    axes[0,0].set_xlabel('Top-5 Overlap', fontsize=12)
+    axes[0,0].set_ylabel('Count', fontsize=12)
+    axes[0,0].set_title(f'Top-5 Overlap Distribution\nMean={np.mean(overlaps_top5):.2f}/5')
+    axes[0,0].set_xticks(range(6))
+    
+    axes[0,1].hist(overlaps_top10, bins=range(12), edgecolor='black', alpha=0.7, align='left')
+    axes[0,1].set_xlabel('Top-10 Overlap', fontsize=12)
+    axes[0,1].set_ylabel('Count', fontsize=12)
+    axes[0,1].set_title(f'Top-10 Overlap Distribution\nMean={np.mean(overlaps_top10):.2f}/10')
+    axes[0,1].set_xticks(range(11))
+    
+    # Mode collapse check: frequency of top-1 predictions
+    pred_top1_counts = Counter(np.argmax(pred_probs_np, axis=1))
+    true_top1_counts = Counter(np.argmax(true_probs_np, axis=1))
+    
+    # True top-1
+    true_common = true_top1_counts.most_common(15)
+    axes[1,0].barh(range(len(true_common)), [c for _, c in true_common], color='blue', alpha=0.7)
+    axes[1,0].set_yticks(range(len(true_common)))
+    axes[1,0].set_yticklabels([f'Allele {a}' for a, _ in true_common])
+    axes[1,0].set_xlabel('Count', fontsize=12)
+    axes[1,0].set_title('TRUE: Most Common Top-1 Alleles')
+    axes[1,0].invert_yaxis()
+    
+    # Pred top-1
+    pred_common = pred_top1_counts.most_common(15)
+    axes[1,1].barh(range(len(pred_common)), [c for _, c in pred_common], color='red', alpha=0.7)
+    axes[1,1].set_yticks(range(len(pred_common)))
+    axes[1,1].set_yticklabels([f'Allele {a}' for a, _ in pred_common])
+    axes[1,1].set_xlabel('Count', fontsize=12)
+    axes[1,1].set_title('PRED: Most Common Top-1 Alleles')
+    axes[1,1].invert_yaxis()
+    
+    plt.tight_layout()
+    save_fig(fig, f'04_mode_collapse_analysis_batch{batch_idx}')
+    
+    # =========================================================================
+    # 2.5: Na=0 BUG CHECK
+    # =========================================================================
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Check if Na=0 alleles appear in top predictions
+    pred_top5_flat = []
+    true_top5_flat = []
+    for i in range(pred_probs_np.shape[0]):
+        pred_top5_flat.extend(np.argsort(pred_probs_np[i])[::-1][:5])
+        true_top5_flat.extend(np.argsort(true_probs_np[i])[::-1][:5])
+    
+    pred_top5_counter = Counter(pred_top5_flat)
+    true_top5_counter = Counter(true_top5_flat)
+    
+    # How many times do Na=0 alleles appear in top-5?
+    na0_in_pred = sum(pred_top5_counter.get(a, 0) for a in zero_alleles)
+    na0_in_true = sum(true_top5_counter.get(a, 0) for a in zero_alleles)
+    total_top5 = len(pred_top5_flat)
+    
+    # Bar chart
+    categories = ['Na=0 in\nTrue Top-5', 'Na=0 in\nPred Top-5', 'Valid in\nTrue Top-5', 'Valid in\nPred Top-5']
+    values = [na0_in_true, na0_in_pred, total_top5 - na0_in_true, total_top5 - na0_in_pred]
+    colors = ['red', 'red', 'green', 'green']
+    axes[0].bar(categories, values, color=colors, alpha=0.7, edgecolor='black')
+    axes[0].set_ylabel('Count', fontsize=12)
+    axes[0].set_title(f'Na=0 Alleles in Top-5 Predictions\n(Total top-5 slots: {total_top5})')
+    for i, v in enumerate(values):
+        axes[0].text(i, v + 50, f'{v}\n({100*v/total_top5:.1f}%)', ha='center', fontsize=10)
+    
+    # Which specific Na=0 alleles appear most?
+    na0_pred_counts = [(a, pred_top5_counter.get(a, 0)) for a in zero_alleles]
+    na0_pred_counts.sort(key=lambda x: -x[1])
+    na0_pred_counts = na0_pred_counts[:10]
+    
+    if sum(c for _, c in na0_pred_counts) > 0:
+        axes[1].barh(range(len(na0_pred_counts)), [c for _, c in na0_pred_counts], color='red', alpha=0.7)
+        axes[1].set_yticks(range(len(na0_pred_counts)))
+        axes[1].set_yticklabels([f'Allele {a} (Na=0)' for a, _ in na0_pred_counts])
+        axes[1].set_xlabel('Count in Pred Top-5', fontsize=12)
+        axes[1].set_title('Most Common Na=0 Alleles in Predictions')
+        axes[1].invert_yaxis()
+    else:
+        axes[1].text(0.5, 0.5, '✓ No Na=0 alleles in\npredicted top-5!', ha='center', va='center', 
+                     fontsize=16, color='green', fontweight='bold')
+        axes[1].set_title('Na=0 Alleles in Predictions')
+    
+    # Same for true
+    na0_true_counts = [(a, true_top5_counter.get(a, 0)) for a in zero_alleles]
+    na0_true_counts.sort(key=lambda x: -x[1])
+    na0_true_counts = na0_true_counts[:10]
+    
+    if sum(c for _, c in na0_true_counts) > 0:
+        axes[2].barh(range(len(na0_true_counts)), [c for _, c in na0_true_counts], color='red', alpha=0.7)
+        axes[2].set_yticks(range(len(na0_true_counts)))
+        axes[2].set_yticklabels([f'Allele {a} (Na=0)' for a, _ in na0_true_counts])
+        axes[2].set_xlabel('Count in True Top-5', fontsize=12)
+        axes[2].set_title('Most Common Na=0 Alleles in True Labels\n⚠️ BUG: valid_allele_mask not applied!')
+        axes[2].invert_yaxis()
+    else:
+        axes[2].text(0.5, 0.5, '✓ No Na=0 alleles in\ntrue top-5!', ha='center', va='center', 
+                     fontsize=16, color='green', fontweight='bold')
+        axes[2].set_title('Na=0 Alleles in True Labels')
+    
+    plt.tight_layout()
+    save_fig(fig, f'05_na0_bug_check_batch{batch_idx}')
+    
+    # =========================================================================
+    # 2.6: LOSS COMPONENTS
+    # =========================================================================
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    # First term vs Second term
+    first_np = first_term.numpy()
+    second_np = second_term.numpy()
+    
+    axes[0,0].scatter(first_np, second_np, alpha=0.3, s=10)
+    axes[0,0].set_xlabel('First Term (log-odds sum)', fontsize=12)
+    axes[0,0].set_ylabel('Second Term (penalty)', fontsize=12)
+    axes[0,0].set_title('Loss Components per TCR')
+    
+    # BCE - handle both (B,) and (B, A) shapes
+    bce_np = bce.numpy()
+    
+    if len(bce_np.shape) == 1:
+        # bce is (B,) - per-sample scalar loss
+        axes[0,1].hist(bce_np, bins=50, edgecolor='black', alpha=0.7, color='purple')
+        axes[0,1].set_xlabel('BCE Loss per TCR', fontsize=12)
+        axes[0,1].set_ylabel('Count', fontsize=12)
+        axes[0,1].set_title(f'BCE Loss Distribution\nMean={np.mean(bce_np):.4f}')
         
-        # Create sequence mask
-        tcr_seq_mask = tf.where(tcr_seqs == PAD_TOKEN, PAD_TOKEN, 1.)
-        tcr_seq_mask = tf.cast(tcr_seq_mask, tf.float32)
-        gamma, q, att_score = model([tcr_seqs, tcr_seq_mask])
+        bce_per_sample = bce_np  # Already per-sample
+        bce_per_allele = None
+    else:
+        # bce is (B, A) - per-sample, per-allele loss
+        sns.heatmap(bce_np[:100], ax=axes[0,1], cmap='Reds', vmin=0)
+        axes[0,1].set_xlabel('Allele', fontsize=12)
+        axes[0,1].set_ylabel('TCR', fontsize=12)
+        axes[0,1].set_title(f'BCE Loss per TCR-Allele (first 100 TCRs)\nMean={np.mean(bce_np):.4f}')
+        
+        bce_per_sample = np.sum(bce_np, axis=1)  # Sum over alleles -> (B,)
+        bce_per_allele = np.mean(bce_np, axis=0)  # Mean over samples -> (A,)
+    
+    # BCE per-sample histogram
+    axes[0,2].hist(bce_per_sample, bins=50, edgecolor='black', alpha=0.7, color='purple')
+    axes[0,2].set_xlabel('BCE Loss (per sample)', fontsize=12)
+    axes[0,2].set_ylabel('Count', fontsize=12)
+    axes[0,2].set_title(f'BCE Loss per TCR\nMean={np.mean(bce_per_sample):.4f}, Std={np.std(bce_per_sample):.4f}')
+    
+    # Likelihood
+    ll_np = first_np - second_np
+    axes[1,0].hist(ll_np, bins=50, edgecolor='black', alpha=0.7, color='teal')
+    axes[1,0].set_xlabel('Log-Likelihood', fontsize=12)
+    axes[1,0].set_ylabel('Count', fontsize=12)
+    axes[1,0].set_title(f'Log-Likelihood Distribution\nMean={np.mean(ll_np):.4f}')
+    
+    # Ni_size distribution
+    ni_size_np = Ni_size.numpy()
+    axes[1,1].hist(ni_size_np, bins=50, edgecolor='black', alpha=0.7, color='orange')
+    axes[1,1].set_xlabel('Number of donors per TCR (Ni_size)', fontsize=12)
+    axes[1,1].set_ylabel('Count', fontsize=12)
+    axes[1,1].set_title(f'Donors per TCR\nMean={np.mean(ni_size_np):.1f}, Max={np.max(ni_size_np):.0f}')
+    
+    # BCE per-allele (only if bce is 2D)
+    if bce_per_allele is not None:
+        axes[1,2].bar(range(len(bce_per_allele)), bce_per_allele, width=1.0, alpha=0.7, color='purple')
+        axes[1,2].set_xlabel('Allele index', fontsize=12)
+        axes[1,2].set_ylabel('Mean BCE', fontsize=12)
+        axes[1,2].set_title('Mean BCE Loss per Allele')
+    else:
+        axes[1,2].text(0.5, 0.5, 'BCE is per-sample only\n(not per-allele)', 
+                       ha='center', va='center', fontsize=12)
+        axes[1,2].set_title('BCE per Allele (N/A)')
+    
+    plt.tight_layout()
+    save_fig(fig, f'06_loss_components_batch{batch_idx}')
+    # =========================================================================
+    # 2.7: RECONSTRUCTION ANALYSIS (NEW)
+    # =========================================================================
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    # Reconstruction loss distribution per token
+    valid_losses = per_token_loss_np[per_token_loss_np > 0]  # Non-masked positions
+    axes[0,0].hist(valid_losses.flatten(), bins=50, edgecolor='black', alpha=0.7, color='green')
+    axes[0,0].set_xlabel('Per-token CE Loss', fontsize=12)
+    axes[0,0].set_ylabel('Count', fontsize=12)
+    axes[0,0].set_title(f'Reconstruction Loss Distribution\nMean={np.mean(valid_losses):.4f}, Std={np.std(valid_losses):.4f}')
+    
+    # Per-position average loss
+    mask = (tcr_seqs.numpy() != PAD_TOKEN).astype(float)
+    position_loss = np.sum(per_token_loss_np, axis=0) / (np.sum(mask, axis=0) + 1e-10)
+    axes[0,1].bar(range(len(position_loss)), position_loss, width=1.0, alpha=0.7, color='green')
+    axes[0,1].set_xlabel('Position in sequence', fontsize=12)
+    axes[0,1].set_ylabel('Mean CE Loss', fontsize=12)
+    axes[0,1].set_title('Reconstruction Loss by Position')
+    
+    # Confusion matrix for amino acid predictions (sampled)
+    pred_tokens = np.argmax(recon_out_np, axis=-1)  # (B, S)
+    true_tokens = tcr_seqs.numpy().astype(int)
+    
+    # Flatten and filter out padding
+    mask_flat = (tcr_seqs.numpy() != PAD_TOKEN).flatten()
+    pred_flat = pred_tokens.flatten()[mask_flat]
+    true_flat = true_tokens.flatten()[mask_flat.astype(bool)]
+    
+    # Create confusion matrix (sample if too large)
+    if len(pred_flat) > 50000:
+        sample_idx = np.random.choice(len(pred_flat), 50000, replace=False)
+        pred_flat = pred_flat[sample_idx]
+        true_flat = true_flat[sample_idx]
+    
+    conf_matrix = np.zeros((21, 21))
+    for p, t in zip(pred_flat, true_flat):
+        if 0 <= p < 21 and 0 <= t < 21:
+            conf_matrix[t, p] += 1
+    
+    # Normalize by row (true class)
+    conf_matrix_norm = conf_matrix / (conf_matrix.sum(axis=1, keepdims=True) + 1e-10)
+    
+    sns.heatmap(conf_matrix_norm, ax=axes[0,2], cmap='Blues', 
+                xticklabels=AA_VOCAB, yticklabels=AA_VOCAB, vmin=0, vmax=1)
+    axes[0,2].set_xlabel('Predicted AA', fontsize=12)
+    axes[0,2].set_ylabel('True AA', fontsize=12)
+    axes[0,2].set_title('Reconstruction Confusion Matrix (normalized)')
+    
+    # Per-amino acid accuracy
+    aa_accuracy = np.diag(conf_matrix_norm)
+    axes[1,0].bar(range(21), aa_accuracy, color='green', alpha=0.7)
+    axes[1,0].set_xticks(range(21))
+    axes[1,0].set_xticklabels(AA_VOCAB, fontsize=8)
+    axes[1,0].set_xlabel('Amino Acid', fontsize=12)
+    axes[1,0].set_ylabel('Accuracy', fontsize=12)
+    axes[1,0].set_title(f'Per-AA Reconstruction Accuracy\nOverall: {recon_acc_np:.4f}')
+    axes[1,0].axhline(y=recon_acc_np, color='red', linestyle='--', label=f'Mean: {recon_acc_np:.3f}')
+    axes[1,0].legend()
+    
+    # Sample reconstruction examples
+    num_examples = 5
+    example_text = "RECONSTRUCTION EXAMPLES\n" + "="*60 + "\n\n"
+    for i in range(min(num_examples, len(tcr_seqs))):
+        true_seq = tokens_to_sequence(tcr_seqs[i].numpy(), PAD_TOKEN)
+        pred_seq = tokens_to_sequence(pred_tokens[i], PAD_TOKEN)
+        
+        # Mark differences
+        diff_markers = ""
+        for t, p in zip(true_seq, pred_seq):
+            diff_markers += "^" if t != p else " "
+        
+        example_text += f"Example {i+1}:\n"
+        example_text += f"  True: {true_seq}\n"
+        example_text += f"  Pred: {pred_seq}\n"
+        example_text += f"  Diff: {diff_markers}\n\n"
+    
+    axes[1,1].text(0.05, 0.95, example_text, transform=axes[1,1].transAxes, 
+                   fontsize=8, verticalalignment='top', fontfamily='monospace',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    axes[1,1].axis('off')
+    axes[1,1].set_title('Sample Reconstructions')
+    
+    # Prediction confidence distribution
+    pred_confidences = np.max(recon_out_np, axis=-1)  # (B, S)
+    valid_confidences = pred_confidences[tcr_seqs.numpy() != PAD_TOKEN]
+    axes[1,2].hist(valid_confidences.flatten(), bins=50, edgecolor='black', alpha=0.7, color='blue')
+    axes[1,2].set_xlabel('Prediction Confidence (max softmax)', fontsize=12)
+    axes[1,2].set_ylabel('Count', fontsize=12)
+    axes[1,2].set_title(f'Reconstruction Confidence\nMean={np.mean(valid_confidences):.4f}')
+    
+    plt.tight_layout()
+    save_fig(fig, f'07_reconstruction_analysis_batch{batch_idx}')
+    
+    # =========================================================================
+    # 2.8: ATTENTION VISUALIZATION (if available)
+    # =========================================================================
+    if att_score is not None:
+        att_np = att_score.numpy()  # Shape: (B, heads, seq, seq)
+        
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        
+        # Show attention for first TCR, all heads
+        sample_idx = 0
+        if len(att_np.shape) == 4:  # (B, heads, seq, seq)
+            num_heads = min(8, att_np.shape[1])
+            for h in range(num_heads):
+                row, col = h // 4, h % 4
+                sns.heatmap(att_np[sample_idx, h], ax=axes[row, col], cmap='viridis', 
+                           square=True, cbar_kws={'shrink': 0.5})
+                axes[row, col].set_title(f'Head {h+1}', fontsize=10)
+        
+        plt.suptitle(f'Attention Patterns for TCR Sample {sample_idx}', fontsize=14)
+        plt.tight_layout()
+        save_fig(fig, f'08_attention_patterns_batch{batch_idx}')
+    
+    # =========================================================================
+    # COLLECT BATCH STATISTICS
+    # =========================================================================
+    batch_stats = {
+        'batch': batch_idx,
+        'num_samples': true_probs_np.shape[0],
+        'gamma_mean': np.mean(gamma_probs),
+        'gamma_std': np.std(gamma_probs),
+        'gamma_max': np.max(gamma_probs),
+        'q_mean': np.mean(q_probs),
+        'q_max': np.max(q_probs),
+        'true_probs_std': np.std(true_probs_np),
+        'pred_probs_std': np.std(pred_probs_np),
+        'delta_logits_std': np.std(delta_logits_np),
+        'top5_overlap_mean': np.mean(overlaps_top5),
+        'top10_overlap_mean': np.mean(overlaps_top10),
+        'na0_in_pred_top5': na0_in_pred,
+        'na0_in_true_top5': na0_in_true,
+        'bce_mean': np.mean(bce_np),
+        'bce_per_sample_mean': np.mean(bce_per_sample),
+        'll_mean': np.mean(ll_np),
+        'per_allele_corr_mean': np.nanmean(allele_corrs),
+        'recon_loss': recon_loss_np,
+        'recon_accuracy': recon_acc_np,
+        'recon_confidence_mean': np.mean(valid_confidences),
+    }
+    all_stats.append(batch_stats)
 
- 
-        plt.figure(figsize=(30,20))
-        sns.heatmap(gamma.numpy())
-        plt.xlabel('HLAs', size=24)
-        plt.ylabel('TCRs', size=24)
-        plt.xticks(range(len(hla)), hla, size=3, rotation=45, ha='right')
-        plt.savefig(os.path.join(OUTPUT_PATH, f'tcr_hla_heatmap_{step}.png'), dpi=600)
-        plt.close()
+# =============================================================================
+# SECTION 3: SUMMARY REPORT
+# =============================================================================
+print("\n" + "="*80)
+print("SECTION 3: GENERATING SUMMARY REPORT")
+print("="*80)
 
-        plt.figure(figsize=(10,7))
-        sns.heatmap(q.numpy())
-        plt.xlabel('Probs', size=24)
-        plt.ylabel('TCRs', size=24)
-        plt.savefig(os.path.join(OUTPUT_PATH, f'tcr_q_{step}.png'), dpi=600)
-        plt.close()
+stats_df = pd.DataFrame(all_stats)
+stats_df.to_csv(os.path.join(OUTPUT_PATH, 'batch_statistics.csv'), index=False)
 
+summary_report = f"""
+TCRtyper MODEL DIAGNOSTICS SUMMARY REPORT
+{'='*60}
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Model: {MODEL_PATH}
+Batches analyzed: {NUM_BATCHES_TO_ANALYZE}
+Batch size: {BATCH_SIZE}
+
+{'='*60}
+1. ALLELE FREQUENCY ISSUE (Na=0 Bug)
+{'='*60}
+Total alleles with Na=0: {len(zero_alleles)}
+Alleles with Na=0: {zero_alleles.tolist()[:20]}{'...' if len(zero_alleles) > 20 else ''}
+
+Average Na=0 alleles appearing in TRUE top-5: {np.mean([s['na0_in_true_top5'] for s in all_stats]):.1f}
+Average Na=0 alleles appearing in PRED top-5: {np.mean([s['na0_in_pred_top5'] for s in all_stats]):.1f}
+
+INTERPRETATION:
+- If Na=0 alleles appear frequently in top-5, the valid_allele_mask is NOT working
+- These should be masked to have near-zero probability
+
+STATUS: {'⚠️ BUG PRESENT - Na=0 alleles in predictions!' if np.mean([s['na0_in_true_top5'] for s in all_stats]) > 100 else '✓ Bug appears fixed or minimal'}
+
+{'='*60}
+2. MODE COLLAPSE ANALYSIS
+{'='*60}
+Average Top-5 Overlap (True vs Pred): {np.mean([s['top5_overlap_mean'] for s in all_stats]):.2f}/5
+Average Top-10 Overlap (True vs Pred): {np.mean([s['top10_overlap_mean'] for s in all_stats]):.2f}/10
+
+Expected by chance:
+- Top-5 overlap: ~0.07/5 (for 358 classes)
+- Top-10 overlap: ~0.28/10 (for 358 classes)
+
+INTERPRETATION:
+- Overlap >> chance: Model is learning meaningful patterns
+- Overlap ~ chance: Model not learning or mode collapse
+- Check mode collapse plots for concentration on few alleles
+
+STATUS: {'✓ Good overlap - model learning' if np.mean([s['top5_overlap_mean'] for s in all_stats]) > 2 else '⚠️ Low overlap - check mode collapse'}
+
+{'='*60}
+3. PROBABILITY DISTRIBUTIONS
+{'='*60}
+                          Mean across batches
+True probs std:           {np.mean([s['true_probs_std'] for s in all_stats]):.6f}
+Pred probs std:           {np.mean([s['pred_probs_std'] for s in all_stats]):.6f}
+Delta logits std:         {np.mean([s['delta_logits_std'] for s in all_stats]):.6f}
+Per-allele correlation:   {np.mean([s['per_allele_corr_mean'] for s in all_stats]):.4f}
+
+INTERPRETATION:
+- If pred_probs_std << true_probs_std: Model predictions too uniform
+- If delta_logits_std is low: Model not differentiating alleles
+- Per-allele correlation should be positive if model is learning
+
+{'='*60}
+4. MODEL OUTPUT STATISTICS
+{'='*60}
+Gamma (HLA binding):
+  Mean: {np.mean([s['gamma_mean'] for s in all_stats]):.6f}
+  Max:  {np.mean([s['gamma_max'] for s in all_stats]):.6f}
+
+Q (Sampling probability):
+  Mean: {np.mean([s['q_mean'] for s in all_stats]):.8f}
+  Max:  {np.mean([s['q_max'] for s in all_stats]):.8f}
+
+INTERPRETATION:
+- Very low Q values (< 0.001) may indicate model is "giving up"
+- Gamma values should vary across alleles if model is discriminating
+
+{'='*60}
+5. LOSS COMPONENTS
+{'='*60}
+BCE Loss (mean per element):    {np.mean([s['bce_mean'] for s in all_stats]):.4f}
+BCE Loss (mean per sample):     {np.mean([s['bce_per_sample_mean'] for s in all_stats]):.4f}
+Log-Likelihood (mean):          {np.mean([s['ll_mean'] for s in all_stats]):.4f}
+
+{'='*60}
+6. RECONSTRUCTION QUALITY (NEW)
+{'='*60}
+Reconstruction Loss:            {np.mean([s['recon_loss'] for s in all_stats]):.4f}
+Reconstruction Accuracy:        {np.mean([s['recon_accuracy'] for s in all_stats]):.4f}
+Mean Prediction Confidence:     {np.mean([s['recon_confidence_mean'] for s in all_stats]):.4f}
+
+INTERPRETATION:
+- High reconstruction accuracy (>0.8) indicates good sequence encoding
+- Low accuracy may suggest the encoder is not capturing sequence information
+- This auxiliary task helps prevent mode collapse in the latent space
+
+STATUS: {'✓ Good reconstruction' if np.mean([s['recon_accuracy'] for s in all_stats]) > 0.7 else '⚠️ Low reconstruction accuracy - check encoder'}
+
+{'='*60}
+7. RECOMMENDATIONS
+{'='*60}
+"""
+
+# Add recommendations based on analysis
+recommendations = []
+
+if np.mean([s['na0_in_true_top5'] for s in all_stats]) > 100:
+    recommendations.append("""
+- ⚠️ FIX Na=0 BUG: Apply valid_allele_mask in delta_loss():
+  
+  valid_allele_mask = tf.cast(self.Na > 0, tf.float32)  # (A,)
+  log_Eia = tf.where(
+      valid_allele_mask[tf.newaxis, :] > 0.5,
+      log_Eia,
+      tf.constant(-100., dtype=log_Eia.dtype)
+  )
+""")
+
+if np.mean([s['top5_overlap_mean'] for s in all_stats]) < 2:
+    recommendations.append("""
+- ⚠️ LOW OVERLAP: Consider:
+  - Increasing softmax_loss_weight
+  - Lowering softmax_temperature (e.g., 0.1-0.5)
+  - Training longer
+  - Checking gradient flow to delta_logits layer
+""")
+
+if np.mean([s['per_allele_corr_mean'] for s in all_stats]) < 0.1:
+    recommendations.append("""
+- ⚠️ LOW CORRELATION: Per-allele correlation is very low
+  - Model may not be learning TCR-specific patterns
+  - Check if true labels have sufficient variation
+""")
+
+if np.mean([s['recon_accuracy'] for s in all_stats]) < 0.7:
+    recommendations.append("""
+- ⚠️ LOW RECONSTRUCTION ACCURACY: 
+  - Increase RECON_WEIGHT to prioritize sequence learning
+  - Check if encoder capacity is sufficient
+  - Verify reconstruction branch architecture
+""")
+
+if not recommendations:
+    recommendations.append("""
+- ✓ No critical issues detected
+- Continue monitoring training progress
+- Consider fine-tuning hyperparameters for better performance
+""")
+
+summary_report += '\n'.join(recommendations)
+
+summary_report += f"""
+
+{'='*60}
+FILES GENERATED
+{'='*60}
+"""
+for f in sorted(os.listdir(OUTPUT_PATH)):
+    summary_report += f"- {f}\n"
+
+write_stats('00_SUMMARY_REPORT.txt', summary_report)
+
+# Also print summary to console
+print(summary_report)
+
+print("\n" + "="*80)
+print(f"✓ DIAGNOSTICS COMPLETE")
+print(f"✓ All outputs saved to: {OUTPUT_PATH}")
+print("="*80)
+
+# =============================================================================
+# SECTION 4: DETAILED ANALYSIS
+# =============================================================================
+print("\n" + "="*80)
+print("SECTION 4: DETAILED ANALYSIS")
+print("="*80)
+
+# Which alleles have high gamma across all TCRs?
+gamma_probs = tf.nn.sigmoid(gamma_logits).numpy()
+allele_means = np.mean(gamma_probs, axis=0)  # Mean gamma per allele
+
+# Top 10 alleles by average gamma
+top_gamma_alleles = np.argsort(allele_means)[::-1][:10]
+print("\nTop 10 alleles by mean gamma:", top_gamma_alleles)
+print("Their Na values:", [loss_func.Na[a].numpy() for a in top_gamma_alleles])
+print("Their mean gamma:", [allele_means[a] for a in top_gamma_alleles])
+
+# Check first vs second term balance
+first_np = first_term.numpy()
+second_np = second_term.numpy()
+print(f"\nFirst term: mean={np.mean(first_np):.2f}, std={np.std(first_np):.2f}")
+print(f"Second term: mean={np.mean(second_np):.2f}, std={np.std(second_np):.2f}")
+
+# Check which alleles appear in most TCR donor pools
+allele_presence = tf.reduce_sum(tf.cast(tf.reduce_sum(Ni, axis=1) > 0, tf.float32), axis=0).numpy()
+print("\nAlleles appearing in most TCRs:")
+top_present = np.argsort(allele_presence)[::-1][:10]
+for a in top_present:
+    print(f"  Allele {a}: present in {allele_presence[a]:.0f}/{Ni.shape[0]} TCRs, Na={loss_func.Na[a].numpy():.0f}")
+
+# Reconstruction summary
+print(f"\nReconstruction Summary:")
+print(f"  Loss: {recon_loss_np:.4f}")
+print(f"  Accuracy: {recon_acc_np:.4f}")
+print(f"  Confidence: {np.mean(valid_confidences):.4f}")
+
+# =============================================================================
+# SECTION 5: EMBEDDING SPACE ANALYSIS (Optional)
+# =============================================================================
+print("\n" + "="*80)
+print("SECTION 5: EMBEDDING SPACE ANALYSIS")
+print("="*80)
+
+# Get pooled representations (if accessible)
+try:
+    # Create a model that outputs the pooled layer
+    pooled_model = keras.Model(
+        inputs=model.inputs,
+        outputs=model.get_layer('pool').output
+    )
+    
+    # Get pooled representations
+    pooled_output = pooled_model([tcr_seqs, tcr_seq_mask]).numpy()
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Pooled representation statistics
+    axes[0].hist(pooled_output.flatten(), bins=50, edgecolor='black', alpha=0.7)
+    axes[0].set_xlabel('Pooled activation value', fontsize=12)
+    axes[0].set_ylabel('Count', fontsize=12)
+    axes[0].set_title(f'Pooled Representation Distribution\nMean={np.mean(pooled_output):.4f}, Std={np.std(pooled_output):.4f}')
+    
+    # Per-dimension variance
+    dim_vars = np.var(pooled_output, axis=0)
+    axes[1].bar(range(len(dim_vars)), dim_vars, width=1.0, alpha=0.7)
+    axes[1].set_xlabel('Dimension', fontsize=12)
+    axes[1].set_ylabel('Variance', fontsize=12)
+    axes[1].set_title('Variance per Embedding Dimension')
+    
+    # 2D projection using PCA
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=2)
+    pooled_2d = pca.fit_transform(pooled_output[:500])  # First 500 samples
+    
+    # Color by Ni_size
+    axes[2].scatter(pooled_2d[:, 0], pooled_2d[:, 1], c=ni_size_np[:500], 
+                    cmap='viridis', alpha=0.5, s=10)
+    axes[2].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%})', fontsize=12)
+    axes[2].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%})', fontsize=12)
+    axes[2].set_title('PCA of Pooled Representations\n(colored by donor count)')
+    plt.colorbar(axes[2].collections[0], ax=axes[2], label='Ni_size')
+    
+    plt.tight_layout()
+    save_fig(fig, '09_embedding_analysis')
+    
+    print("✓ Embedding analysis complete")
+    
+except Exception as e:
+    print(f"⚠️ Could not perform embedding analysis: {e}")
+
+print("\n" + "="*80)
+print("ALL DIAGNOSTICS COMPLETE")
+print("="*80)

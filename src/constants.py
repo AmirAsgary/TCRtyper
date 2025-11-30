@@ -1,4 +1,4 @@
-
+import numpy as np
 aa_order = list("ARNDCEQGHILKMFPSTWYVX")
 AMINO_ACIDS = 'ARNDCEQGHILKMFPSTWYVX'
 AMINO_ACID_IDX = dict(zip(AMINO_ACIDS, range(len(AMINO_ACIDS))))
@@ -80,6 +80,7 @@ one_hot_encoding = {
 }
 
 
+
 PHYSICHE_PROPERTIES = {
     "A": [0.51, 0.169, 0.471, 0.279, 0.141, 0.294, 0, 0.262, 0.512, 0, 0.404],
     "R": [0.667, 0.726, 0.321, 1, 0.905, 0.529, 0.327, 0.169, 0.372, 1, 1],
@@ -101,7 +102,12 @@ PHYSICHE_PROPERTIES = {
     "W": [0.686, 1, 0.681, 0.207, 0.219, 1, 1, 0.537, 0.674, 0.04, 0.39],
     "Y": [0.686, 0.796, 0.591, 0.477, 0.454, 0.853, 0.682, 1, 0.419, 0.031, 0.362],
     "V": [0.745, 0.487, 0.859, 0.036, 0.094, 0.647, 0.234, 0.369, 0.674, 0.003, 0.399],
+    "X": [0.] * 11,
+    "-": [0.] * 11,
 }
+
+A = 'ARNDCEQGHILKMFPSTWYVX-'
+PHYSICHE_PROPERTIES_IDX = np.array([PHYSICHE_PROPERTIES[i] + [0] for i in A])
 
 BLOSUM80 = {
     'A': [5, -2, -2, -2, -1, -1, -1, 0, -2, -2, -2, -1, -1, -3, -1, 1, 0, -3, -2, 0, -2, -2, -1, -1, -6],

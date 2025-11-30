@@ -1,6 +1,8 @@
 import keras
 from keras import layers
 import tensorflow as tf
+import src
+from src.constants import PHYSICHE_PROPERTIES_IDX
 
 
 
@@ -96,7 +98,7 @@ class MaskedEmbedding(keras.layers.Layer):
         self.embedding = self.add_weight(
             name="embedding_matrix",
             shape=(self.vocab_size+1, self.embed_dim),
-            initializer="glorot_uniform",
+            initializer='random_normal',
             trainable=True,
         )
 
@@ -138,6 +140,75 @@ class MaskedEmbedding(keras.layers.Layer):
             'pad_token': self.pad_token,
         })
         return config
+
+
+
+@keras.utils.register_keras_serializable(package='custom_layers', name='MaskedEmbeddingOHE')
+class MaskedEmbeddingOHE(keras.layers.Layer):
+    def __init__(
+        self,
+        vocab_size,
+        mask_token=-1,
+        pad_token=-2,
+        name='masked_embedding_ohe',
+        **kwargs
+    ):
+        super().__init__(name=name, **kwargs)
+        self.vocab_size = vocab_size
+        self.mask_token = mask_token
+        self.pad_token = pad_token
+        # For one-hot encoding, embed_dim is vocab_size+1 (including pad token)
+        self.embed_dim = vocab_size + 1
+
+    def build(self, input_shape):
+        # No learnable weights needed for one-hot encoding
+        super().build(input_shape)
+
+    @tf.function(reduce_retracing=True)
+    def call(self, x, mask):
+        """
+        Args:
+            x: integer input tokens, shape (B, N)
+            mask: mask values, shape (B, N),
+                  contains original IDs so we check pad/mask tokens
+        Returns:
+            One-hot encoded embeddings with padded/masked positions set to zero.
+        """
+        # Cast to int32
+        x = tf.cast(x, dtype=tf.int32)  # (B, S)
+        
+        # Map pad_token to vocab_size
+        x = tf.where(x == tf.cast(self.pad_token, tf.int32), self.vocab_size, x)
+        
+        # One-hot encode: shape (B, S, vocab_size+1)
+        embedded = tf.one_hot(x, depth=self.vocab_size + 1, dtype=tf.float32)
+        
+        # Cast mask to same dtype
+        mask = tf.cast(mask, embedded.dtype)
+
+        # Identify padded or masked tokens
+        bad = (mask == self.pad_token) | (mask == self.mask_token)
+
+        # Convert to (0 for masked/padded, 1 for valid)
+        keep_mask = tf.where(bad, 0.0, 1.0)
+        keep_mask = tf.cast(keep_mask, embedded.dtype)
+
+        # Zero-out embeddings at masked/padded positions
+        embedded = embedded * keep_mask[:, :, tf.newaxis]
+
+        return embedded
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'vocab_size': self.vocab_size,
+            'mask_token': self.mask_token,
+            'pad_token': self.pad_token,
+        })
+        return config
+
+
+
 
 
 def _neg_inf(dtype):
@@ -619,7 +690,7 @@ class Likelihood(keras.losses.Loss):
         gamma_donor_id_mask = tf.where(gamma_donor_id == self.pad_token, 0., 1) #(B,D_i) or (B,N_i) pads == 0, normal == 1
         Ni = tf.gather(self.donor_mhc, gamma_donor_id_converted, axis=0) # (N, A), (B,D_i) --> (B, N_i, A) N_i are simply gathered D_is , D_i is index and is padded. len(N_i) == len(D_i)
         Ni = tf.multiply(Ni, tf.cast(gamma_donor_id_mask[:, :, tf.newaxis], tf.int32)) #(B,N_i,A) masked out
-        return tf.cast(Ni_size, tf.float32), tf.cast(Ni, tf.float32), gamma_donor_id_mask
+        return tf.cast(Ni_size, tf.float32), tf.cast(Ni, tf.float32), gamma_donor_id_mask #(B,) (B,N_i,A) masked out and (B,N_i) pads == 0, normal == 1
 
     def calculate_pni(self, Ni, gamma, gamma_donor_id_mask): #(B,N_i,A) and (B,A)
         # pni = 1 - Prod (1 - gamma_ia) ^ xna
@@ -683,6 +754,7 @@ class MaskedDense(keras.layers.Layer):
         y = tf.matmul(x, self.W)  # (B, Seq, units)
         if self.use_bias:
             y = y + self.b
+        y = tf.nn.relu(y)
 
         # Make mask binary: 1 = keep, 0 = pad
         mask_binary = tf.cast(mask != self.pad_token, y.dtype)  # (B, Seq)
@@ -750,6 +822,39 @@ class QDense(tf.keras.layers.Layer):
         return outputs
 
 
+@tf.keras.utils.register_keras_serializable(package="custom_layers", name='QDense')
+class SpatialTemporalDropout1D(keras.layers.Layer):
+    """Drops entire feature channels AND entire timesteps."""
+    def __init__(self, feature_rate=0.1, timestep_rate=0.1, name='spatial_dropout', **kwargs):
+        super().__init__(**kwargs)
+        self.feature_rate = feature_rate
+        self.timestep_rate = timestep_rate
+        self.name = name
+    @tf.function(reduce_retracing=True)
+    def call(self, inputs, training=None):
+        if not training:
+            return inputs
+        shape = tf.shape(inputs)  # (B, T, F)
+        # Drop entire features: mask shape (B, 1, F)
+        feature_mask = tf.random.uniform((shape[0], 1, shape[2])) > self.feature_rate
+        # Drop entire timesteps: mask shape (B, T, 1)
+        timestep_mask = tf.random.uniform((shape[0], shape[1], 1)) > self.timestep_rate
+        # Combine masks
+        combined_mask = tf.cast(feature_mask & timestep_mask, inputs.dtype)
+        # Scale to maintain expected value
+        keep_prob = (1 - self.feature_rate) * (1 - self.timestep_rate)
+        return inputs * combined_mask / keep_prob
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "feature_rate": self.feature_rate,
+            "timestep_rate": self.timestep_rate,
+            'name': self.name
+        })
+        return config
+
+
+
 def log1mexp(x):
     """
     Compute log(1 - exp(x)) in a numerically stable way.
@@ -791,12 +896,14 @@ class LogSpaceLikelihood(keras.losses.Loss):
     
     def __init__(
         self, 
-        donor_mhc: tf.Tensor,
-        pad_token: int | float = -1,
+        donor_mhc: tf.Tensor, #(N, A) binary that is 1 if a donor has one mhc and 0 if not
+        pad_token: int | float = -2,
         test_mode: bool = False,
         use_softmax_loss: bool = True,
         softmax_loss_weight: float = 1.0,
         softmax_temperature: float = 1.0,
+        fix_q = True, #If True, Q will be fixed to the calculations in the document $q_i = |\mathcal{N}_i| A  / \big(|\mathcal{N}_i| A + 24 N\big)$
+        num_mhc=358, # total number of mhcs in the dataset. Based on the input data, some mhcs might not be available in the data, and they will be masked out.
         **kwargs
     ):
         super().__init__()
@@ -806,13 +913,20 @@ class LogSpaceLikelihood(keras.losses.Loss):
         self.use_softmax_loss = use_softmax_loss
         self.softmax_loss_weight = softmax_loss_weight
         self.softmax_temperature = softmax_temperature
+        self.N = 702. # total number of donors
+        self.fix_q = fix_q
         
         # Precompute Na and log(Na) for the second term
         # Na is the count of donors carrying each allele, shape (A,)
         self.Na = tf.reduce_sum(self.donor_mhc, axis=0)  # (A,)
         self.log_Na = tf.math.log(self.Na + 1e-10)  # (A,)
+        # Mask for valid alleles (present in cohort)
+        self.valid_allele_mask = tf.cast(self.Na > 0, tf.float32)  # (A,)
+        self.BCE = keras.losses.BinaryCrossentropy(from_logits=True, reduction=None)
+        self.A = tf.constant(num_mhc, dtype=tf.float32)
+        self.log_A = tf.math.log(self.A)
     
-    def call(self, gamma_logits, q_logits, gamma_donor_id):
+    def call(self, gamma_logits, q_logits, gamma_donor_id, delta_logits):
         # Ensure q_logits has correct shape
         if len(tf.shape(q_logits)) == 2:
             q_logits = tf.squeeze(q_logits, axis=-1)  # (B,)
@@ -825,9 +939,18 @@ class LogSpaceLikelihood(keras.losses.Loss):
         log_gamma = tf.math.log_sigmoid(gamma_logits)  # (B, A)
         log_one_minus_gamma = tf.math.log_sigmoid(-gamma_logits)  # (B, A)
         log_q = tf.math.log_sigmoid(q_logits)  # (B,)
-        
+            
         # Get donor information
-        Ni_size, Ni, gamma_donor_id_mask = self.calculate_Ni_Nisize(gamma_donor_id)
+        Ni_size, Ni, gamma_donor_id_mask = self.calculate_Ni_Nisize(gamma_donor_id) #(B,), (B,N_i,A) masked out, (B,N_i) pads == 0, normal == 1
+        if self.fix_q: 
+            log_q = tf.exp(log_q) * 0. # zero outing the q (B,)
+            # calculate log(q_i) = log(Ni_size * A) - log(Ni_size * A + 24N)
+            log_numerator = tf.math.log(Ni_size) + self.log_A #(B,) + scalar
+            log_N_times_24 = tf.math.log(24.0) + tf.math.log(self.N) #(1,) + (1,)
+            log_N_times_24 = tf.broadcast_to(log_N_times_24, tf.shape(log_numerator)) #(B,)
+            log_denominator = tf.math.reduce_logsumexp(tf.stack([log_numerator, log_N_times_24], axis=-1), axis=-1) #(B,)
+            term = log_numerator - log_denominator
+            log_q = log_q + term #(B,)
         
         # ===== FIRST TERM: Sum over donors containing each TCR =====
         # Compute log(p_ni) = log(1 - prod_a(1-γ)^x_na)
@@ -864,18 +987,22 @@ class LogSpaceLikelihood(keras.losses.Loss):
 
         # ===== SOFTMAX LOSS (optional) =====
         if self.use_softmax_loss:
-            cce = self.softmax_loss(Ni, gamma_logits)
+            true_probs = self.delta_loss(Ni) #(B,A)
+            bce = self.BCE(true_probs, delta_logits)
+
         else:
-            cce = tf.zeros_like(LL_batch)
+            bce = tf.zeros_like(LL_batch)
         
+        # regularization term
+        reg_term = self.regularization_term(gamma_logits) #(B,)
         # ===== TOTAL LOSS =====
         if not self.test_mode:
-            total_loss = (-tf.reduce_mean(LL_batch), self.softmax_loss_weight * tf.reduce_mean(cce))
-            return total_loss
+            return -LL_batch + reg_term, self.softmax_loss_weight * bce #(B,) , (B)
+
         else:
             return (Ni_size, Ni, gamma_donor_id_mask, log_p_ni,
-                    log_qp, log_one_minus_qp, first_term, second_term, cce,
-                    log_gamma, log_one_minus_gamma)
+                    log_qp, log_one_minus_qp, first_term, second_term, bce,
+                    log_gamma, log_one_minus_gamma, true_probs, tf.nn.sigmoid(delta_logits))
 
     def calculate_log_pni(self, Ni, log_one_minus_gamma, gamma_donor_id_mask):
         """
@@ -926,35 +1053,72 @@ class LogSpaceLikelihood(keras.losses.Loss):
         Ni = tf.gather(self.donor_mhc, gamma_donor_id_safe, axis=0)
         Ni = Ni * tf.cast(gamma_donor_id_mask[:, :, tf.newaxis], Ni.dtype)
         
-        return tf.cast(Ni_size, tf.float32), tf.cast(Ni, tf.float32), gamma_donor_id_mask
+        return tf.cast(Ni_size, tf.float32), tf.cast(Ni, tf.float32), gamma_donor_id_mask #(B,) (B,N_i,A) masked out and (B,N_i) pads == 0, normal == 1
 
-    def softmax_loss(self, Ni, gamma_logits):
+    def delta_loss(self, Ni):
         """
-        Cross-entropy loss between gamma predictions and empirical HLA distribution.
-        
         Args:
             Ni: HLA profiles of donors, shape (B, N_i, A)
-            gamma_logits: Pre-sigmoid logits, shape (B, A)
         
         Returns:
-            Cross-entropy loss per sample, shape (B,)
+            CCE loss per sample, shape (B,)
         """
-        # Sum HLA counts across donors to get empirical distribution
-        hla_counts = tf.reduce_sum(Ni, axis=1)  # (B, A)
-        
-        # Convert gamma logits to probabilities for normalization
-        gamma = tf.nn.sigmoid(gamma_logits)
-        
-        # Target distribution from HLA counts (temperature-scaled)
-        y_true = tf.nn.softmax(
-            tf.cast(hla_counts, tf.float32) / self.softmax_temperature,
-            axis=-1
+        #### --- Defining Parameters --- ####
+        N = self.N #scalar --> total number of donors
+        ##
+        log_Na = self.log_Na #(A,) --> for each hla, how many donors we have
+        ##
+        log_Nia = tf.math.log(tf.reduce_sum(Ni, axis=1) + 1e-7)#(B, A) --> for each tcr, how many hlas we have 
+        ## Ni valid (B,1) --> count how many donors we have for a given tcr
+        mask_valid = tf.reduce_any(tf.not_equal(Ni, 0), axis=-1)
+        mask_valid = tf.cast(mask_valid, tf.float32)  # (B, N_i)
+        Ni_valid = tf.reduce_sum(mask_valid, axis=1, keepdims=True)  # (B,1)
+        #### --- Calculations --- ####
+        # 1- Cohort level background frequencies:
+        # f_a = Na / N --> log(f_a) = log(Na) - log(N)
+        log_fa = log_Na - tf.math.log(N) # (A,)
+        log_fa = tf.clip_by_value(log_fa, clip_value_min=-100., clip_value_max=0.0) # to keep always below 1.
+
+        # 2- TCR i and HLA a co-occurance frequency
+        # p_ia = N_ia / N_i --> log(p_ia) = log(N_ia) - log(Ni_valid)
+        log_pia = log_Nia - tf.math.log(Ni_valid + 1e-7) #(B, A)
+        log_pia = tf.clip_by_value(log_pia, clip_value_min=-100., clip_value_max=0.0) # to keep always below 1.
+
+        # 3- Compute enrichment scores for each allele
+        # E_ia =  p_ia / f_a --> log(E_ia) = log(p_ia) - log(f_a)
+
+        log_Eia = log_pia - tf.expand_dims(log_fa, axis=0) #(B, A)
+        log_Eia = tf.where(
+        self.valid_allele_mask[tf.newaxis, :] > 0.5, #(1,A)
+        log_Eia,
+        tf.constant(-100., dtype=log_Eia.dtype)  # zero probability
         )
+    
+        # 4- Compute conditional/binding probability
+        # p_a_binds_i = E_ia / SUM_b(E_ib) --> log(p_a_binds_i) = log(E_ia) - log(SUM_b(E_ib))
+        #log_p_a_binds_i = log_Eia - tf.reduce_logsumexp(log_Eia, axis=-1, keepdims=True) # (B,A)
+        # Calculate loss CCE
+        #pred_probs = tf.nn.softmax(delta_logits / self.softmax_temperature, axis=-1) #(B,A)
+        #true_probs = tf.exp(log_p_a_binds_i) #(B,A)
+        # Compute scaled log odds
+        # log E_ia - log max(E_ia)
         
-        # Predicted distribution (normalized gamma)
-        y_pred = gamma / (tf.reduce_sum(gamma, axis=-1, keepdims=True) + 1e-10)
-        
-        # Cross-entropy: -sum(y_true * log(y_pred))
-        cce = -tf.reduce_sum(y_true * tf.math.log(y_pred + 1e-10), axis=-1)
-        
-        return cce
+        log_Eia_max = tf.reduce_max(log_Eia, axis=-1, keepdims=True)  #(B,1)
+        log_scaled = log_Eia - log_Eia_max  #(B,A)
+        true_probs = tf.exp(log_scaled)  #(B,A)
+
+        return true_probs
+
+    def regularization_term(self, gamma_logits):
+                    # In your training loss
+        invalid_mask = 1.0 - self.valid_allele_mask  # 1 for Na=0, 0 otherwise
+        gamma_probs = tf.nn.sigmoid(gamma_logits)
+
+        # Penalize non-zero gamma for invalid alleles
+        invalid_gamma_penalty = tf.reduce_mean(
+            gamma_probs * invalid_mask[tf.newaxis, :],  # (B, A)
+            axis=-1  # (B,)
+            )
+        return invalid_gamma_penalty
+    
+
