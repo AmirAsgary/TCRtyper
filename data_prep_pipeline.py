@@ -41,7 +41,7 @@ def parse_args():
     
     # Boolean flags
     parser.add_argument('--add_rel_path', action='store_true', default=False, help='Add relative path prefix to file paths')
-    parser.add_argument('--assign_numeric_ids', action='store_true', default=True, help='Assign numeric IDs to samples')
+    parser.add_argument('--assign_numeric_ids', action='store_true', default=False, help='Assign numeric IDs to samples')
     parser.add_argument('--no_assign_numeric_ids', dest='assign_numeric_ids', action='store_false', help='Do not assign numeric IDs to samples')
     parser.add_argument('--assign_cdr_columns', action='store_true', default=True, help='Assign CDR column names to dataframe')
     parser.add_argument('--no_assign_cdr_columns', dest='assign_cdr_columns', action='store_false', help='Do not assign CDR column names to dataframe')

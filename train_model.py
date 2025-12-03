@@ -76,7 +76,7 @@ def normalize_gamma_logits(gamma_logits, freqs):
 # =============================================================================
 PAD_TOKEN = -2.
 MASK_TOKEN = -1.
-BATCH_SIZE = 5000
+BATCH_SIZE = 3000
 EPOCH = 10
 TEST_MODE = False
 ATT_MODE = True
@@ -84,28 +84,31 @@ TEST_MODE_OUTPUT_DIR = 'output/test_mode_Nov27_3'
 GRAD_CLIP = True
 DECOUPLE_TRAINING = False
 CONTINUE_TRAINING = False
-MODEL_PATH = 'checkpoints/larger_buffer3/model_epoch_5.keras'
+MODEL_PATH = 'checkpoints/exactloss_q+gamma+recon+reg+L1REGonQ+REGONGAMMA+public+RegOnDiversingGamma+FixQ/model_epoch_10.keras'
 q_ampl = 1.0
 gamma_ampl = 1.0
-CHECKPOINT_PATH = 'checkpoints/exactloss_q+gamma+recon+reg+L1RegOngamma+NoAdjustLogit+REG_ON_Q+ADJUST_LOGITS2'
-SOFTMAX_LOSS = True
+CHECKPOINT_PATH = 'checkpoints/exactloss_q+gamma'
+SOFTMAX_LOSS = False
 SOFTMAX_WEIGHTS = 0.01
 SOFTMAX_TEMP = 3.
 LL_WEIGHTS = 1.
-REG_WEIGHT = 1.
-DROPOUT_RATE = 0.3
-RECON_WEIGHT = 1.
+REG_WEIGHT = 0.
+DROPOUT_RATE = 0.0
+RECON_WEIGHT = 0.0
 FIX_Q = False
 EXACT_LIKELIHOOD = True
 NUM_VALID_DONORS = 705.
 PARQUET_DIR = os.path.join(CHECKPOINT_PATH, 'logs')
-REG_ON_GAMMA = True
-L1_REG_LAMBDA = 0.01
-ADJUST_LOGITS = True
-L1_REG_Q = True
-REG_ON_Q = 0.001
+REG_ON_GAMMA = False
+L1_REG_LAMBDA = 0.
+ADJUST_LOGITS = False
+L1_REG_Q =0.
+REG_ON_Q = False
+LAMBDA_REG_GAMMA_DIVERSE = 0.
 # Data paths
+#train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/randompatientwise/train0.tfrecord'
 train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_train1.tfrecord'
+#val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/randompatientwise/val0.tfrecord'
 val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_valid1.tfrecord'
 patient_id_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/patients_index_process.tsv'
 ################# Write configs
@@ -185,19 +188,12 @@ if GRAD_CLIP == True:
 print("=" * 80)
 print("TCRtyper Model Training")
 print("=" * 80)
-print(f"Batch Size: {BATCH_SIZE}")
-print(f"Epochs: {EPOCH}")
-print(f"Pad Token: {PAD_TOKEN}")
-print(f"Mask Token: {MASK_TOKEN}")
-print(f"TEST_MODE: {TEST_MODE}")
-print(f"ATT_MODE: {ATT_MODE}")
-print(f"SOFTMAX_LOSS: {SOFTMAX_LOSS}")
-print(f"SOFTMAX_WEIGHTS: {SOFTMAX_WEIGHTS}")
-print(f"SOFTMAX_TEMP: {SOFTMAX_TEMP}")
-print(f"DECOUPLE_TRAINING: {DECOUPLE_TRAINING}")
-print(f"gamma_ampl: {gamma_ampl}, q_ampl: {q_ampl}")
-print(f"EXACT_LIKELIHOOD: {EXACT_LIKELIHOOD}")  # NEW: Print this setting
-print(f"NUM_VALID_DONORS: {NUM_VALID_DONORS}")  # NEW: Print this setting
+
+# Auto-print all config entries
+print("CONFIGURATION:")
+for k, v in config.items():
+    print(f"{k}: {v}")
+
 print("=" * 80)
 
 # =============================================================================
@@ -567,22 +563,22 @@ for epoch in range(EPOCH):
             elif ATT_MODE:
                 gamma_logits, q_logits, att_score, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
                 if ADJUST_LOGITS: gamma_logits = normalize_gamma_logits(gamma_logits, freqs)
-                ll_loss, bce_loss = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
+                ll_loss, bce_loss, reg_term2 = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
             else:
                 gamma_logits, q_logits, delta_logits, recon_out = model([tcr_seqs, tcr_seq_mask])
                 if ADJUST_LOGITS: gamma_logits = normalize_gamma_logits(gamma_logits, freqs)
-                ll_loss, bce_loss = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
+                ll_loss, bce_loss, reg_term2 = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
             
             # Reconstruction loss
             final_recon_loss = compute_reconstruction_loss(tcr_seqs, recon_out, PAD_TOKEN, cce_loss_fn)
             # L1 regularization on loss
             if REG_ON_GAMMA:
-                l1_reg_loss = tf.reduce_mean(tf.reduce_sum(tf.nn.sigmoid(gamma_logits), axis=-1))
+                l1_reg_loss = tf.reduce_sum(tf.reduce_sum(tf.nn.sigmoid(gamma_logits), axis=-1))
             if REG_ON_Q:
                 l1_reg_q_loss = tf.reduce_sum(tf.nn.sigmoid(q_logits))
             # Regularization losses from model layers
             reg_loss = tf.reduce_sum(model.losses) if model.losses else 0.0
-        
+            reg_loss2 = tf.reduce_sum(reg_term2)
             # Total loss
             bce_loss_r = tf.reduce_mean(bce_loss)
             ll_loss = tf.reduce_mean(ll_loss)
@@ -591,7 +587,8 @@ for epoch in range(EPOCH):
                          REG_WEIGHT * reg_loss + 
                          RECON_WEIGHT * final_recon_loss +
                          L1_REG_LAMBDA * l1_reg_loss +
-                         L1_REG_Q * l1_reg_q_loss)
+                         L1_REG_Q * l1_reg_q_loss +
+                         LAMBDA_REG_GAMMA_DIVERSE * reg_loss2)
         
         # In TEST_MODE, we only process one batch for visualization
         if TEST_MODE:
@@ -644,7 +641,8 @@ for epoch in range(EPOCH):
             f"MinQ: {tf.reduce_min(q_probs).numpy():.6f} | "
             f"ReconLoss: {final_recon_loss.numpy():.6f} | " 
             f"L1 RegGAMMA: {l1_reg_loss.numpy():.6f} | "
-            f"L1 RegQ: {l1_reg_q_loss.numpy():.6f}"
+            f"L1 RegQ: {l1_reg_q_loss.numpy():.6f} | "
+            f"GammaDiverseREG: {reg_loss2.numpy():.6f}"
         )
         
         if SOFTMAX_LOSS:
@@ -716,7 +714,7 @@ for epoch in range(EPOCH):
         val_recon_loss = compute_reconstruction_loss(tcr_seqs, recon, PAD_TOKEN, cce_loss_fn)
         
         # Likelihood loss
-        val_ll_loss, val_bce_loss = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
+        val_ll_loss, val_bce_loss, reg_term2 = loss_func.call(gamma_logits, q_logits, tcr_donor_ids, delta_logits)
         reg_loss = tf.reduce_sum(model.losses) if model.losses else 0.0
         val_ll_loss = tf.reduce_mean(val_ll_loss)
         val_bce_loss = tf.reduce_mean(val_bce_loss)

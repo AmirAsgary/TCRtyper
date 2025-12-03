@@ -994,7 +994,7 @@ class LogSpaceLikelihood(keras.losses.Loss):
             bce = tf.zeros_like(LL_batch)
         
         # regularization term
-        reg_term = self.regularization_term(gamma_logits) #(B,)
+        reg_term = self.regularization_term_alleles_notavail(gamma_logits) #(B,)
         # ===== TOTAL LOSS =====
         if not self.test_mode:
             return -LL_batch + reg_term, self.softmax_loss_weight * bce #(B,) , (B)
@@ -1109,7 +1109,7 @@ class LogSpaceLikelihood(keras.losses.Loss):
 
         return true_probs
 
-    def regularization_term(self, gamma_logits):
+    def regularization_term_alleles_notavail(self, gamma_logits):
                     # In your training loss
         invalid_mask = 1.0 - self.valid_allele_mask  # 1 for Na=0, 0 otherwise
         gamma_probs = tf.nn.sigmoid(gamma_logits)
@@ -1388,7 +1388,7 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
             # Shape: (B,)
             # = log(|N_i|) + log(A)
             
-            log_N_times_24 = tf.math.log(24.0) + tf.math.log(self.N)
+            log_N_times_24 = tf.math.log(24.0) + tf.math.log(self.num_valid_donors)
             # Scalar: log(24 * 702) ≈ 9.73
             
             log_N_times_24 = tf.broadcast_to(log_N_times_24, tf.shape(log_numerator))
@@ -1503,14 +1503,16 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         else:
             bce = tf.zeros_like(LL_batch)
         
-        reg_term = self.regularization_term(gamma_logits)  # (B,)
+        gamma_probs = tf.nn.sigmoid(gamma_logits)
+        reg_term = self.regularization_term_alleles_notavail(gamma_probs)  # (B,)
+        reg_term2 = self.regularization_term_penalize_same_gamma_for_one_allele(gamma_probs, Ni_size, gamma_donor_id, lambda_reg=0.1)
         
         # =====================================================================
         # STEP 9: Return loss
         # =====================================================================
         if not self.test_mode:
             # Return NEGATIVE log-likelihood (for minimization)
-            return -LL_batch + reg_term, self.softmax_loss_weight * bce
+            return -LL_batch + reg_term , self.softmax_loss_weight * bce, -reg_term2
         else:
             return (Ni_size, Ni, gamma_donor_id_mask, log_p_ni_Ni, log_p_ni_all,
                     log_qp_Ni, log_one_minus_qp_Ni, first_term, second_term, bce,
@@ -1575,7 +1577,10 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         # Compute log(p_ni) = log(1 - exp(log_prod))
         log_p_ni = log1mexp(log_prod)
         # Shape: (B, N_expanded)
-        
+        # Important: Now for the invalid donors, pni is 1, and log(pni) = 0. This is not interpretable!
+        # Why a donor without any HLA should have prob to have all TCRs?
+        # we should set them to zero porb, which means log prob of (log_pni) -100
+        log_p_ni = tf.where(self.valid_donor_mask[tf.newaxis, :] > 0.5, log_p_ni, tf.constant(-100.0, dtype=log_prod.dtype))
         return log_p_ni
     
     def calculate_log_pni(self, Ni, log_one_minus_gamma, gamma_donor_id_mask):
@@ -1670,7 +1675,7 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         
         SAME AS ORIGINAL - no changes needed.
         """
-        N = self.N
+        N = self.num_valid_donors
         log_Na = self.log_Na
         
         log_Nia = tf.math.log(tf.reduce_sum(Ni, axis=1) + 1e-7)
@@ -1699,17 +1704,62 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         
         return true_probs
     
-    def regularization_term(self, gamma_logits):
+    def regularization_term_alleles_notavail(self, gamma_probs):
         """
         Penalize non-zero gamma for alleles not present in cohort.
         
         SAME AS ORIGINAL - no changes needed.
         """
         invalid_mask = 1.0 - self.valid_allele_mask
-        gamma_probs = tf.nn.sigmoid(gamma_logits)
         
         invalid_gamma_penalty = tf.reduce_mean(
             gamma_probs * invalid_mask[tf.newaxis, :],
             axis=-1
         )
         return invalid_gamma_penalty
+    
+    def regularization_term_penalize_same_gamma_for_one_allele(self, gamma_probs, Ni_size, gamma_donor_id, lambda_reg=1.):
+        '''
+        Ri = −λ ∑_a(γia · max (0, 1 − e_ia)) --> enrichment penalyt 0 if enrichment is below expected enrichment, penalize
+        E_Mia = na*​∣Ni​∣/N --> expected number of cooccurences
+        mia --> when tcr i occures with allele a
+        e_ia = M_ia / E_Mia
+        inputs:
+            gamma_probs: (B, A)
+            Ni_size: (B,)
+            gamma_donor_id: (B, max_Ni), padded by PAD_TOKEN
+
+        '''
+        Na = self.Na #(A,)
+        donor_mhc = self.donor_mhc # (N_expanded, A)
+        N = self.num_valid_donors # scalar
+        mhc_val_mask = tf.expand_dims(self.valid_allele_mask, axis=0) # (1,A)
+        # calculate M_ia
+        # first multi hot encode (mhe) gamma_donor_id (B, max_Ni) --> (B, N_expanded), invalid indices out of [0,depth−1] are set to zero.
+        # make sure pad tokens are invalid (-2.) to become all zero
+        gamma_donor_id = tf.where(gamma_donor_id == self.pad_token, -2, gamma_donor_id)
+        gamma_donor_id = tf.cast(gamma_donor_id, tf.int32)
+        gamma_donor_id_expanded = tf.keras.ops.multi_hot(gamma_donor_id, num_classes=tf.cast(tf.shape(donor_mhc)[0], tf.int32)) #(B, N_expanded), pads are all zero
+        # Now map to MHC mhe
+        M_ia = tf.matmul(gamma_donor_id_expanded, tf.cast(donor_mhc, tf.float32)) * mhc_val_mask # (B, N_expanded) . (N_expanded, A) --> (B,A) * (B,A), 1> if a is present in donors of i
+        # calculate regularization:
+        # 1- E_Mia = na*​∣Ni​∣/N
+        E_Mia = (Na[tf.newaxis, :] * Ni_size[:, tf.newaxis])  / N # (1,A) * (B,1) --> (B,A) - N is never zero bcz it is our number of patients
+        # 2- M_ia / E_Mia
+        e_ia = M_ia / (E_Mia + 1e-10) # (B,A), E_Mia can be zero for some alleles, as some alleles have no occurance
+        e_ia_masked_out = e_ia * mhc_val_mask # (B,A) * (1,A) = (B,A) zeros out those allaes that are zero
+        # 3- γia · max (0, 1 − e_ia)
+        R_ia = gamma_probs * tf.math.maximum(0, 1.-e_ia_masked_out) #(B,A)
+        # 4- R_i = −λ ∑_a(R_ia)
+        R_i = -lambda_reg * tf.reduce_sum(R_ia, axis=-1) #(B,)
+        return R_i
+
+
+        
+
+
+
+
+
+
+    

@@ -54,16 +54,16 @@ def normalize_gamma_logits(gamma_logits, freqs):
 # =============================================================================
 PAD_TOKEN = -2.
 MASK_TOKEN = -1.
-BATCH_SIZE = 1000
-MODEL_PATH = 'checkpoints/exactloss_q+gamma+recon+reg+L1RegOngamma+NoAdjustLogit+REG_ON_Q+ADJUST_LOGITS2/model_epoch_3.keras'
-OUTPUT_PATH = 'output/model_diagnostics_' + datetime.now().strftime('%Y%m%d_%H%M%S') + "_exactloss_q+gamma+recon+reg+L1RegOngamma+NoAdjustLogit+REG_ON_Q+ADJUST_LOGITS2"
+BATCH_SIZE = 500
+MODEL_PATH = 'checkpoints/exactloss_q+gamma/model_epoch_10.keras'
+OUTPUT_PATH = 'output/model_diagnostics_' + datetime.now().strftime('%Y%m%d_%H%M%S') + "_exactloss_q+gamma"
 PATIENT_TO_HLA = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/processed/patient_to_hla.csv'
 SOFTMAX_LOSS = True
 SOFTMAX_WEIGHTS = 0.5
 SOFTMAX_TEMP = 3.
 ATT_MODE = True  # Must match training configuration
-NUM_BATCHES_TO_ANALYZE = 2  # Number of batches to analyze
-ADJUST_LOGITS = True
+NUM_BATCHES_TO_ANALYZE = 3  # Number of batches to analyze
+ADJUST_LOGITS = False
 CONFIG_PATH = os.path.join(os.path.dirname(MODEL_PATH), 'config.json')
 # =============================================================================
 # NEW: EXACT LIKELIHOOD FLAG - Must match training configuration!
@@ -81,8 +81,10 @@ AA_VOCAB = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L',
             'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'X']  # 21 amino acids
 
 # Data paths
+#train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/randompatientwise/train0.tfrecord'
 train_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_train1.tfrecord'
-val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_valid1.tfrecord'
+val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/randompatientwise/val0.tfrecord'
+#val_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/train_val_split/datasetwise/public_valid1.tfrecord'
 patient_id_path = 'data/processed_data/delmonte2023_mitchell2022_musvosvi2022_Nov20/patients_index_process.tsv'
 assert os.path.exists(CONFIG_PATH)
 os.makedirs(OUTPUT_PATH, exist_ok=True)
@@ -398,8 +400,8 @@ for batch_idx, data in enumerate(dataset, start=1):
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
     # Heatmap
-    sns.heatmap(gamma_probs[:100], ax=axes[0,0], cmap='viridis', vmin=0, vmax=0.5)
-    axes[0,0].set_title(f'Gamma (HLA binding) - First 100 TCRs', fontsize=12)
+    sns.heatmap(gamma_probs, ax=axes[0,0], cmap='viridis', vmin=0, vmax=0.5)
+    axes[0,0].set_title(f'Gamma (HLA binding) - TCRs', fontsize=12)
     axes[0,0].set_xlabel('Allele')
     axes[0,0].set_ylabel('TCR')
     
@@ -451,19 +453,19 @@ for batch_idx, data in enumerate(dataset, start=1):
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
     # Heatmaps
-    sns.heatmap(true_probs_np[:100], ax=axes[0,0], cmap='viridis', vmin=0, vmax=0.5)
+    sns.heatmap(true_probs_np, ax=axes[0,0], cmap='viridis', vmin=0, vmax=0.5)
     axes[0,0].set_title('True Probs (Enrichment-based)', fontsize=12)
     axes[0,0].set_xlabel('Allele')
     axes[0,0].set_ylabel('TCR')
     
-    sns.heatmap(pred_probs_np[:100], ax=axes[0,1], cmap='viridis', vmin=0, vmax=0.5)
+    sns.heatmap(pred_probs_np, ax=axes[0,1], cmap='viridis', vmin=0, vmax=0.5)
     axes[0,1].set_title('Pred Probs (Model sigmoid(delta))', fontsize=12)
     axes[0,1].set_xlabel('Allele')
     axes[0,1].set_ylabel('TCR')
     
     # Difference
     diff = true_probs_np - pred_probs_np
-    sns.heatmap(diff[:100], ax=axes[0,2], cmap='RdBu_r', center=0, vmin=-0.3, vmax=0.3)
+    sns.heatmap(diff, ax=axes[0,2], cmap='RdBu_r', center=0, vmin=-0.3, vmax=0.3)
     axes[0,2].set_title('Difference (True - Pred)', fontsize=12)
     axes[0,2].set_xlabel('Allele')
     axes[0,2].set_ylabel('TCR')
@@ -650,7 +652,7 @@ for batch_idx, data in enumerate(dataset, start=1):
         bce_per_sample = bce_np
         bce_per_allele = None
     else:
-        sns.heatmap(bce_np[:100], ax=axes[0,1], cmap='Reds', vmin=0)
+        sns.heatmap(bce_np, ax=axes[0,1], cmap='Reds', vmin=0)
         axes[0,1].set_xlabel('Allele', fontsize=12)
         axes[0,1].set_ylabel('TCR', fontsize=12)
         axes[0,1].set_title(f'BCE Loss per TCR-Allele (first 100 TCRs)\nMean={np.mean(bce_np):.4f}')
@@ -702,8 +704,8 @@ for batch_idx, data in enumerate(dataset, start=1):
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         
         # Heatmap of log_p_ni_all (first 50 TCRs, first 200 donors)
-        display_tcrs = min(50, log_p_ni_all_np.shape[0])
-        display_donors = min(200, log_p_ni_all_np.shape[1])
+        display_tcrs = log_p_ni_all_np.shape[0]
+        display_donors = log_p_ni_all_np.shape[1]
         sns.heatmap(log_p_ni_all_np[:display_tcrs, :display_donors], 
                     ax=axes[0,0], cmap='viridis', vmin=-10, vmax=0)
         axes[0,0].set_title(f'log(p_ni) for ALL donors\n(first {display_tcrs} TCRs, {display_donors} donors)', fontsize=12)
