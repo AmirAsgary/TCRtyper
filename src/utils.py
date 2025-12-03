@@ -212,6 +212,7 @@ class ReadAndPreprocess:
         assert arr.shape[0] == self.mhc_maximum_num, (
             f"Expected array size of {self.mhc_maximum_num}, "
             f"but received array of shape {arr.shape}"
+            f"Path: {path}"
         )
         # Validate array contains only binary values
         assert np.isin(arr, [0, 1]).all(), (
@@ -266,10 +267,24 @@ class ReadAndPreprocess:
         """
         
         for col in columns:
-            df[col] = [
-                ';'.join(str(self.get_idx(aa)) for aa in seq) 
-                for seq in df[str(col)].values
-            ]
+            try:
+                df[col] = [
+                    ';'.join(str(self.get_idx(aa)) for aa in seq) 
+                    for seq in df[str(col)].values
+                ]
+            except Exception as e:
+                # Only run slow diagnostic loop on error
+                for idx, seq in enumerate(df[str(col)].values):
+                    try:
+                        ';'.join(str(self.get_idx(aa)) for aa in seq)
+                    except:
+                        raise ValueError(
+                            f"Error mapping sequence in column '{col}' at row {idx}.\n"
+                            f"  Sequence: {seq}\n"
+                            f"  Sequence type: {type(seq)}\n"
+                            f"  Error: {type(e).__name__}: {e}"
+                        ) from e
+                raise  # If we can't find the specific row, re-raise original
         return df
     
     def call(self, sequence_mapping: bool = False, 
@@ -318,38 +333,50 @@ class ReadAndPreprocess:
             tcr_path = getattr(row, self.tcr_tsv_path)
             mhc_path = getattr(row, self.mhc_arr_path)
             
-            # Read TCR data
-            tcr_df = self.read_tcr_df(tcr_path, cdr3_col, cdr2_col, cdr2_5_col, cdr1_col)
-            
-            # Read MHC array
-            mhc_arr, mhc_state = self.read_mhc_arr(mhc_path)
-            if mhc_state == False:
-                patients_faulty.append(row._asdict())
-                continue
-            patients_processed.append(row._asdict())
-            mhc_arrays.append(mhc_arr)
-            patient_ids.append(patient_id)
-            # Add patient ID column and rename CDR columns to standard names
-            tcr_df[self.id_col] = patient_id
-            tcr_df = tcr_df.rename(columns={
-                cdr3_col: 'cdr3', 
-                cdr2_col: 'cdr2',
-                cdr2_5_col: 'cdr2.5',
-                cdr1_col: 'cdr1'
-            })
-            # sequence mapping
-            if sequence_mapping:
-                cols_to_map = ['cdr3']
-                if cdr1_sequence:
-                    cols_to_map.append('cdr1')
-                if cdr2_sequence:
-                    cols_to_map.append('cdr2')
-                if cdr2_5_sequence:
-                    cols_to_map.append('cdr2.5')
+            try:
+                # Read TCR data
+                tcr_df = self.read_tcr_df(tcr_path, cdr3_col, cdr2_col, cdr2_5_col, cdr1_col)
                 
-                self.map_df_to_num(tcr_df, cols_to_map)
-            
-            all_tcr_dfs.append(tcr_df)
+                # Read MHC array
+                mhc_arr, mhc_state = self.read_mhc_arr(mhc_path)
+                if mhc_state == False:
+                    patients_faulty.append({**row._asdict(), 'error': 'mhc_state False', 'error_path': mhc_path})
+                    continue
+                    
+                # Add patient ID column and rename CDR columns to standard names
+                tcr_df[self.id_col] = patient_id
+                tcr_df = tcr_df.rename(columns={
+                    cdr3_col: 'cdr3', 
+                    cdr2_col: 'cdr2',
+                    cdr2_5_col: 'cdr2.5',
+                    cdr1_col: 'cdr1'
+                })
+                # sequence mapping
+                if sequence_mapping:
+                    cols_to_map = ['cdr3']
+                    if cdr1_sequence:
+                        cols_to_map.append('cdr1')
+                    if cdr2_sequence:
+                        cols_to_map.append('cdr2')
+                    if cdr2_5_sequence:
+                        cols_to_map.append('cdr2.5')
+                    
+                    self.map_df_to_num(tcr_df, cols_to_map)
+                
+                patients_processed.append(row._asdict())
+                mhc_arrays.append(mhc_arr)
+                patient_ids.append(patient_id)
+                all_tcr_dfs.append(tcr_df)
+                
+            except Exception as e:
+                patients_faulty.append({
+                    **row._asdict(), 
+                    'error': str(e), 
+                    'error_type': type(e).__name__,
+                    'tcr_path': tcr_path,
+                    'mhc_path': mhc_path
+                })
+                continue
         
         # Concatenate all TCR dataframes and save (more efficient than appending)
         combined_tcr_df = pd.concat(all_tcr_dfs, ignore_index=True)

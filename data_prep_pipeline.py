@@ -55,7 +55,7 @@ def parse_args():
     
     # ReadandProcess options
     parser.add_argument('--read_and_process', action='store_true', help='Run ReadAndProcess pipeline')
-    parser.add_argument('--mhc_num_allele_thr', type=parse_tuple, default=(8, 25), help='MHC allele threshold (min, max). Format: "8,20"')
+    parser.add_argument('--mhc_num_allele_thr', type=parse_tuple, default=(7, 100), help='MHC allele threshold (min, max). Format: "8,20"')
     parser.add_argument('--tcr_tsv_path_col', type=str, default='relpath_tcr', help='Column name for TCR TSV file paths')
     parser.add_argument('--mhc_arr_path_col', type=str, default='relpath_mask', help='Column name for MHC array file paths')
     parser.add_argument('--cdr1_col', type=str, default='cdr1aa_gapped', help='Column name for CDR1 sequences')
@@ -63,7 +63,7 @@ def parse_args():
     parser.add_argument('--cdr2_5_col', type=str, default='cdr2.5aa_gapped', help='Column name for CDR2.5 sequences')
     parser.add_argument('--cdr3_col', type=str, default='cdr3aa', help='Column name for CDR3 sequences')
     parser.add_argument('--sample_id', type=str, default='sample_id', help='Column name for sample/patient IDs')
-    parser.add_argument('--pad_token', type=int, default=-1, help='Padding token value for sequence mapping')
+    parser.add_argument('--pad_token', type=int, default=-2, help='Padding token value for sequence mapping')
     
     # Train/val split options
     parser.add_argument('--train_val_split', action='store_true', help='Perform train/validation split')
