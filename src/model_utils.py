@@ -4,7 +4,7 @@ import tensorflow as tf
 import src
 from src.constants import PHYSICHE_PROPERTIES_IDX
 
-
+MHC_NUM = 620
 
 @tf.keras.utils.register_keras_serializable(package='custom_layers', name='PositionalEncoding')
 class PositionalEncoding(keras.layers.Layer):
@@ -903,7 +903,7 @@ class LogSpaceLikelihood(keras.losses.Loss):
         softmax_loss_weight: float = 1.0,
         softmax_temperature: float = 1.0,
         fix_q = True, #If True, Q will be fixed to the calculations in the document $q_i = |\mathcal{N}_i| A  / \big(|\mathcal{N}_i| A + 24 N\big)$
-        num_mhc=358, # total number of mhcs in the dataset. Based on the input data, some mhcs might not be available in the data, and they will be masked out.
+        num_mhc=MHC_NUM, # total number of mhcs in the dataset. Based on the input data, some mhcs might not be available in the data, and they will be masked out.
         **kwargs
     ):
         super().__init__()
@@ -1177,7 +1177,7 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
     Simplified (Eq 8): O(B * |N_i| * A) for first term + O(B * A) for second term
     Exact (Eq 4):      O(B * |N_i| * A) for first term + O(B * N * A) for second term
     
-    For B=5000, N=702, A=358: exact version adds ~1.3 billion operations per batch
+    For B=5000, N=702, A=MHC_NUM: exact version adds ~1.3 billion operations per batch
     """
     
     def __init__(
@@ -1185,11 +1185,8 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         donor_mhc: tf.Tensor,
         pad_token: int | float = -2,
         test_mode: bool = False,
-        use_softmax_loss: bool = True,
-        softmax_loss_weight: float = 1.0,
-        softmax_temperature: float = 1.0,
         fix_q: bool = True,
-        num_mhc: int = 358,
+        num_mhc: int = MHC_NUM,
         N: float = 702.,
         **kwargs
     ):
@@ -1210,15 +1207,12 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
             test_mode: If True, return intermediate tensors for debugging
             
             use_softmax_loss: If True, compute auxiliary BCE loss on delta_logits
-            
-            softmax_loss_weight: Weight for the auxiliary loss
-            
-            softmax_temperature: Temperature for softmax in auxiliary loss
+        
             
             fix_q: If True, use fixed formula for q_i instead of learning it:
                    q_i = |N_i| * A / (|N_i| * A + 24N)
                    
-            num_mhc: Total number of HLA alleles (A = 358)
+            num_mhc: Total number of HLA alleles (A = MHC_NUM)
             
             N: ACTUAL number of valid donors (702), NOT the expanded array size!
                CHANGE FROM ORIGINAL: Made this an explicit parameter instead of inferring
@@ -1232,9 +1226,6 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         
         self.pad_token = tf.cast(pad_token, tf.int32)
         self.test_mode = test_mode
-        self.use_softmax_loss = use_softmax_loss
-        self.softmax_loss_weight = softmax_loss_weight
-        self.softmax_temperature = softmax_temperature
         self.fix_q = fix_q
         
         # CHANGE: Use explicit N parameter, not inferred from array
@@ -1275,7 +1266,7 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         self.A = tf.constant(num_mhc, dtype=tf.float32)
         self.log_A = tf.math.log(self.A)
     
-    def call(self, gamma_logits, q_logits, gamma_donor_id, delta_logits):
+    def call(self, gamma_logits, q_logits, gamma_donor_id):
         """
         Compute the exact negative log-likelihood loss.
         
@@ -1285,7 +1276,7 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         
         gamma_logits: (B, A)
             - B = batch size (number of TCR sequences in this batch)
-            - A = number of HLA alleles (358)
+            - A = number of HLA alleles (MHC_NUM)
             - These are LOGITS, not probabilities!
             - γ_ia = sigmoid(gamma_logits[i, a])
             
@@ -1301,9 +1292,6 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
             - Example: TCR 0 appears in donors [5, 12, 47], TCR 1 in [3, 8]
               gamma_donor_id = [[5, 12, 47], [3, 8, -2]]
               
-        delta_logits: (B, A)
-            - Auxiliary output for BCE loss (helps training)
-            - Not used in main likelihood computation
         
         =======================================================================
         OUTPUT
@@ -1403,8 +1391,8 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
             
             log_q = log_numerator - log_denominator
             # Shape: (B,)
-            # Example: |N_i|=2, A=358, N=702
-            #   numerator = 2 * 358 = 716
+            # Example: |N_i|=2, A=MHC_NUM, N=702
+            #   numerator = 2 * MHC_NUM = 716
             #   denominator = 716 + 24*702 = 716 + 16848 = 17564
             #   q = 716/17564 ≈ 0.041
             #   log(q) ≈ -3.2
@@ -1497,11 +1485,7 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         # =====================================================================
         # STEP 8: Auxiliary losses (same as original)
         # =====================================================================
-        if self.use_softmax_loss:
-            true_probs = self.delta_loss(Ni)  # (B, A)
-            bce = self.BCE(true_probs, delta_logits)  # (B,)
-        else:
-            bce = tf.zeros_like(LL_batch)
+        bce = tf.zeros_like(LL_batch)
         
         gamma_probs = tf.nn.sigmoid(gamma_logits)
         reg_term = self.regularization_term_alleles_notavail(gamma_probs)  # (B,)
@@ -1512,11 +1496,11 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
         # =====================================================================
         if not self.test_mode:
             # Return NEGATIVE log-likelihood (for minimization)
-            return -LL_batch + reg_term , self.softmax_loss_weight * bce, -reg_term2
+            return -LL_batch + reg_term , bce, -reg_term2
         else:
             return (Ni_size, Ni, gamma_donor_id_mask, log_p_ni_Ni, log_p_ni_all,
                     log_qp_Ni, log_one_minus_qp_Ni, first_term, second_term, bce,
-                    log_gamma, log_one_minus_gamma, true_probs, tf.nn.sigmoid(delta_logits))
+                    log_gamma, log_one_minus_gamma)
     
     def calculate_log_pni_all_donors(self, log_one_minus_gamma):
         """
