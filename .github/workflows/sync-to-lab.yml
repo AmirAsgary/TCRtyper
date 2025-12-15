@@ -3,22 +3,27 @@ name: Sync to Lab Repository
 on:
   push:
     branches:
-      - main  # change to 'master' if that's your default branch
+      - main  # change to 'master' if needed
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout personal repo
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Push to lab repository
+      - name: Setup SSH
         run: |
-          git config user.name "Amir Asgary"
-          git config user.email "mranamir@gmail.com"
-          
-          git remote add lab https://x-access-token:${{ secrets.LAB_REPO_TOKEN }}@github.com/soedinglab/TCRtyper.git
-          
-          git push lab HEAD:dev-amir --force
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_ed25519
+
+      - name: Push to SoedingLab
+        run: |
+          git remote add lab git@github.com:soedinglab/TCRtyper.git
+          git push lab HEAD:amir-dev --force --verbose
