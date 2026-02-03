@@ -1,0 +1,74 @@
+name: TCRtyper
+channels:
+  - conda-forge
+  - nvidia
+  - defaults
+dependencies:
+  # Core
+  - python=3.11.13
+  
+  # --- CRITICAL: Install CUDA Toolkit inside Conda ---
+  # This provides the missing libraries (nvcc, libcudart, etc.)
+  # It does NOT conflict with your system driver.
+  - cuda-toolkit=12.4
+  - cudnn=9.1
+  
+  # Scientific & ML
+  - numpy=1.26.4
+  - scipy=1.16.1
+  - pandas=2.3.1
+  - scikit-learn=1.7.1
+  - shap=0.48.0
+  - statsmodels=0.14.5
+  - numba=0.61.2
+  - joblib=1.5.1
+  
+  # Data & Viz
+  - h5py=3.14.0
+  - cloudpickle=3.1.1
+  - matplotlib=3.10.5
+  - seaborn=0.13.2
+  
+  # Jupyter
+  - ipython=9.4.0
+  - ipykernel=6.30.0
+  - jupyter_client=8.6.3
+  - jupyter_core=5.8.1
+  
+  # Bioinformatics
+  - biopandas=0.5.1
+  - mmtf-python=1.1.3
+  
+  # Utilities
+  - tqdm=4.67.1
+  - rich=14.1.0
+  - click=8.2.1
+  
+  # PIP Packages
+  - pip
+  - pip:
+    # 1. PyTorch: Force CUDA 12.4 wheels
+    - --extra-index-url https://download.pytorch.org/whl/cu124
+    - torch
+    - torchvision
+    - torchtext
+    
+    # 2. TensorFlow: Install the bundle that checks for libraries
+    - tensorflow[and-cuda]==2.19.0
+    - keras==3.10.0
+    
+    # 3. Transformers & Utils
+    - transformers==4.48.1
+    - tokenizers==0.21.2
+    - huggingface-hub==0.34.2
+    - safetensors==0.5.3
+    - biopython==1.85
+    - biotite==1.4.0
+    - biotraj==1.2.2
+    - freesasa==2.2.1
+    - alphafoldfetch==0.0.1
+    - pyyaml==6.0.2
+    - requests==2.32.4
+    - umap-learn
+    - hdbscan
+

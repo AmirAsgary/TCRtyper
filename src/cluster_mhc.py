@@ -55,9 +55,6 @@ from tensorflow.keras import layers, Model, callbacks
 from tensorflow.keras.saving import register_keras_serializable
 
 
-# =============================================================================
-# Positional Encoding
-# =============================================================================
 
 @register_keras_serializable()
 class PositionalEncoding(layers.Layer):
@@ -94,9 +91,7 @@ class PositionalEncoding(layers.Layer):
         return config
 
 
-# =============================================================================
-# Transformer Encoder Layer
-# =============================================================================
+
 
 @register_keras_serializable()
 class TransformerEncoderLayer(layers.Layer):
@@ -151,9 +146,7 @@ class TransformerEncoderLayer(layers.Layer):
         return config
 
 
-# =============================================================================
-# Transformer Decoder Layer
-# =============================================================================
+
 
 @register_keras_serializable()
 class TransformerDecoderLayer(layers.Layer):
@@ -208,9 +201,6 @@ class TransformerDecoderLayer(layers.Layer):
         return config
 
 
-# =============================================================================
-# Latent Bottleneck Layer
-# =============================================================================
 
 @register_keras_serializable()
 class LatentBottleneck(layers.Layer):
@@ -266,9 +256,6 @@ class LatentBottleneck(layers.Layer):
         return config
 
 
-# =============================================================================
-# Latent Expansion Layer
-# =============================================================================
 
 @register_keras_serializable()
 class LatentExpansion(layers.Layer):
@@ -302,9 +289,7 @@ class LatentExpansion(layers.Layer):
         return config
 
 
-# =============================================================================
-# Transformer Autoencoder Model
-# =============================================================================
+
 
 class TransformerAutoencoder:
     """
@@ -426,9 +411,6 @@ class TransformerAutoencoder:
         self.model.summary()
 
 
-# =============================================================================
-# Convergence Monitor Callback
-# =============================================================================
 
 class ConvergenceMonitor(callbacks.Callback):
     """
@@ -497,9 +479,6 @@ class ConvergenceMonitor(callbacks.Callback):
             print(f"\nConvergence achieved. Final training loss: {self.loss_history[-1]:.6f}")
 
 
-# =============================================================================
-# Data Loading Utilities
-# =============================================================================
 
 def load_embeddings(embeddings_path, memmap=False):
     """Load embeddings from numpy file.
@@ -552,9 +531,7 @@ def validate_data(embeddings, alleles):
     print(f"Data validation passed: {len(embeddings)} samples")
 
 
-# =============================================================================
-# HDBSCAN Clustering
-# =============================================================================
+
 
 def cluster_latent_space(
     latent_embeddings,
@@ -622,9 +599,6 @@ def cluster_latent_space(
     return labels, clusterer
 
 
-# =============================================================================
-# Save Results
-# =============================================================================
 
 def save_results(output_path, latent_embeddings, cluster_labels, alleles):
     """
@@ -670,9 +644,6 @@ def save_results(output_path, latent_embeddings, cluster_labels, alleles):
     print(f"  Latent dimension: {latent_embeddings.shape[1]}")
     
 
-# =============================================================================
-# Data Generator for Memory-Efficient Training
-# =============================================================================
 
 class EmbeddingDataGenerator:
     """
@@ -756,9 +727,6 @@ def create_tf_dataset_generator(embeddings, batch_size, validation_split=0.1):
     return train_dataset, val_dataset, n_train, n_val
 
 
-# =============================================================================
-# Training Function
-# =============================================================================
 
 def train_autoencoder(
     embeddings,
@@ -1002,9 +970,7 @@ def visualize_clusters(latent_embeddings, cluster_labels, alleles, output_dir):
 
 
 
-# =============================================================================
-# Main Function
-# =============================================================================
+
 
 def main():
     parser = argparse.ArgumentParser(
