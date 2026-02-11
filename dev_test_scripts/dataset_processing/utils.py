@@ -5,7 +5,7 @@ Shared data-processing utilities.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterator, Optional, Sequence
 
@@ -13,31 +13,133 @@ import numpy as np
 
 
 @dataclass
-class PublicTcrHlaRow:
-    row: int
-    cluster_id: int
-    cdr3aa: str
-    cdr2aa_gapped: str
-    cdr1aa_gapped: str
-    cdr2_5aa_gapped: str
-    n_donors: int
-    n_identical_sequences: int
-    v_gene_id: Optional[int]
-    counts: np.ndarray
+class PublicTcrHlaClusterChunk:
+    cluster_start: int
+    cluster_end: int
+    cluster_id: np.ndarray
+    n_donors: np.ndarray
+    raw_csr_tcr_indptr: np.ndarray
+    counts_dense: Optional[np.ndarray]
+    pvals_dense: Optional[np.ndarray]
+    raw_csr_tcr_loops: np.ndarray
+    raw_csr_tcr_int_fields: np.ndarray
+    raw_csr_tcr_int_field_names: tuple[str, ...]
+    _tcr_loops_accessor: RaggedClusterAccessor = field(init=False, repr=False)
+    _n_identical_accessor: RaggedClusterAccessor = field(init=False, repr=False)
+    _v_gene_id_accessor: RaggedClusterAccessor | None = field(init=False, repr=False)
+    _tcr_counts: np.ndarray = field(init=False, repr=False)
+
+    @property
+    def n_clusters(self) -> int:
+        return int(self.cluster_end - self.cluster_start)
+
+    def __init__(
+        self,
+        *,
+        cluster_start: int,
+        cluster_end: int,
+        cluster_id: np.ndarray,
+        n_donors: np.ndarray,
+        raw_csr_tcr_indptr: np.ndarray,
+        counts_dense: Optional[np.ndarray],
+        pvals_dense: Optional[np.ndarray],
+        raw_csr_tcr_loops: np.ndarray,
+        raw_csr_tcr_int_fields: np.ndarray,
+        raw_csr_tcr_int_field_names: tuple[str, ...],
+    ) -> None:
+        self.cluster_start = int(cluster_start)
+        self.cluster_end = int(cluster_end)
+        self.cluster_id = cluster_id
+        self.n_donors = n_donors
+        self.raw_csr_tcr_indptr = raw_csr_tcr_indptr
+        self.counts_dense = counts_dense
+        self.pvals_dense = pvals_dense
+        self.raw_csr_tcr_loops = raw_csr_tcr_loops
+        self.raw_csr_tcr_int_fields = raw_csr_tcr_int_fields
+        self.raw_csr_tcr_int_field_names = raw_csr_tcr_int_field_names
+
+        self._tcr_loops_accessor = RaggedClusterAccessor(
+            self.raw_csr_tcr_loops, self.raw_csr_tcr_indptr
+        )
+        idx = _index_int_field(
+            self.raw_csr_tcr_int_field_names, "n_identical_sequences"
+        )
+        self._n_identical_accessor = RaggedClusterAccessor(
+            self.raw_csr_tcr_int_fields[:, idx], self.raw_csr_tcr_indptr
+        )
+        if "v_gene_id" in self.raw_csr_tcr_int_field_names:
+            idx = _index_int_field(self.raw_csr_tcr_int_field_names, "v_gene_id")
+            self._v_gene_id_accessor = RaggedClusterAccessor(
+                self.raw_csr_tcr_int_fields[:, idx], self.raw_csr_tcr_indptr
+            )
+        else:
+            self._v_gene_id_accessor = None
+        self._tcr_counts = np.diff(self.raw_csr_tcr_indptr).astype(np.int64, copy=False)
+
+    @property
+    def tcr_int_field_names(self) -> tuple[str, ...]:
+        return self.raw_csr_tcr_int_field_names
+
+    @property
+    def tcr_loops(self) -> "RaggedClusterAccessor":
+        return self._tcr_loops_accessor
+
+    @property
+    def n_identical_sequences(self) -> "RaggedClusterAccessor":
+        return self._n_identical_accessor
+
+    @property
+    def v_gene_id(self) -> Optional["RaggedClusterAccessor"]:
+        return self._v_gene_id_accessor
+
+    @property
+    def tcr_counts(self) -> np.ndarray:
+        return self._tcr_counts
 
 
-import h5py
-import numpy as np
-from pathlib import Path
-from typing import Optional, Iterator
-from scipy import sparse
+class RaggedClusterAccessor:
+    __slots__ = ("_data", "_indptr")
 
-# Assuming PublicTcrHlaRow is defined elsewhere
-# from your_module import PublicTcrHlaRow 
+    def __init__(self, data: np.ndarray, indptr: np.ndarray) -> None:
+        self._data = data
+        self._indptr = indptr
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(self._indptr.shape[0] - 1)
+            return [self[i] for i in range(start, stop, step)]
+        if isinstance(idx, (list, tuple, np.ndarray)):
+            return [self[i] for i in idx]
+        i = int(idx)
+        t0 = int(self._indptr[i])
+        t1 = int(self._indptr[i + 1])
+        return self._data[t0:t1]
+
+
+def _index_int_field(names: Sequence[str], name: str) -> int:
+    try:
+        return names.index(name)
+    except ValueError as exc:
+        raise ValueError(f"Missing {name} in tcr_int_field_names.") from exc
+
 
 class PublicTcrHlaCsrReader:
-    def __init__(self, path: str | Path):
+    """
+    Cluster-level reader for public_tcr_hla_counts.h5 with ragged TCR arrays.
+
+    Set include_counts/include_pvals to control which sparse arrays are loaded.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        include_counts: bool = True,
+        include_pvals: bool = False,
+    ):
         self.path = Path(path)
+        self.include_counts = bool(include_counts)
+        self.include_pvals = bool(include_pvals)
         self._h5 = None
 
     def __enter__(self) -> "PublicTcrHlaCsrReader":
@@ -50,9 +152,9 @@ class PublicTcrHlaCsrReader:
     def open(self) -> None:
         if self._h5 is not None:
             return
-        # Increase cache size for faster sequential reads (4MB cache)
-        rdcc_nbytes = 4 * 1024 * 1024 
-        self._h5 = h5py.File(self.path, "r", rdcc_nbytes=rdcc_nbytes)
+        import h5py
+
+        self._h5 = h5py.File(self.path, "r")
 
     def close(self) -> None:
         if self._h5 is not None:
@@ -60,170 +162,173 @@ class PublicTcrHlaCsrReader:
             self._h5 = None
 
     @property
-    def num_rows(self) -> int:
+    def num_clusters(self) -> int:
         self.open()
-        return int(self._h5["cluster_id"].shape[0])
+        return int(self._h5["clusters"]["cluster_id"].shape[0])
+
+    @property
+    def num_rows(self) -> int:
+        return self.num_clusters
 
     @property
     def num_alleles(self) -> int:
         self.open()
-        return int(self._h5.attrs["num_alleles"])
+        num = self._h5.attrs.get("num_alleles")
+        if num is None:
+            raise KeyError("HDF5 missing 'num_alleles' attribute.")
+        return int(num)
 
-    def get_counts_only(self, start: int = 0, stop: Optional[int] = None) -> np.ndarray:
-        """
-        FASTEST METHOD: Extracts ONLY the dense counts matrix as a single numpy array.
-        Skips all other metadata processing.
-        """
+    @property
+    def num_tcrs(self) -> int:
         self.open()
-        counts_grp = self._h5["y_counts"]
-        indptr = counts_grp["indptr"]
-        indices = counts_grp["indices"]
-        data = counts_grp["data"]
-        
-        n_rows = self.num_rows
-        if stop is None or stop > n_rows:
-            stop = n_rows
-        
-        # 1. Read sparse structure for the entire range at once
-        # Note: indptr has n_rows + 1 elements
-        subset_indptr = indptr[start : stop + 1]
-        
-        # Calculate the range of data indices we need
-        data_start = subset_indptr[0]
-        data_end = subset_indptr[-1]
-        
-        subset_indices = indices[data_start:data_end]
-        subset_data = data[data_start:data_end]
-        
-        # 2. Adjust indptr to start at 0 for the new matrix
-        subset_indptr = subset_indptr - data_start
-        
-        # 3. Create CSR matrix and convert to dense in one highly optimized step
-        n_cols = self.num_alleles
-        matrix = sparse.csr_matrix(
-            (subset_data, subset_indices, subset_indptr),
-            shape=(stop - start, n_cols)
-        )
-        
-        return matrix.toarray()
+        return int(self._h5["tcrs"]["n_identical_sequences"].shape[0])
 
-    def iter_rows(
+    def iter_cluster_chunks(
         self,
         *,
+        chunk_rows: int = 100_000,
+        include_v_genes: bool = True,
         start: int = 0,
         stop: Optional[int] = None,
-        batch_size: int = 4096  # Process 4k rows at a time
-    ) -> Iterator["PublicTcrHlaRow"]:
+    ) -> Iterator[PublicTcrHlaClusterChunk]:
         self.open()
         h5 = self._h5
-        
-        # Cache dataset handles
-        loops = h5["loops"]
-        ds_cdr3 = loops["cdr3aa"].asstr()
-        ds_cdr2 = loops["cdr2aa_gapped"].asstr()
-        ds_cdr1 = loops["cdr1aa_gapped"].asstr()
-        ds_cdr25 = loops["cdr2_5aa_gapped"].asstr()
-        
-        ds_cluster = h5["cluster_id"]
-        ds_donors = h5["n_donors"]
-        ds_identical = h5["n_identical_sequences"]
-        ds_vgenes = h5.get("v_gene_ids")
-        
-        counts_grp = h5["y_counts"]
-        ds_indptr = counts_grp["indptr"]
-        ds_indices = counts_grp["indices"]
-        ds_data = counts_grp["data"]
+        clusters_grp = h5["clusters"]
+        cluster_id = clusters_grp["cluster_id"]
+        n_donors = clusters_grp["n_donors"]
+        tcr_indptr = clusters_grp["tcr_indptr"]
+        counts_grp = clusters_grp.get("counts") if self.include_counts else None
+        pvals_grp = clusters_grp.get("pvals") if self.include_pvals else None
+        if self.include_counts and counts_grp is None:
+            raise KeyError("HDF5 missing clusters/counts (include_counts=True).")
+        if self.include_pvals and pvals_grp is None:
+            raise KeyError("HDF5 missing clusters/pvals (include_pvals=True).")
+        counts_indptr = counts_grp["indptr"] if counts_grp is not None else None
+        counts_indices = counts_grp["indices"] if counts_grp is not None else None
+        counts_data = counts_grp["data"] if counts_grp is not None else None
+        pvals_indptr = pvals_grp["indptr"] if pvals_grp is not None else None
+        pvals_indices = pvals_grp["indices"] if pvals_grp is not None else None
+        pvals_data = pvals_grp["data"] if pvals_grp is not None else None
 
-        n_rows = int(ds_cluster.shape[0])
-        n_cols = self.num_alleles
-        if stop is None or stop > n_rows:
-            stop = n_rows
+        tcrs_grp = h5["tcrs"]
+        loops_grp = tcrs_grp["loops"]
+        loops_cdr3 = loops_grp["cdr3aa"].asstr()
+        loops_cdr2 = loops_grp["cdr2aa_gapped"].asstr()
+        loops_cdr1 = loops_grp["cdr1aa_gapped"].asstr()
+        loops_cdr25 = loops_grp["cdr2_5aa_gapped"].asstr()
+        n_identical = tcrs_grp["n_identical_sequences"]
+        v_gene_ids = tcrs_grp.get("v_gene_id") if include_v_genes else None
 
-        # --- BATCHED LOOP ---
-        for b_start in range(start, stop, batch_size):
-            b_stop = min(stop, b_start + batch_size)
-            batch_len = b_stop - b_start
-            
-            # 1. Bulk Read Metadata (Vectorized read)
-            # Reading a slice is 100x faster than reading 1 item 100 times
-            b_cluster = ds_cluster[b_start:b_stop]
-            b_donors = ds_donors[b_start:b_stop]
-            b_identical = ds_identical[b_start:b_stop]
-            b_vgenes = ds_vgenes[b_start:b_stop] if ds_vgenes else None
-            
-            b_cdr3 = ds_cdr3[b_start:b_stop]
-            b_cdr2 = ds_cdr2[b_start:b_stop]
-            b_cdr1 = ds_cdr1[b_start:b_stop]
-            b_cdr25 = ds_cdr25[b_start:b_stop]
+        n_clusters = int(cluster_id.shape[0])
+        if stop is None or stop > n_clusters:
+            stop = n_clusters
+        if start < 0 or start > stop:
+            raise ValueError(f"Invalid start/stop for chunking: {start}..{stop}")
 
-            # 2. Bulk Read Sparse Data
-            b_indptr = ds_indptr[b_start : b_stop + 1]
-            data_start = b_indptr[0]
-            data_end = b_indptr[-1]
-            
-            b_indices = ds_indices[data_start:data_end]
-            b_data = ds_data[data_start:data_end]
-            
-            # 3. Fast Densification (Batch Level)
-            # Adjust indptr to be relative to this batch
-            b_indptr_rel = b_indptr - data_start
-            
-            # Use Scipy to construct the whole batch matrix at once
-            # This is significantly faster than looping manually
-            batch_csr = sparse.csr_matrix(
-                (b_data, b_indices, b_indptr_rel), 
-                shape=(batch_len, n_cols)
-            )
-            # Convert whole batch to dense numpy array
-            batch_dense = batch_csr.toarray()
+        step = max(1, int(chunk_rows))
+        for cluster_start in range(start, stop, step):
+            cluster_end = min(cluster_start + step, stop)
+            if cluster_end <= cluster_start:
+                continue
 
-            # 4. In-Memory Iteration (Fast Python loop)
-            # Now we just iterate over RAM, which is instant
-            for i in range(batch_len):
-                row_obj = PublicTcrHlaRow(
-                    row=b_start + i,
-                    cluster_id=int(b_cluster[i]),
-                    cdr3aa=b_cdr3[i],
-                    cdr2aa_gapped=b_cdr2[i],
-                    cdr1aa_gapped=b_cdr1[i],
-                    cdr2_5aa_gapped=b_cdr25[i],
-                    n_donors=int(b_donors[i]),
-                    n_identical_sequences=int(b_identical[i]),
-                    v_gene_id=int(b_vgenes[i]) if b_vgenes is not None else None,
-                    counts=batch_dense[i], # Pre-computed dense row
+            cluster_chunk = np.asarray(cluster_id[cluster_start:cluster_end])
+            donors_chunk = np.asarray(n_donors[cluster_start:cluster_end])
+
+            tcr_indptr_chunk = np.asarray(tcr_indptr[cluster_start : cluster_end + 1])
+            tcr_start = int(tcr_indptr_chunk[0])
+            tcr_end = int(tcr_indptr_chunk[-1])
+            tcr_indptr_chunk = tcr_indptr_chunk - tcr_start
+
+            if counts_indptr is not None:
+                counts_indptr_chunk = np.asarray(
+                    counts_indptr[cluster_start : cluster_end + 1]
                 )
-                yield row_obj
-    def read_sparse_indices(self):
-            """
-            Extracts nonzero indices directly from HDF5 CSR structure.
-            Skips dense conversion entirely for maximum speed.
-            """
-            self.open()
-            counts_grp = self._h5["y_counts"]
-            
-            # 1. Bulk read the structure arrays (Very fast, just integers)
-            # indptr: points to the start/end of each row
-            # indices: contains the column index of every nonzero element
-            indptr = counts_grp["indptr"][:]
-            indices = counts_grp["indices"][:]
-            
-            # 2. Vectorized calculation of row lengths
-            # (The number of nonzero elements is just the difference in pointers)
-            row_lengths = indptr[1:] - indptr[:-1]
-            
-            # Get max_all instantly without a loop
-            max_all = int(row_lengths.max()) if row_lengths.size > 0 else 0
-            
-            # 3. Slice the indices array into your list of lists
-            # We use a list comprehension which is faster than a robust for-loop
-            n_rows = len(row_lengths)
-            counts_set = [indices[indptr[i] : indptr[i+1]] for i in range(n_rows)]
-            
-            return counts_set, max_all
+                counts_start = int(counts_indptr_chunk[0])
+                counts_end = int(counts_indptr_chunk[-1])
+                counts_indptr_chunk = counts_indptr_chunk - counts_start
+            else:
+                counts_indptr_chunk = None
+                counts_start = counts_end = 0
+
+            if pvals_indptr is not None:
+                pvals_indptr_chunk = np.asarray(
+                    pvals_indptr[cluster_start : cluster_end + 1]
+                )
+                pvals_start = int(pvals_indptr_chunk[0])
+                pvals_end = int(pvals_indptr_chunk[-1])
+                pvals_indptr_chunk = pvals_indptr_chunk - pvals_start
+            else:
+                pvals_indptr_chunk = None
+                pvals_start = pvals_end = 0
+
+            if tcr_end > tcr_start:
+                cdr3_vals = np.asarray(loops_cdr3[tcr_start:tcr_end])
+                cdr2_vals = np.asarray(loops_cdr2[tcr_start:tcr_end])
+                cdr1_vals = np.asarray(loops_cdr1[tcr_start:tcr_end])
+                cdr25_vals = np.asarray(loops_cdr25[tcr_start:tcr_end])
+                tcr_loops = np.column_stack([cdr3_vals, cdr2_vals, cdr1_vals, cdr25_vals])
+                ident_vals = np.asarray(n_identical[tcr_start:tcr_end])
+                int_fields = [ident_vals.astype(np.int64, copy=False)]
+                int_field_names = ["n_identical_sequences"]
+                if v_gene_ids is not None:
+                    v_vals = np.asarray(v_gene_ids[tcr_start:tcr_end])
+                    int_fields.append(v_vals.astype(np.int64, copy=False))
+                    int_field_names.append("v_gene_id")
+                tcr_int_fields = np.column_stack(int_fields)
+            else:
+                tcr_loops = np.empty((0, 4), dtype=object)
+                tcr_int_fields = np.empty((0, 1), dtype=np.int64)
+                int_field_names = ["n_identical_sequences"]
+                if v_gene_ids is not None:
+                    tcr_int_fields = np.empty((0, 2), dtype=np.int64)
+                    int_field_names.append("v_gene_id")
+
+            n_clusters = int(cluster_end - cluster_start)
+            counts_dense = None
+            pvals_dense = None
+            if counts_indptr_chunk is not None and counts_indices is not None:
+                indices_chunk = np.asarray(counts_indices[counts_start:counts_end])
+                data_chunk = np.asarray(counts_data[counts_start:counts_end])
+                counts_dense = np.zeros(
+                    (n_clusters, self.num_alleles), dtype=data_chunk.dtype
+                )
+                for i in range(n_clusters):
+                    lo = int(counts_indptr_chunk[i])
+                    hi = int(counts_indptr_chunk[i + 1])
+                    if hi > lo:
+                        idx = indices_chunk[lo:hi].astype(np.int64, copy=False)
+                        counts_dense[i, idx] = data_chunk[lo:hi]
+
+            if pvals_indptr_chunk is not None and pvals_indices is not None:
+                pvals_indices_chunk = np.asarray(pvals_indices[pvals_start:pvals_end])
+                pvals_data_chunk = np.asarray(pvals_data[pvals_start:pvals_end])
+                pvals_dense = np.zeros(
+                    (n_clusters, self.num_alleles), dtype=pvals_data_chunk.dtype
+                )
+                for i in range(n_clusters):
+                    lo = int(pvals_indptr_chunk[i])
+                    hi = int(pvals_indptr_chunk[i + 1])
+                    if hi > lo:
+                        idx = pvals_indices_chunk[lo:hi].astype(np.int64, copy=False)
+                        pvals_dense[i, idx] = pvals_data_chunk[lo:hi]
+
+            yield PublicTcrHlaClusterChunk(
+                cluster_start=cluster_start,
+                cluster_end=cluster_end,
+                cluster_id=cluster_chunk,
+                n_donors=donors_chunk,
+                raw_csr_tcr_indptr=tcr_indptr_chunk,
+                counts_dense=counts_dense,
+                pvals_dense=pvals_dense,
+                raw_csr_tcr_loops=tcr_loops,
+                raw_csr_tcr_int_fields=tcr_int_fields,
+                raw_csr_tcr_int_field_names=tuple(int_field_names),
+            )
+
 
 class PublicTcrHlaCsrWriter:
     """
-    CSR-backed HDF5 writer for public_tcr_hla_counts.h5 using dense inputs.
+    Cluster-level HDF5 writer for public_tcr_hla_counts.h5 with ragged TCR arrays.
     """
 
     def __init__(
@@ -252,17 +357,19 @@ class PublicTcrHlaCsrWriter:
         self.comp = compression or {}
 
         self._h5 = None
-        self._rows_written = 0
-        self._nnz_total = 0
+        self._clusters_written = 0
+        self._tcrs_written = 0
+        self._counts_nnz_total = 0
 
-        self._buffer_loops: list[tuple[str, str, str, str]] = []
-        self._buffer_n_donors: list[int] = []
         self._buffer_cluster_ids: list[int] = []
-        self._buffer_n_identical: list[int] = []
-        self._buffer_v_gene_ids: list[int] = []
-        self._buffer_indices: list[np.ndarray] = []
-        self._buffer_data: list[np.ndarray] = []
-        self._buffer_nnz: list[int] = []
+        self._buffer_n_donors: list[int] = []
+        self._buffer_tcr_counts: list[int] = []
+        self._buffer_tcr_loops: list[tuple[str, str, str, str]] = []
+        self._buffer_tcr_n_identical: list[int] = []
+        self._buffer_tcr_v_gene_ids: list[int] = []
+        self._buffer_counts_indices: list[np.ndarray] = []
+        self._buffer_counts_data: list[np.ndarray] = []
+        self._buffer_counts_nnz: list[int] = []
 
     def __enter__(self) -> "PublicTcrHlaCsrWriter":
         self.open()
@@ -273,7 +380,15 @@ class PublicTcrHlaCsrWriter:
 
     @property
     def rows_written(self) -> int:
-        return self._rows_written
+        return self._clusters_written
+
+    @property
+    def clusters_written(self) -> int:
+        return self._clusters_written
+
+    @property
+    def tcrs_written(self) -> int:
+        return self._tcrs_written
 
     def open(self) -> None:
         if self._h5 is not None:
@@ -290,102 +405,38 @@ class PublicTcrHlaCsrWriter:
         for k, v in self.attrs.items():
             self._h5.attrs[k] = v
 
-        loops_grp = self._h5.create_group("loops")
-        str_dtype = h5py.string_dtype(encoding="ascii")
-        loops_grp.create_dataset(
-            "cdr3aa",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=str_dtype,
-            chunks=(self.chunk_rows,),
-            **self.comp,
-        )
-        loops_grp.create_dataset(
-            "cdr2aa_gapped",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=str_dtype,
-            chunks=(self.chunk_rows,),
-            **self.comp,
-        )
-        loops_grp.create_dataset(
-            "cdr1aa_gapped",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=str_dtype,
-            chunks=(self.chunk_rows,),
-            **self.comp,
-        )
-        loops_grp.create_dataset(
-            "cdr2_5aa_gapped",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=str_dtype,
-            chunks=(self.chunk_rows,),
-            **self.comp,
-        )
+        clusters_grp = self._h5.create_group("clusters")
+        clusters_grp.create_dataset(
+            "cluster_id", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=(self.chunk_rows,), **self.comp,)
+        clusters_grp.create_dataset( "n_donors", shape=(0,), maxshape=(None,), dtype=self.counts_dtype, chunks=(self.chunk_rows,), **self.comp,)
+        clusters_grp.create_dataset( "tcr_indptr", shape=(1,), maxshape=(None,), dtype=np.int64, chunks=(self.chunk_rows + 1,), **self.comp,)
+        clusters_grp["tcr_indptr"][0] = 0
 
-        self._h5.create_dataset(
-            "n_donors",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=self.counts_dtype,
-            chunks=(self.chunk_rows,),
-            **self.comp,
-        )
-        self._h5.create_dataset(
-            "cluster_id",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=np.int64,
-            chunks=(self.chunk_rows,),
-            **self.comp,
-        )
-        self._h5.create_dataset(
-            "n_identical_sequences",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=self.counts_dtype,
-            chunks=(self.chunk_rows,),
-            **self.comp,
-        )
-
-        if self.include_v_genes:
-            self._h5.create_dataset(
-                "v_gene_ids",
-                shape=(0,),
-                maxshape=(None,),
-                dtype=np.int32,
-                chunks=(self.chunk_rows,),
-                **self.comp,
-            )
-
-        counts_grp = self._h5.create_group("y_counts")
+        counts_grp = clusters_grp.create_group("counts")
         counts_grp.create_dataset(
-            "indptr",
-            shape=(1,),
-            maxshape=(None,),
-            dtype=np.int64,
-            chunks=(self.chunk_rows + 1,),
-            **self.comp,
-        )
+            "indptr", shape=(1,), maxshape=(None,), dtype=np.int64, chunks=(self.chunk_rows + 1,), **self.comp,)
         counts_grp["indptr"][0] = 0
         counts_grp.create_dataset(
-            "indices",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=self.indices_dtype,
-            chunks=(self.chunk_nnz,),
-            **self.comp,
-        )
+            "indices", shape=(0,), maxshape=(None,), dtype=self.indices_dtype, chunks=(self.chunk_nnz,), **self.comp,)
         counts_grp.create_dataset(
-            "data",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=self.counts_dtype,
-            chunks=(self.chunk_nnz,),
-            **self.comp,
-        )
+            "data", shape=(0,), maxshape=(None,), dtype=self.counts_dtype, chunks=(self.chunk_nnz,), **self.comp,)
+
+        tcrs_grp = self._h5.create_group("tcrs")
+        loops_grp = tcrs_grp.create_group("loops")
+        str_dtype = h5py.string_dtype(encoding="ascii")
+        loops_grp.create_dataset(
+            "cdr3aa", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(self.chunk_rows,), **self.comp,)
+        loops_grp.create_dataset(
+            "cdr2aa_gapped", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(self.chunk_rows,), **self.comp,)
+        loops_grp.create_dataset(
+            "cdr1aa_gapped", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(self.chunk_rows,), **self.comp,)
+        loops_grp.create_dataset(
+            "cdr2_5aa_gapped", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(self.chunk_rows,), **self.comp,)
+        tcrs_grp.create_dataset(
+            "n_identical_sequences", shape=(0,), maxshape=(None,), dtype=self.counts_dtype, chunks=(self.chunk_rows,), **self.comp,)
+        if self.include_v_genes:
+            tcrs_grp.create_dataset(
+                "v_gene_id", shape=(0,), maxshape=(None,), dtype=np.int32, chunks=(self.chunk_rows,), **self.comp,)
 
     def close(self) -> None:
         if self._h5 is None:
@@ -402,6 +453,73 @@ class PublicTcrHlaCsrWriter:
             raise ValueError(f"Non-ASCII string in loops dataset: {s!r}") from exc
         return s
 
+    def add_cluster(
+        self,
+        *,
+        cluster_id: int,
+        n_donors: int,
+        counts: np.ndarray,
+        tcr_loops: Sequence[Sequence[str]],
+        tcr_n_identical: Sequence[int],
+        tcr_v_gene_ids: Optional[Sequence[Optional[int]]] = None,
+    ) -> None:
+        loops_arr = np.asarray(tcr_loops, dtype=object)
+        if loops_arr.ndim != 2 or loops_arr.shape[1] != 4:
+            raise ValueError("tcr_loops must be an array of shape (n_tcr, 4)")
+        n_tcr = int(loops_arr.shape[0])
+        if n_tcr < 1:
+            return
+
+        n_identical = np.asarray(tcr_n_identical, dtype=np.int64)
+        if n_identical.shape[0] != n_tcr:
+            raise ValueError("tcr_n_identical length must match tcr_loops")
+
+        if self.include_v_genes:
+            if tcr_v_gene_ids is None:
+                v_gene_vals = np.full(n_tcr, -1, dtype=np.int64)
+            else:
+                v_gene_vals = np.asarray(tcr_v_gene_ids)
+                if v_gene_vals.shape[0] != n_tcr:
+                    raise ValueError("tcr_v_gene_ids length must match tcr_loops")
+                if v_gene_vals.dtype == object:
+                    v_gene_vals = np.asarray(
+                        [(-1 if v is None else int(v)) for v in v_gene_vals],
+                        dtype=np.int64,
+                    )
+                else:
+                    v_gene_vals = v_gene_vals.astype(np.int64, copy=False)
+        else:
+            v_gene_vals = None
+
+        counts = np.asarray(counts, dtype=self.counts_dtype)
+        nz = np.flatnonzero(counts)
+        if nz.size == 0:
+            return
+        indices = nz.astype(self.indices_dtype, copy=False)
+        data = counts[nz]
+
+        self._buffer_cluster_ids.append(int(cluster_id))
+        self._buffer_n_donors.append(int(n_donors))
+        self._buffer_tcr_counts.append(n_tcr)
+
+        for loops in loops_arr:
+            if len(loops) != 4:
+                raise ValueError("tcr_loops must be an array of shape (n_tcr, 4)")
+            self._buffer_tcr_loops.append(
+                tuple(self._validate_ascii(x) for x in loops)
+            )
+
+        self._buffer_tcr_n_identical.extend(n_identical.astype(int).tolist())
+        if self.include_v_genes and v_gene_vals is not None:
+            self._buffer_tcr_v_gene_ids.extend(v_gene_vals.astype(int).tolist())
+
+        self._buffer_counts_indices.append(np.asarray(indices, dtype=self.indices_dtype))
+        self._buffer_counts_data.append(np.asarray(data, dtype=self.counts_dtype))
+        self._buffer_counts_nnz.append(int(len(indices)))
+
+        if len(self._buffer_cluster_ids) >= self.flush_rows:
+            self.flush()
+
     def add_row(
         self,
         *,
@@ -412,123 +530,120 @@ class PublicTcrHlaCsrWriter:
         counts: np.ndarray,
         v_gene_id: Optional[int] = None,
     ) -> None:
-        counts = np.asarray(counts, dtype=self.counts_dtype)
-        nz = np.flatnonzero(counts)
-        if nz.size == 0:
-            return
-        self._add_sparse_row(
-            loops=loops,
-            n_donors=n_donors,
+        tcr_v_gene_ids = [v_gene_id] if self.include_v_genes else None
+        self.add_cluster(
             cluster_id=cluster_id,
-            n_identical=n_identical,
-            indices=nz.astype(self.indices_dtype, copy=False),
-            data=counts[nz],
-            v_gene_id=v_gene_id,
+            n_donors=n_donors,
+            counts=counts,
+            tcr_loops=[loops],
+            tcr_n_identical=[n_identical],
+            tcr_v_gene_ids=tcr_v_gene_ids,
         )
 
-    def _add_sparse_row(
-        self,
-        *,
-        loops: Sequence[str],
-        n_donors: int,
-        cluster_id: int,
-        n_identical: int,
-        indices: np.ndarray,
-        data: np.ndarray,
-        v_gene_id: Optional[int] = None,
-    ) -> None:
-        if len(loops) != 4:
-            raise ValueError("loops must be a 4-tuple of strings")
-        self._buffer_loops.append(tuple(self._validate_ascii(x) for x in loops))
-        self._buffer_n_donors.append(int(n_donors))
-        self._buffer_cluster_ids.append(int(cluster_id))
-        self._buffer_n_identical.append(int(n_identical))
-        if self.include_v_genes:
-            self._buffer_v_gene_ids.append(
-                int(v_gene_id) if v_gene_id is not None else -1
-            )
-        self._buffer_indices.append(np.asarray(indices, dtype=self.indices_dtype))
-        self._buffer_data.append(np.asarray(data, dtype=self.counts_dtype))
-        self._buffer_nnz.append(int(len(indices)))
-
-        if len(self._buffer_loops) >= self.flush_rows:
-            self.flush()
-
-    def add_rows(self, rows: Sequence[dict]) -> None:
-        for row in rows:
-            self.add_row(**row)
+    def add_clusters(self, clusters: Sequence[dict]) -> None:
+        for cluster in clusters:
+            self.add_cluster(**cluster)
 
     def flush(self) -> None:
         if self._h5 is None:
             self.open()
-        if not self._buffer_loops:
+        if not self._buffer_cluster_ids:
             return
 
         h5 = self._h5
-        n_new = len(self._buffer_loops)
-        loops_grp = h5["loops"]
+        n_new_clusters = len(self._buffer_cluster_ids)
+        n_new_tcrs = int(sum(self._buffer_tcr_counts))
 
-        cdr3_vals = [v[0] for v in self._buffer_loops]
-        cdr2_vals = [v[1] for v in self._buffer_loops]
-        cdr1_vals = [v[2] for v in self._buffer_loops]
-        cdr25_vals = [v[3] for v in self._buffer_loops]
+        clusters_grp = h5["clusters"]
+        clusters_grp["cluster_id"].resize((self._clusters_written + n_new_clusters,))
+        clusters_grp["cluster_id"][
+            self._clusters_written:self._clusters_written + n_new_clusters
+        ] = np.asarray(self._buffer_cluster_ids, dtype=np.int64)
 
-        loops_grp["cdr3aa"].resize((self._rows_written + n_new,))
-        loops_grp["cdr2aa_gapped"].resize((self._rows_written + n_new,))
-        loops_grp["cdr1aa_gapped"].resize((self._rows_written + n_new,))
-        loops_grp["cdr2_5aa_gapped"].resize((self._rows_written + n_new,))
-        loops_grp["cdr3aa"][self._rows_written:self._rows_written + n_new] = cdr3_vals
-        loops_grp["cdr2aa_gapped"][self._rows_written:self._rows_written + n_new] = cdr2_vals
-        loops_grp["cdr1aa_gapped"][self._rows_written:self._rows_written + n_new] = cdr1_vals
-        loops_grp["cdr2_5aa_gapped"][self._rows_written:self._rows_written + n_new] = cdr25_vals
+        clusters_grp["n_donors"].resize((self._clusters_written + n_new_clusters,))
+        clusters_grp["n_donors"][
+            self._clusters_written:self._clusters_written + n_new_clusters
+        ] = np.asarray(self._buffer_n_donors, dtype=self.counts_dtype)
 
-        h5["n_donors"].resize((self._rows_written + n_new,))
-        h5["n_donors"][self._rows_written:self._rows_written + n_new] = np.asarray(
-            self._buffer_n_donors, dtype=self.counts_dtype
+        tcr_indptr_vals = self._tcrs_written + np.cumsum(
+            np.asarray(self._buffer_tcr_counts, dtype=np.int64)
         )
-        h5["cluster_id"].resize((self._rows_written + n_new,))
-        h5["cluster_id"][self._rows_written:self._rows_written + n_new] = np.asarray(
-            self._buffer_cluster_ids, dtype=np.int64
+        clusters_grp["tcr_indptr"].resize(
+            (self._clusters_written + n_new_clusters + 1,)
         )
-        h5["n_identical_sequences"].resize((self._rows_written + n_new,))
-        h5["n_identical_sequences"][self._rows_written:self._rows_written + n_new] = np.asarray(
-            self._buffer_n_identical, dtype=self.counts_dtype
+        clusters_grp["tcr_indptr"][
+            self._clusters_written + 1:self._clusters_written + n_new_clusters + 1
+        ] = tcr_indptr_vals
+
+        loops_grp = h5["tcrs"]["loops"]
+        cdr3_vals = [v[0] for v in self._buffer_tcr_loops]
+        cdr2_vals = [v[1] for v in self._buffer_tcr_loops]
+        cdr1_vals = [v[2] for v in self._buffer_tcr_loops]
+        cdr25_vals = [v[3] for v in self._buffer_tcr_loops]
+
+        loops_grp["cdr3aa"].resize((self._tcrs_written + n_new_tcrs,))
+        loops_grp["cdr2aa_gapped"].resize((self._tcrs_written + n_new_tcrs,))
+        loops_grp["cdr1aa_gapped"].resize((self._tcrs_written + n_new_tcrs,))
+        loops_grp["cdr2_5aa_gapped"].resize((self._tcrs_written + n_new_tcrs,))
+        loops_grp["cdr3aa"][
+            self._tcrs_written:self._tcrs_written + n_new_tcrs
+        ] = cdr3_vals
+        loops_grp["cdr2aa_gapped"][
+            self._tcrs_written:self._tcrs_written + n_new_tcrs
+        ] = cdr2_vals
+        loops_grp["cdr1aa_gapped"][
+            self._tcrs_written:self._tcrs_written + n_new_tcrs
+        ] = cdr1_vals
+        loops_grp["cdr2_5aa_gapped"][
+            self._tcrs_written:self._tcrs_written + n_new_tcrs
+        ] = cdr25_vals
+
+        tcrs_grp = h5["tcrs"]
+        tcrs_grp["n_identical_sequences"].resize(
+            (self._tcrs_written + n_new_tcrs,)
         )
+        tcrs_grp["n_identical_sequences"][
+            self._tcrs_written:self._tcrs_written + n_new_tcrs
+        ] = np.asarray(self._buffer_tcr_n_identical, dtype=self.counts_dtype)
 
         if self.include_v_genes:
-            h5["v_gene_ids"].resize((self._rows_written + n_new,))
-            h5["v_gene_ids"][self._rows_written:self._rows_written + n_new] = np.asarray(
-                self._buffer_v_gene_ids, dtype=np.int32
-            )
+            tcrs_grp["v_gene_id"].resize((self._tcrs_written + n_new_tcrs,))
+            tcrs_grp["v_gene_id"][
+                self._tcrs_written:self._tcrs_written + n_new_tcrs
+            ] = np.asarray(self._buffer_tcr_v_gene_ids, dtype=np.int32)
 
-        total_nnz_new = sum(self._buffer_nnz)
-        indptr_vals = []
-        cursor = self._nnz_total
-        for nnz in self._buffer_nnz:
-            cursor += nnz
-            indptr_vals.append(cursor)
-
-        counts_grp = h5["y_counts"]
-        counts_grp["indptr"].resize((self._rows_written + n_new + 1,))
-        counts_grp["indptr"][self._rows_written + 1:self._rows_written + n_new + 1] = np.asarray(
-            indptr_vals, dtype=np.int64
+        counts_grp = clusters_grp["counts"]
+        total_nnz_new = int(sum(self._buffer_counts_nnz))
+        counts_indptr_vals = self._counts_nnz_total + np.cumsum(
+            np.asarray(self._buffer_counts_nnz, dtype=np.int64)
         )
+        counts_grp["indptr"].resize((self._clusters_written + n_new_clusters + 1,))
+        counts_grp["indptr"][
+            self._clusters_written + 1:self._clusters_written + n_new_clusters + 1
+        ] = counts_indptr_vals
 
         if total_nnz_new:
-            indices_concat = np.concatenate(self._buffer_indices)
-            data_concat = np.concatenate(self._buffer_data)
-            counts_grp["indices"].resize((self._nnz_total + total_nnz_new,))
-            counts_grp["data"].resize((self._nnz_total + total_nnz_new,))
-            counts_grp["indices"][self._nnz_total:self._nnz_total + total_nnz_new] = indices_concat
-            counts_grp["data"][self._nnz_total:self._nnz_total + total_nnz_new] = data_concat
-            self._nnz_total += total_nnz_new
+            indices_concat = np.concatenate(self._buffer_counts_indices)
+            data_concat = np.concatenate(self._buffer_counts_data)
+            counts_grp["indices"].resize((self._counts_nnz_total + total_nnz_new,))
+            counts_grp["data"].resize((self._counts_nnz_total + total_nnz_new,))
+            counts_grp["indices"][
+                self._counts_nnz_total:self._counts_nnz_total + total_nnz_new
+            ] = indices_concat
+            counts_grp["data"][
+                self._counts_nnz_total:self._counts_nnz_total + total_nnz_new
+            ] = data_concat
+            self._counts_nnz_total += total_nnz_new
 
-        self._rows_written += n_new
-        self._buffer_loops.clear()
-        self._buffer_n_donors.clear()
+        self._clusters_written += n_new_clusters
+        self._tcrs_written += n_new_tcrs
+
         self._buffer_cluster_ids.clear()
-        self._buffer_n_identical.clear()
-        self._buffer_v_gene_ids.clear()
-        self._buffer_indices.clear()
-        self._buffer_data.clear()
-        self._buffer_nnz.clear()
+        self._buffer_n_donors.clear()
+        self._buffer_tcr_counts.clear()
+        self._buffer_tcr_loops.clear()
+        self._buffer_tcr_n_identical.clear()
+        self._buffer_tcr_v_gene_ids.clear()
+        self._buffer_counts_indices.clear()
+        self._buffer_counts_data.clear()
+        self._buffer_counts_nnz.clear()
