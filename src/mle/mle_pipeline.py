@@ -26,7 +26,8 @@ from utils import (
     SparseTCRModel, create_dataset, pad_list_to_array, NumpyEncoder,
     assess_explanation_for_donors, analyze_model_predictions,
     evaluate_model_performance, compute_precision_at_k, 
-    plot_precision_at_k_heatmap, plot_precision_at_k_curves, save_metrics_json
+    plot_precision_at_k_heatmap, plot_precision_at_k_curves, save_metrics_json,
+    PublicTcrHlaCsrReader
 )
 
 
@@ -83,7 +84,7 @@ def load_config_file(config_path):
 
 def load_data(data_dir, donor_matrix_path, pad_token=-1.):
     """Load dataset and return all required arrays."""
-    from dataset_processing.utils import PublicTcrHlaCsrReader
+
     data_dir = Path(data_dir)
     print(f"Loading data from {data_dir}...")
     # Load binder sets (ground truth)
