@@ -16,8 +16,8 @@ import os, json
 import numpy as np
 import tensorflow as tf
 #import tensorflow_probability as tfp
-#import matplotlib
-#matplotlib.use('Agg')
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
@@ -551,14 +551,29 @@ class PublicTcrHlaCsrWriter:
 
 # --- MODEL DEFINITION ---
 class SparseTCRModel(tf.keras.Model):
-    """TCR Binding Model using sparse representation with likelihood maximization."""
+    """TCR Binding Model using sparse representation with likelihood maximization.
+    
+    Parameters
+    ----------
+    accumulation_steps : int
+        Number of mini-batches to accumulate gradients over before applying.
+        Effective batch = batch_size * accumulation_steps.
+        Set to 1 for no accumulation (default).
+    reduction : str
+        'sum' or 'mean'. Controls how per-TCR losses are aggregated.
+        'sum' (recommended): gradient per z_i is independent of batch_size.
+        'mean': gradient per z_i scales as 1/batch_size (original behavior).
+    """
     def __init__(self, num_tcrs, max_hlas_per_tcr, donor_hla_matrix, binder_sets, 
-                 beta=4.0, mode='continuous', pad_token=-1., l2_reg_lambda=1e-5):
+                 beta=4.0, mode='continuous', pad_token=-1., l2_reg_lambda=1e-5,
+                 accumulation_steps=1, reduction='sum'):
         super().__init__()
         self.beta = beta
         self.mode = mode
         self.pad_token = pad_token
         self.l2_reg_lambda = l2_reg_lambda
+        self.accumulation_steps = accumulation_steps
+        self.reduction = reduction
         # Store donor matrix transposed: (NumAlleles, NumDonors)
         self.X_T = tf.constant(donor_hla_matrix.T, dtype=tf.float32)
         # Store binder_sets with pad replaced by 0 for gathering
@@ -573,34 +588,30 @@ class SparseTCRModel(tf.keras.Model):
         self.loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.final_loss_tracker = tf.keras.metrics.Mean(name="final_loss")
         self.reg_tracker = tf.keras.metrics.Mean(name="reg_term")
+        # Gradient accumulation state (built lazily on first train_step)
+        self._grad_accumulators = None
+        self._accum_step = None
 
     def l2_reg(self, z_logits, mask):
-        if self.l2_reg_lambda: 
-            return self.l2_reg_lambda * tf.reduce_sum(tf.pow(z_logits, 2) * mask)
+        """L2 regularization normalized by number of valid positions."""
+        if self.l2_reg_lambda:
+            # Normalize by valid entries so reg strength is independent of
+            # batch_size, chunk_size, and max_hlas padding width
+            n_valid = tf.reduce_sum(mask)
+            n_valid = tf.maximum(n_valid, 1.0)  # avoid division by zero
+            return self.l2_reg_lambda * tf.reduce_sum(tf.pow(z_logits, 2) * mask) / n_valid
         return 0.
 
     def get_z_probabilities(self, z_logits, mask):
         """Toggle between continuous relaxation and binary sampling."""
-        #if self.mode == 'continuous':
         return tf.sigmoid(z_logits) * mask
-        #elif self.mode == 'gumbel':
-        #    dist = tfp.distributions.RelaxedBernoulli(temperature=0.5, logits=z_logits)
-        #    z_sampled = dist.sample()
-        #    z_hard = tf.cast(tf.greater(z_sampled, 0.5), tf.float32)
-        #    z_final = tf.stop_gradient(z_hard - z_sampled) + z_sampled
-        #    return z_final * mask
-        #raise ValueError(f"Unknown mode: {self.mode}")
 
     def call(self, inputs):
         """Compute negative log-likelihood loss for a batch of TCRs."""
-        # we only gt the index of TCRs and their donor index in HLA_to_Donor matrix.
-        tcr_idx, pos_donor_indices = inputs # (Batch, 1), (Batch, max_donor_set_padded)
-        # we gather the binder HLA set of tcr indexes of the current batch
-        batch_binder_indices = tf.gather(self.binder_sets, tcr_idx) #(All_TCRs, max_hla_set_padded) --> (Batch, max_hla_set_padded)
-        # We do the same for masking, where 0 is if position in set does not exist
-        batch_mask = tf.gather(self.binder_mask, tcr_idx) #(All_TCRs, max_hla_set_padded) --> (Batch, max_hla_set_padded)
-        # extract the embeddings of the tcr positions
-        z_logits = self.z_embedding(tcr_idx) # (Batch, 1)
+        tcr_idx, pos_donor_indices = inputs
+        batch_binder_indices = tf.gather(self.binder_sets, tcr_idx)
+        batch_mask = tf.gather(self.binder_mask, tcr_idx)
+        z_logits = self.z_embedding(tcr_idx)
         # Compute p_ni (Prob TCR i binds in Donor n)
         relevant_x = tf.gather(self.X_T, batch_binder_indices)
         z_prob = self.get_z_probabilities(z_logits, batch_mask)
@@ -623,20 +634,73 @@ class SparseTCRModel(tf.keras.Model):
         n_tilde = sum_p_all - sum_p_pos
         penalty = tf.math.lgamma(n_tilde + self.beta) - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
         log_likelihood = reward + penalty
-        return -tf.reduce_mean(log_likelihood), regularization_term
+        # Reduction: sum makes gradient per z_i independent of batch_size
+        if self.reduction == 'sum':
+            nll = -tf.reduce_sum(log_likelihood)
+        else:
+            nll = -tf.reduce_mean(log_likelihood)
+        return nll, regularization_term
 
     @property
     def metrics(self):
         return [self.loss_tracker, self.final_loss_tracker, self.reg_tracker]
 
+    def _ensure_accumulators(self):
+            """Create gradient accumulator variables on the same device as the model."""
+            if self._grad_accumulators is None:
+                gpus = tf.config.list_logical_devices("GPU")
+                device = gpus[0].name if gpus else "/CPU:0"
+                with tf.device(device):
+                    self._grad_accumulators = [
+                        tf.Variable(tf.zeros_like(v), trainable=False, name=f"grad_acc_{i}")
+                        for i, v in enumerate(self.trainable_variables)
+                    ]
+                    self._accum_step = tf.Variable(0, trainable=False, dtype=tf.int32)
+
+    def _apply_and_reset(self):
+        """Apply accumulated gradients and reset accumulators."""
+        self.optimizer.apply_gradients(
+            zip(self._grad_accumulators, self.trainable_variables)
+        )
+        for acc in self._grad_accumulators:
+            acc.assign(tf.zeros_like(acc))
+        return tf.constant(0.0)
+
     def train_step(self, data):
         with tf.GradientTape() as tape:
             loss, reg_term = self(data, training=True)
             final_loss = loss + reg_term
+
         gradients = tape.gradient(final_loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-        self.loss_tracker.update_state(loss)
-        self.final_loss_tracker.update_state(final_loss)
+
+        if self.accumulation_steps <= 1:
+            # Standard: apply gradients directly
+            self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        else:
+            # Gradient accumulation: accumulate N mini-batches, apply once.
+            # Divide each gradient by N so the accumulated sum = average.
+            self._ensure_accumulators()
+            accum_f = tf.cast(self.accumulation_steps, tf.float32)
+            for acc, grad in zip(self._grad_accumulators, gradients):
+                if grad is not None:
+                    acc.assign_add(grad / accum_f)
+            self._accum_step.assign_add(1)
+            tf.cond(
+                tf.equal(self._accum_step % self.accumulation_steps, 0),
+                true_fn=self._apply_and_reset,
+                false_fn=lambda: tf.constant(0.0),
+            )
+
+        # Report per-TCR loss for readability (always mean for metrics)
+        batch_size = tf.cast(tf.shape(data[0])[0], tf.float32)
+        if self.reduction == 'sum':
+            display_loss = loss / batch_size
+            display_final = final_loss / batch_size
+        else:
+            display_loss = loss
+            display_final = final_loss
+        self.loss_tracker.update_state(display_loss)
+        self.final_loss_tracker.update_state(display_final)
         self.reg_tracker.update_state(reg_term)
         return {m.name: m.result() for m in self.metrics}
 

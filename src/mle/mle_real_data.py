@@ -24,12 +24,12 @@ independently and saved to its own checkpoint file (.npz), enabling:
 === PARALLEL USAGE ===
 
   # Compute total chunks first (use status mode):
-  python mle_real_data.py --h5_data_path data.h5 --donor_matrix_path donor.npz \
+  python mle_real_data.py --h5_data_path data.h5 --donor_matrix_path donor.npz \\
       --output_dir /out --mode status --chunk_size 100000
 
   # Then submit array jobs (e.g. SLURM):
   #   SBATCH --array=0-19
-  python mle_real_data.py --h5_data_path data.h5 --donor_matrix_path donor.npz \
+  python mle_real_data.py --h5_data_path data.h5 --donor_matrix_path donor.npz \\
       --output_dir /out --mode train --chunk_id $SLURM_ARRAY_TASK_ID
 
   # Or run a range per job:
@@ -40,7 +40,7 @@ independently and saved to its own checkpoint file (.npz), enabling:
 
 === SEQUENTIAL USAGE (with resume on crash) ===
 
-  python mle_real_data.py --h5_data_path data.h5 --donor_matrix_path donor.npz \
+  python mle_real_data.py --h5_data_path data.h5 --donor_matrix_path donor.npz \\
       --output_dir /out --mode train --resume --epochs 10
 
   # If it crashes at chunk 47, just re-run the same command.
@@ -58,12 +58,11 @@ independently and saved to its own checkpoint file (.npz), enabling:
 import os
 import sys
 import json
-import glob
 import shutil
 import time
-import math
 import argparse
 import numpy as np
+import tensorflow as tf
 from pathlib import Path
 
 
@@ -119,7 +118,11 @@ Examples:
     parser.add_argument("--epochs", type=int, default=10,
                         help="Training epochs per chunk (default: 10).")
     parser.add_argument("--batch_size", type=int, default=512,
-                        help="Batch size for TF training (default: 512).")
+                        help="Actual mini-batch size for GPU memory (default: 512).")
+    parser.add_argument("--accumulation_steps", type=int, default=1,
+                        help="Gradient accumulation steps. Effective batch = "
+                             "batch_size * accumulation_steps. E.g. batch_size=512, "
+                             "accumulation_steps=8 simulates batch of 4096. Default: 1.")
     parser.add_argument("--learning_rate", type=float, default=0.01,
                         help="Initial learning rate (default: 0.01).")
     parser.add_argument("--beta", type=float, default=4.0,
@@ -128,6 +131,29 @@ Examples:
                         help="L2 regularization on z_logits (default: 1e-5).")
     parser.add_argument("--pad_token", type=float, default=-1.0,
                         help="Padding token value (default: -1.0).")
+    parser.add_argument("--optimizer", type=str, default="adam",
+                        choices=["adam", "lion", "lamb", "sgd"],
+                        help="Optimizer: adam, lion (memory-efficient, large batch), "
+                             "lamb (layer-adaptive, large batch), sgd. Default: adam.")
+    parser.add_argument("--reduction", type=str, default="sum",
+                        choices=["sum", "mean"],
+                        help="Loss reduction: 'sum' (recommended, batch-size invariant) "
+                             "or 'mean' (legacy). Default: sum.")
+
+    # --- Convergence ---
+    parser.add_argument("--converge", action="store_true",
+                        help="Train until convergence instead of fixed epochs. "
+                             "Ignores --epochs. Stops when loss improvement < tol "
+                             "for patience consecutive epochs.")
+    parser.add_argument("--converge_patience", type=int, default=10,
+                        help="Number of epochs with no improvement before stopping "
+                             "(default: 10).")
+    parser.add_argument("--converge_tol", type=float, default=1e-4,
+                        help="Minimum relative improvement to count as progress. "
+                             "Converged when (prev_loss - loss) / |prev_loss| < tol "
+                             "(default: 1e-4).")
+    parser.add_argument("--converge_max_epochs", type=int, default=1000,
+                        help="Safety cap on epochs in convergence mode (default: 1000).")
 
     # --- Chunking ---
     parser.add_argument("--chunk_size", type=int, default=100_000,
@@ -148,11 +174,9 @@ Examples:
                         help="Device: 'auto' (GPU if available), 'cpu', or 'gpu'. "
                              "Default: auto.")
     parser.add_argument("--gpu_id", type=int, default=None,
-                        help="Specific GPU index to use (e.g. 0, 1). "
-                             "Only relevant with --device gpu/auto.")
+                        help="Specific GPU index to use (e.g. 0, 1).")
     parser.add_argument("--gpu_memory_limit", type=int, default=None,
-                        help="GPU memory limit in MB. If set, enables memory growth "
-                             "with a cap.")
+                        help="GPU memory limit in MB.")
 
     # --- Misc ---
     parser.add_argument("--seed", type=int, default=42,
@@ -165,28 +189,17 @@ Examples:
 
 
 # ---------------------------------------------------------------------------
-# Device configuration (must happen BEFORE any TF operations)
+# Device configuration
 # ---------------------------------------------------------------------------
 
 def configure_device(args):
-    """
-    Configure TensorFlow to run on the requested device.
-    Call this BEFORE importing any TF-dependent code or creating tensors.
-
-    Handles:
-      - Forcing CPU-only execution (hides all GPUs).
-      - Selecting a specific GPU by index.
-      - Memory growth / memory cap to prevent OOM.
-    """
-    import tensorflow as tf
+    """Configure TensorFlow device. Call BEFORE any TF operations."""
 
     if args.device == "cpu":
-        # Hide all GPUs so TF falls back to CPU
         tf.config.set_visible_devices([], "GPU")
         print("Device: CPU (all GPUs hidden)")
         return
 
-    # GPU or auto mode
     gpus = tf.config.list_physical_devices("GPU")
 
     if not gpus:
@@ -196,7 +209,6 @@ def configure_device(args):
             print("Device: CPU (no GPUs detected)")
         return
 
-    # Select specific GPU if requested
     if args.gpu_id is not None:
         if args.gpu_id >= len(gpus):
             raise ValueError(
@@ -209,7 +221,6 @@ def configure_device(args):
     else:
         print(f"Device: GPU (found {len(gpus)})")
 
-    # Memory growth / memory cap to prevent OOM
     for gpu in gpus:
         try:
             if args.gpu_memory_limit:
@@ -232,17 +243,14 @@ def configure_device(args):
 # ---------------------------------------------------------------------------
 
 def chunks_dir(output_dir: str) -> Path:
-    """Directory where chunk checkpoint .npz files are stored."""
     return Path(output_dir) / "chunks"
 
 
 def chunk_path(output_dir: str, chunk_id: int) -> Path:
-    """Path to a specific chunk checkpoint file."""
     return chunks_dir(output_dir) / f"chunk_{chunk_id:06d}.npz"
 
 
 def get_completed_chunk_ids(output_dir: str) -> set:
-    """Return set of chunk IDs that have completed checkpoint files."""
     cdir = chunks_dir(output_dir)
     if not cdir.exists():
         return set()
@@ -257,10 +265,6 @@ def get_completed_chunk_ids(output_dir: str) -> set:
 
 
 def compute_chunk_schedule(total_clusters: int, chunk_size: int):
-    """
-    Compute the mapping from chunk_id to (cluster_start, cluster_end).
-    Returns a list of (start, end) tuples indexed by chunk_id.
-    """
     schedule = []
     for start in range(0, total_clusters, chunk_size):
         end = min(start + chunk_size, total_clusters)
@@ -273,25 +277,7 @@ def compute_chunk_schedule(total_clusters: int, chunk_size: int):
 # ---------------------------------------------------------------------------
 
 def extract_binder_sets_from_counts(counts_dense: np.ndarray, pad_token: float):
-    """
-    Convert a dense counts matrix to padded binder sets (nonzero allele indices).
-
-    Parameters
-    ----------
-    counts_dense : np.ndarray, shape (n_clusters, num_alleles)
-        Dense count matrix for this chunk.
-    pad_token : float
-        Padding value.
-
-    Returns
-    -------
-    binder_sets : np.ndarray, shape (n_clusters, max_nonzero_per_row)
-        Padded allele column indices where count > 0.
-    max_all : int
-        Maximum number of nonzero alleles across all rows in this chunk.
-    """
     from utils import pad_list_to_array_without_max
-
     n = counts_dense.shape[0]
     nonzero_rows, nonzero_cols = np.nonzero(counts_dense)
     counts_set = np.split(
@@ -302,20 +288,11 @@ def extract_binder_sets_from_counts(counts_dense: np.ndarray, pad_token: float):
 
 
 def split_ragged_to_list(flat_indices: np.ndarray, indptr: np.ndarray):
-    """Split flat CSR indices into a list of per-row arrays using indptr."""
     return np.split(flat_indices, indptr[1:-1])
 
 
 def extract_z_probs_from_model(model, binder_mask: np.ndarray) -> np.ndarray:
-    """
-    Extract sigmoid(z_logits) * mask from a trained SparseTCRModel.
-
-    Returns z_probs with shape (num_tcrs, max_hlas_per_tcr),
-    zeroed at padded positions.
-    """
-    import tensorflow as tf
-
-    z_logits = model.z_embedding.get_weights()[0]  # (num_tcrs, max_hlas_per_tcr)
+    z_logits = model.z_embedding.get_weights()[0]
     z_probs = tf.sigmoid(z_logits).numpy().astype(np.float32)
     z_probs[~binder_mask] = 0.0
     return z_probs
@@ -326,29 +303,13 @@ def extract_z_probs_from_model(model, binder_mask: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def save_chunk_checkpoint(
-    output_dir: str,
-    chunk_id: int,
-    cluster_start: int,
-    cluster_end: int,
-    binder_sets: np.ndarray,
-    z_probs: np.ndarray,
-    metadata: dict,
+    output_dir, chunk_id, cluster_start, cluster_end,
+    binder_sets, z_probs, metadata,
 ) -> Path:
-    """
-    Save a single chunk's training results to a compressed .npz file.
-
-    Contents:
-      cluster_start, cluster_end : int scalars
-      binder_sets : (n_clusters, max_hlas) padded allele indices
-      z_probs     : (n_clusters, max_hlas) sigmoid probabilities (float32)
-      metadata_json : JSON string with loss history and timing
-    """
     cdir = chunks_dir(output_dir)
     cdir.mkdir(parents=True, exist_ok=True)
     fpath = chunk_path(output_dir, chunk_id)
-
-    # Write to a temp file first, then atomically rename.
-    # This prevents partial files if the job is killed mid-write.
+    # Atomic write: tmp file then rename
     tmp_path = fpath.with_suffix(".tmp.npz")
     np.savez_compressed(
         tmp_path,
@@ -358,12 +319,11 @@ def save_chunk_checkpoint(
         z_probs=z_probs.astype(np.float32),
         metadata_json=np.array(json.dumps(metadata)),
     )
-    tmp_path.rename(fpath)  # atomic on POSIX
+    tmp_path.rename(fpath)
     return fpath
 
 
 def load_chunk_checkpoint(fpath: Path) -> dict:
-    """Load a chunk checkpoint .npz and return its contents."""
     data = np.load(fpath, allow_pickle=False)
     return {
         "cluster_start": int(data["cluster_start"]),
@@ -375,43 +335,166 @@ def load_chunk_checkpoint(fpath: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Optimizer factory
+# ---------------------------------------------------------------------------
+
+def build_optimizer(name: str, learning_rate):
+    """
+    Build an optimizer by name.
+
+    Parameters
+    ----------
+    name : str
+        One of 'adam', 'lion', 'lamb', 'sgd'.
+    learning_rate : float or tf.keras.optimizers.schedules.LearningRateSchedule
+    """
+
+    name = name.lower()
+    if name == "adam":
+        return tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    elif name == "sgd":
+        return tf.keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9)
+    elif name == "lion":
+        try:
+            return tf.keras.optimizers.Lion(learning_rate=learning_rate)
+        except AttributeError:
+            return LionOptimizer(learning_rate=learning_rate)
+    elif name == "lamb":
+        return LAMBOptimizer(learning_rate=learning_rate)
+    else:
+        raise ValueError(f"Unknown optimizer: {name}")
+
+
+class LionOptimizer(tf.keras.optimizers.Optimizer):
+    """
+    Lion optimizer (Chen et al., 2023).
+    Uses sign of exponential moving average for updates.
+    More memory efficient than Adam (no v state).
+    """
+    def __init__(self, learning_rate=1e-4, beta_1=0.9, beta_2=0.99,
+                 weight_decay=0.0, name="Lion", **kwargs):
+        super().__init__(learning_rate=learning_rate, name=name, **kwargs)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.wd = weight_decay
+
+    def build(self, var_list):
+        super().build(var_list)
+        self._momentums = []
+        for var in var_list:
+            self._momentums.append(
+                self.add_variable_from_reference(var, name="momentum")
+            )
+
+    def update_step(self, gradient, variable, learning_rate):
+        m = self._momentums[self._get_variable_index(variable)]
+        lr = tf.cast(learning_rate, variable.dtype)
+        beta1 = tf.cast(self.beta_1, variable.dtype)
+        beta2 = tf.cast(self.beta_2, variable.dtype)
+        update = tf.math.sign(beta1 * m + (1.0 - beta1) * gradient)
+        if self.wd > 0:
+            variable.assign_sub(lr * self.wd * variable)
+        variable.assign_sub(lr * update)
+        m.assign(beta2 * m + (1.0 - beta2) * gradient)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "beta_1": self.beta_1, "beta_2": self.beta_2,
+            "weight_decay": self.wd,
+        })
+        return config
+
+
+class LAMBOptimizer(tf.keras.optimizers.Optimizer):
+    """
+    LAMB optimizer (You et al., 2020).
+    Adam + layer-wise trust ratio for stable large-batch training.
+    """
+    def __init__(self, learning_rate=1e-3, beta_1=0.9, beta_2=0.999,
+                 epsilon=1e-6, weight_decay=0.0, name="LAMB", **kwargs):
+        super().__init__(learning_rate=learning_rate, name=name, **kwargs)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.epsilon = epsilon
+        self.wd = weight_decay
+
+    def build(self, var_list):
+        super().build(var_list)
+        self._momentums = []
+        self._velocities = []
+        for var in var_list:
+            self._momentums.append(
+                self.add_variable_from_reference(var, name="m")
+            )
+            self._velocities.append(
+                self.add_variable_from_reference(var, name="v")
+            )
+
+    def update_step(self, gradient, variable, learning_rate):
+        idx = self._get_variable_index(variable)
+        m = self._momentums[idx]
+        v = self._velocities[idx]
+        lr = tf.cast(learning_rate, variable.dtype)
+        beta1 = tf.cast(self.beta_1, variable.dtype)
+        beta2 = tf.cast(self.beta_2, variable.dtype)
+        eps = tf.cast(self.epsilon, variable.dtype)
+        step = tf.cast(self.iterations + 1, variable.dtype)
+        m.assign(beta1 * m + (1.0 - beta1) * gradient)
+        v.assign(beta2 * v + (1.0 - beta2) * tf.square(gradient))
+        m_hat = m / (1.0 - tf.pow(beta1, step))
+        v_hat = v / (1.0 - tf.pow(beta2, step))
+        update = m_hat / (tf.sqrt(v_hat) + eps)
+        if self.wd > 0:
+            update = update + self.wd * variable
+        w_norm = tf.norm(variable)
+        u_norm = tf.norm(update)
+        trust_ratio = tf.where(
+            tf.logical_and(w_norm > 0, u_norm > 0),
+            w_norm / u_norm, 1.0,
+        )
+        variable.assign_sub(lr * trust_ratio * update)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "beta_1": self.beta_1, "beta_2": self.beta_2,
+            "epsilon": self.epsilon, "weight_decay": self.wd,
+        })
+        return config
+
+
+# ---------------------------------------------------------------------------
 # MODE: train
 # ---------------------------------------------------------------------------
 
 def run_train(args):
-    """
-    Train z_probs for the specified chunks.
-    Each chunk saves an independent .npz checkpoint to <output_dir>/chunks/.
-    """
-    # Configure device FIRST (before any TF tensor creation)
+    """Train z_probs for specified chunks, saving independent .npz checkpoints."""
     configure_device(args)
 
-    import tensorflow as tf
     from utils import (
         SparseTCRModel, create_dataset, pad_list_to_array_without_max,
         PublicTcrHlaCsrReaderChunk,
     )
 
-    # Reproducibility
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
 
-    # Create output directories
     os.makedirs(args.output_dir, exist_ok=True)
     chunks_dir(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Save config (idempotent: every job writes the same content)
+    # Save config
     config_path = os.path.join(args.output_dir, "config.json")
     with open(config_path, "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    # ---- Load donor matrix (small, fits in memory) ----
+    # Load donor matrix
     print("Loading donor HLA matrix...")
     donor_hla_matrix = np.load(args.donor_matrix_path)["donor_hla_matrix"]
     num_donors, num_alleles = donor_hla_matrix.shape
     print(f"  Donor matrix: {num_donors} donors x {num_alleles} alleles")
 
-    # ---- Compute chunk schedule ----
+    # Compute chunk schedule
     print("Counting total clusters...")
     with PublicTcrHlaCsrReaderChunk(
         args.h5_data_path, include_counts=False, include_donors=False
@@ -421,7 +504,7 @@ def run_train(args):
     total_chunks = len(schedule)
     print(f"  Total: {total_clusters:,} clusters -> {total_chunks} chunks")
 
-    # ---- Determine target chunk IDs for this job ----
+    # Determine target chunks
     if args.chunk_id is not None:
         if args.chunk_id < 0 or args.chunk_id >= total_chunks:
             raise ValueError(
@@ -436,7 +519,7 @@ def run_train(args):
     else:
         target_ids = list(range(total_chunks))
 
-    # ---- Resume: skip already-completed chunks ----
+    # Resume: skip completed chunks
     if args.resume:
         completed = get_completed_chunk_ids(args.output_dir)
         before = len(target_ids)
@@ -451,16 +534,20 @@ def run_train(args):
 
     print(f"  Will train {len(target_ids)} chunks: "
           f"[{target_ids[0]} .. {target_ids[-1]}]")
+    print(f"  Optimizer: {args.optimizer} | Reduction: {args.reduction} | "
+          f"Accum steps: {args.accumulation_steps} | "
+          f"Effective batch: {args.batch_size * args.accumulation_steps}")
+    if args.converge:
+        print(f"  Convergence mode: patience={args.converge_patience}, "
+              f"tol={args.converge_tol}, max_epochs={args.converge_max_epochs}")
+    else:
+        print(f"  Fixed epochs: {args.epochs}")
 
-    # Convert target_ids to a set for fast lookup during iteration
     target_set = set(target_ids)
-
-    # ---- Optimized H5 read range ----
-    # Only read the cluster range that covers our target chunks.
     min_cluster = schedule[target_ids[0]][0]
     max_cluster = schedule[target_ids[-1]][1]
 
-    # ---- Training loop ----
+    # --- Training loop ---
     global_t0 = time.time()
     trained_count = 0
 
@@ -475,10 +562,7 @@ def run_train(args):
             start=min_cluster,
             stop=max_cluster,
         ):
-            # Map this chunk's cluster_start back to a chunk_id
             chunk_id = chunk.cluster_start // args.chunk_size
-
-            # Skip chunks not assigned to this job
             if chunk_id not in target_set:
                 continue
 
@@ -495,7 +579,7 @@ def run_train(args):
                 f"{'='*60}"
             )
 
-            # -- Donor indices: ragged CSR -> padded 2D array --
+            # Donor indices: ragged CSR -> padded 2D
             donor_lists = split_ragged_to_list(
                 chunk.raw_csr_donor_indices, chunk.raw_csr_donor_indptr
             )
@@ -504,7 +588,7 @@ def run_train(args):
             )
             donor_indices_padded = donor_indices_padded.astype(np.int32)
 
-            # -- Binder sets: nonzero allele indices from counts_dense --
+            # Binder sets: nonzero allele indices
             binder_sets, max_hlas = extract_binder_sets_from_counts(
                 chunk.counts_dense, args.pad_token
             )
@@ -512,7 +596,7 @@ def run_train(args):
             print(f"  binder_sets: ({n_clusters}, {max_hlas}) | "
                   f"donor_indices: ({n_clusters}, {max_donors})")
 
-            # Handle empty chunks
+            # Empty chunk
             if max_hlas == 0:
                 print("  WARNING: no nonzero alleles — saving empty checkpoint.")
                 save_chunk_checkpoint(
@@ -527,16 +611,10 @@ def run_train(args):
                 trained_count += 1
                 continue
 
-            # -- TF dataset --
+            # TF dataset
             train_dataset = create_dataset(donor_indices_padded, args.batch_size)
 
-            # -- Model --
-            steps_per_epoch = max(1, n_clusters // args.batch_size)
-            lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-                initial_learning_rate=args.learning_rate,
-                first_decay_steps=steps_per_epoch * 20,
-                t_mul=2.0, m_mul=0.9, alpha=0.1,
-            )
+            # Model
             model = SparseTCRModel(
                 num_tcrs=n_clusters,
                 max_hlas_per_tcr=max_hlas,
@@ -546,22 +624,88 @@ def run_train(args):
                 mode="continuous",
                 pad_token=args.pad_token,
                 l2_reg_lambda=args.l2_reg,
+                accumulation_steps=args.accumulation_steps,
+                reduction=args.reduction,
             )
-            optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+            # Optimizer with CosineDecay over total training steps
+            steps_per_epoch = max(1, n_clusters // args.batch_size)
+            if args.converge:
+                # In convergence mode, set decay over max_epochs as upper bound
+                total_steps = steps_per_epoch * args.converge_max_epochs
+            else:
+                total_steps = steps_per_epoch * args.epochs
+            lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+                initial_learning_rate=args.learning_rate,
+                decay_steps=total_steps,
+                alpha=0.001,
+            )
+            optimizer = build_optimizer(args.optimizer, lr_schedule)
             model.compile(optimizer=optimizer)
+            
+            # Build model and accumulators on GPU before training
+            dummy = tf.zeros((1,), dtype=tf.int32)
+            dummy_donors = tf.zeros((1, donor_indices_padded.shape[1]), dtype=tf.int32)
+            model((dummy, dummy_donors))
+            if args.accumulation_steps > 1:
+                model._ensure_accumulators()
 
-            # -- Train --
-            history = model.fit(
-                train_dataset, epochs=args.epochs, verbose=args.verbose
-            )
+            # Train
+            if args.converge:
+                # ---- Convergence mode: train epoch-by-epoch until converged ----
+                best_loss = float("inf")
+                no_improve_count = 0
+                all_loss_history = []
+                all_final_loss_history = []
+                actual_epochs = 0
 
-            # -- Extract z_probs --
+                for epoch in range(1, args.converge_max_epochs + 1):
+                    history = model.fit(
+                        train_dataset, epochs=1, verbose=args.verbose
+                    )
+                    epoch_loss = float(history.history["final_loss"][-1])
+                    all_loss_history.append(float(history.history["loss"][-1]))
+                    all_final_loss_history.append(epoch_loss)
+                    actual_epochs = epoch
+
+
+                    if best_loss == float("inf") or epoch_loss < best_loss - args.converge_tol * abs(best_loss):
+                        best_loss = epoch_loss
+                        no_improve_count = 0
+                    else:
+                        no_improve_count += 1
+
+                    if args.verbose >= 2 and epoch % 10 == 0:
+                        print(f"    [converge] epoch {epoch}: loss={epoch_loss:.4f}, "
+                              f"best={best_loss:.4f}, no_improve={no_improve_count}/{args.converge_patience}")
+
+                    if no_improve_count >= args.converge_patience:
+                        print(f"  Converged at epoch {epoch} "
+                              f"(patience {args.converge_patience} exhausted, "
+                              f"best_loss={best_loss:.4f})")
+                        break
+                else:
+                    print(f"  WARNING: Hit max epochs ({args.converge_max_epochs}) "
+                          f"without converging (best_loss={best_loss:.4f})")
+
+                final_loss = all_final_loss_history[-1]
+                loss_history = all_loss_history
+                trained_epochs = actual_epochs
+            else:
+                # ---- Fixed epoch mode (original behavior) ----
+                history = model.fit(
+                    train_dataset, epochs=args.epochs, verbose=args.verbose
+                )
+                final_loss = float(history.history["final_loss"][-1])
+                loss_history = [float(v) for v in history.history.get("loss", [])]
+                trained_epochs = args.epochs
+
+            # Extract z_probs
             binder_mask = binder_sets != args.pad_token
             z_probs = extract_z_probs_from_model(model, binder_mask)
 
-            # -- Save checkpoint (atomic write) --
+            # Save checkpoint
             elapsed = time.time() - chunk_t0
-            final_loss = float(history.history["final_loss"][-1])
             meta = {
                 "chunk_id": chunk_id,
                 "cluster_start": cluster_start,
@@ -570,18 +714,24 @@ def run_train(args):
                 "max_hlas_per_tcr": max_hlas,
                 "max_donors_per_cluster": max_donors,
                 "final_loss": final_loss,
-                "loss_history": [float(v) for v in history.history.get("loss", [])],
+                "loss_history": loss_history,
+                "epochs_trained": trained_epochs,
+                "converged": args.converge,
                 "elapsed_seconds": round(elapsed, 2),
                 "skipped": False,
+                "optimizer": args.optimizer,
+                "reduction": args.reduction,
+                "accumulation_steps": args.accumulation_steps,
             }
             fpath = save_chunk_checkpoint(
                 args.output_dir, chunk_id, cluster_start, cluster_end,
                 binder_sets=binder_sets, z_probs=z_probs, metadata=meta,
             )
             print(f"  Done in {elapsed:.1f}s | "
-                  f"Loss: {final_loss:.4f} | Saved: {fpath.name}")
+                  f"Loss: {final_loss:.4f} | Epochs: {trained_epochs} | "
+                  f"Saved: {fpath.name}")
 
-            # -- Free memory --
+            # Free memory
             del model, train_dataset, binder_sets, donor_indices_padded, z_probs
             tf.keras.backend.clear_session()
             trained_count += 1
@@ -596,22 +746,13 @@ def run_train(args):
 # ---------------------------------------------------------------------------
 
 def run_merge(args):
-    """
-    Merge all chunk .npz checkpoints into the final output H5.
-
-    Steps:
-      1. Copy original H5 to output dir (if not already there).
-      2. Open copy in append mode via MleZprobsWriter.
-      3. Load each chunk .npz in order and write its z_probs.
-      4. Save a combined training log JSON.
-    """
+    """Merge all chunk .npz checkpoints into the final output H5."""
     from utils import PublicTcrHlaCsrReaderChunk, MleZprobsWriter, NumpyEncoder
 
     print("=" * 60)
     print("MERGE MODE: combining chunk checkpoints into output H5")
     print("=" * 60)
 
-    # ---- Count total clusters ----
     with PublicTcrHlaCsrReaderChunk(
         args.h5_data_path, include_counts=False, include_donors=False
     ) as reader:
@@ -619,7 +760,6 @@ def run_merge(args):
     schedule = compute_chunk_schedule(total_clusters, args.chunk_size)
     total_chunks = len(schedule)
 
-    # ---- Check completeness ----
     completed = get_completed_chunk_ids(args.output_dir)
     missing = sorted(set(range(total_chunks)) - completed)
     print(f"\n  Total chunks: {total_chunks}")
@@ -635,7 +775,6 @@ def run_merge(args):
             print("  Aborted.")
             return
 
-    # ---- Copy original H5 to output ----
     output_h5_path = Path(args.output_dir) / Path(args.h5_data_path).name
     if not output_h5_path.exists():
         print(f"\nCopying original H5...")
@@ -646,14 +785,12 @@ def run_merge(args):
         print(f"  Done in {time.time() - t0:.1f}s")
     else:
         print(f"\nOutput H5 already exists: {output_h5_path}")
-        # Remove stale z_probs from a previous merge attempt
         import h5py
         with h5py.File(str(output_h5_path), "a") as f:
             if "z_probs" in f.get("clusters", {}):
                 print("  Removing old z_probs group from previous merge...")
                 del f["clusters"]["z_probs"]
 
-    # ---- Write z_probs ----
     writer = MleZprobsWriter(
         str(output_h5_path),
         num_clusters=total_clusters,
@@ -668,9 +805,7 @@ def run_merge(args):
 
     for chunk_id in range(total_chunks):
         fpath = chunk_path(args.output_dir, chunk_id)
-
         if not fpath.exists():
-            # Missing chunk: indptr stays flat -> zero-length row
             print(f"  Chunk {chunk_id:6d}: MISSING (zeros)")
             all_metadata.append({
                 "chunk_id": chunk_id, "skipped": True,
@@ -696,7 +831,6 @@ def run_merge(args):
     writer.close()
     merge_elapsed = time.time() - t0
 
-    # ---- Save combined log ----
     log = {
         "total_clusters": total_clusters,
         "total_chunks": total_chunks,
@@ -711,6 +845,9 @@ def run_merge(args):
             "l2_reg": args.l2_reg,
             "chunk_size": args.chunk_size,
             "seed": args.seed,
+            "optimizer": args.optimizer,
+            "reduction": args.reduction,
+            "accumulation_steps": args.accumulation_steps,
         },
         "chunks": all_metadata,
     }
@@ -732,7 +869,7 @@ def run_merge(args):
 # ---------------------------------------------------------------------------
 
 def run_status(args):
-    """Print a summary of which chunks are completed vs missing."""
+    """Print chunk completion status."""
     from utils import PublicTcrHlaCsrReaderChunk
 
     with PublicTcrHlaCsrReaderChunk(
@@ -763,7 +900,6 @@ def run_status(args):
         if len(missing) <= 30:
             print(f"  Missing IDs:     {missing}")
 
-        # Print SLURM helper
         print(f"\n  SLURM array job command (one chunk per task):")
         print(f"    #SBATCH --array={missing[0]}-{missing[-1]}")
         print(f"    python mle_real_data.py \\")
@@ -781,7 +917,6 @@ def run_status(args):
         print(f"      --chunk_size {args.chunk_size} \\")
         print(f"      --mode merge")
 
-    # ---- Aggregate statistics from completed chunks ----
     if completed:
         losses = []
         times = []
@@ -817,7 +952,6 @@ def run_status(args):
 
 
 def _compress_ranges(ids: list) -> str:
-    """Compress [0,1,2,5,6,7,10] into '0-2, 5-7, 10'."""
     if not ids:
         return "none"
     ranges = []
