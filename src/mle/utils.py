@@ -705,11 +705,13 @@ class SparseTCRModel(tf.keras.Model):
         return {m.name: m.result() for m in self.metrics}
 
 
-def create_dataset(donor_indices, batch_size):
+def create_dataset(donor_indices, batch_size, shuffle=False):
     """Create TF dataset from donor indices."""
     tcr_ids = np.arange(donor_indices.shape[0], dtype=np.int32)
     dataset = tf.data.Dataset.from_tensor_slices((tcr_ids, donor_indices))
-    dataset = dataset.shuffle(buffer_size=10000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=1000)
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return dataset
 
 

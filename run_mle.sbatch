@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=mle_tcr
 #SBATCH --array=0-4
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=40G
+#SBATCH --cpus-per-task=10
+#SBATCH --mem=63G
 #SBATCH --time=02-00:00:00
-#SBATCH --output=/user/a.hajialiasgarynaj01/u14286/.project/dir.project/Amir/TCRtyper/outputs/real_data_2/logs/mle_job_%a.out
-#SBATCH --error=/user/a.hajialiasgarynaj01/u14286/.project/dir.project/Amir/TCRtyper/outputs/real_data_2/logs/mle_job_%a.err
+#SBATCH --output=/user/a.hajialiasgarynaj01/u14286/.project/dir.project/Amir/TCRtyper/outputs/real_data_2/logs/mle_job_%a_2.out
+#SBATCH --error=/user/a.hajialiasgarynaj01/u14286/.project/dir.project/Amir/TCRtyper/outputs/real_data_2/logs/mle_job_%a_2.err
 #SBATCH --partition=scc-gpu
 #SBATCH -G A100:1
 
