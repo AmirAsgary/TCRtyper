@@ -18,9 +18,11 @@
 # for gpu required
 module purge
 source ~/.bashrc
-conda activate /user/a.hajialiasgarynaj01/u14286/.project/dir.project/Amir/envs/TCRtyper
+mamba activate /user/a.hajialiasgarynaj01/u14286/.project/dir.project/Amir/envs/TCRtyper
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib
 export CUDA_HOME=$CONDA_PREFIX
+export TF_XLA_FLAGS="--tf_xla_enable_xla_devices --tf_xla_auto_jit=2"
+export XLA_FLAGS="--xla_gpu_cuda_data_dir=$CONDA_PREFIX"
 module load gcc/13.2.0-nvptx
 module load cuda/12.6.2
 module load cudnn/9.8.0.87-12

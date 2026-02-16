@@ -208,3 +208,85 @@ output_dir/analysis/
 - **Gradient accumulation** (`--accumulation_steps N`) simulates large batches without extra GPU memory. Effective batch = batch_size × N.
 - **Resume** (`--resume`) is safe for restarts and SLURM preemption — completed chunks are atomic (write to `.tmp.npz`, then rename).
 - The analysis script does a **single pass** through the H5, computing all metrics simultaneously.
+
+
+
+--------------------
+# TCR Binder Set Size Classifier
+
+Predicts how many HLA alleles restrict a given TCR using a classifier trained on synthetic data with uncertainty-aware calibration.
+
+## Requirements
+
+```
+tensorflow >= 2.14
+numpy, h5py, matplotlib, scikit-learn
+```
+
+## Overview
+
+**Train** on synthetic TCR-HLA data (bX_nY folders) → **Infer** on real TCR data (HDF5).
+
+The model outputs a continuous expected binder set size per TCR and flags unreliable predictions using calibrated entropy/margin thresholds.
+
+## Usage
+
+### Training
+
+```bash
+python train_and_pred_binder_set.py --mode train \
+    --input_train outputs/synthetic_analysis_with_reg \
+    --output_dir outputs/synthetic_analysis_with_reg/models \
+    --epochs 100 \
+    --convergence \
+    --k_crossval 10 \
+    --val_split 0.1 \
+    --num_neurons 128 \
+    --num_layers 1 \
+    --dropout_rate 0.3 \
+    --ordinal_lambda 1.0 \
+    --delta 5.0 \
+    --max_error_rate 0.05 \
+    --batch_size 10000 \
+    --lr_schedule cosine \
+    --seed 43
+```
+
+**Input:** Directory containing `bX_nY/` subfolders (e.g. `b10_n100/`), each with `figures/donor_scores_matrix.npz` and `figures/analysis_arrays.npz`.
+
+**Output:** Model checkpoint, `metadata_train.json` (calibration parameters), confusion matrices, and training curves in `--output_dir`.
+
+### Inference
+
+```bash
+python train_and_pred_binder_set.py --mode inference \
+    --input_inference outputs/real_data_2/analysis/metrics.h5 \
+    --output_dir outputs/synthetic_analysis_with_reg/models \
+    --batch_size 10000 \
+    --infer_chunk 500000
+```
+
+**Input:** HDF5 file with keys `entropy`, `n_donors`, `explanation_fractions`, `n_active_alleles`, `explanation_auc`, `max_z_prob`, `mean_z_prob_nonzero`.
+
+**Output:** Writes predictions back into the same HDF5:
+
+| Key | Description |
+|---|---|
+| `predicted_binderset_probs_calibrated` | (N, 6) calibrated probabilities over bins [3,5,10,15,25,35] |
+| `predicted_binderset_expected` | (N,) continuous expected binder size (main output) |
+| `predicted_binderset_best_calibrated` | (N,) argmax discrete binder size |
+| `predicted_binderset_entropy` | (N,) predictive entropy |
+| `predicted_binderset_margin` | (N,) confidence margin |
+| `predicted_binderset_reliable` | (N,) binary: 1 = passes uncertainty thresholds |
+
+Also saves a `.npz` copy and generates diagnostic plots in `figures_inference/`.
+
+## Key Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--ordinal_lambda` | 1.0 | Sharpness of distance-weighted soft targets |
+| `--delta` | 5.0 | Tolerance band for continuous error: \|b̂ − y\| > δ |
+| `--max_error_rate` | 0.05 | Max acceptable error among retained predictions |
+| `--k_crossval` | 5 | Folds for cross-validated temperature calibration |
+| `--convergence` | True | Early stopping on validation loss (patience=15) |
