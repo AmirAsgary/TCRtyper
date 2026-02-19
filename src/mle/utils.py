@@ -1235,6 +1235,7 @@ class PublicTcrHlaClusterChunk:
         raw_csr_tcr_loops: np.ndarray,
         raw_csr_tcr_int_fields: np.ndarray,
         raw_csr_tcr_int_field_names: tuple[str, ...],
+        cdr_freq: Optional[Dict[str, "RaggedClusterAccessor"]] = None,
     ) -> None:
         self.cluster_start = int(cluster_start)
         self.cluster_end = int(cluster_end)
@@ -1250,6 +1251,7 @@ class PublicTcrHlaClusterChunk:
         self.raw_csr_tcr_loops = raw_csr_tcr_loops
         self.raw_csr_tcr_int_fields = raw_csr_tcr_int_fields
         self.raw_csr_tcr_int_field_names = raw_csr_tcr_int_field_names
+        self.cdr_freq = cdr_freq
 
         self._tcr_loops_accessor = RaggedClusterAccessor(
             self.raw_csr_tcr_loops, self.raw_csr_tcr_indptr
@@ -1341,6 +1343,7 @@ class PublicTcrHlaCsrReaderChunk:
         include_pvals: bool = False,
         include_donors: bool = False,
         include_z_probs: bool = False,
+        include_cdr_freq: bool = False,
     ):
         self.path = Path(path)
         self.include_counts = bool(include_counts)
@@ -1348,6 +1351,7 @@ class PublicTcrHlaCsrReaderChunk:
         self.include_donors = bool(include_donors)
         self.include_z_probs = bool(include_z_probs)
         self._h5 = None
+        self.include_cdr_freq = bool(include_cdr_freq)
 
     def __enter__(self) -> "PublicTcrHlaCsrReaderChunk":
         self.open()
@@ -1411,6 +1415,7 @@ class PublicTcrHlaCsrReaderChunk:
         pvals_grp = clusters_grp.get("pvals") if self.include_pvals else None
         donors_grp = clusters_grp.get("donors") if include_donors else None
         z_probs_grp = clusters_grp.get("z_probs") if self.include_z_probs else None
+        cdr_freq_grp = clusters_grp.get("cdr_freq") if self.include_cdr_freq else None
         if self.include_counts and counts_grp is None:
             raise KeyError("HDF5 missing clusters/counts (include_counts=True).")
         if self.include_pvals and pvals_grp is None:
@@ -1583,6 +1588,25 @@ class PublicTcrHlaCsrReaderChunk:
                         (n_clusters, self.num_alleles), dtype=np.float32
                     )
 
+            cdr_freq = None
+            if cdr_freq_grp is not None:
+                cdr_freq = {}
+                for nm in ("cdr3", "cdr1", "cdr2", "cdr25"):
+                    ip_ds = cdr_freq_grp.get(f"{nm}_indptr")
+                    fr_ds = cdr_freq_grp.get(f"{nm}_freq")
+                    if ip_ds is not None and fr_ds is not None:
+                        ip_chunk = np.asarray(
+                            ip_ds[cluster_start : cluster_end + 1]
+                        )
+                        fr_start = int(ip_chunk[0])
+                        fr_end = int(ip_chunk[-1])
+                        ip_local = ip_chunk - fr_start
+                        if fr_end > fr_start:
+                            fr_data = np.asarray(fr_ds[fr_start:fr_end])
+                        else:
+                            fr_data = np.empty((0, 21), dtype=np.float32)
+                        cdr_freq[nm] = RaggedClusterAccessor(fr_data, ip_local)
+
             yield PublicTcrHlaClusterChunk(
                 cluster_start=cluster_start,
                 cluster_end=cluster_end,
@@ -1598,6 +1622,7 @@ class PublicTcrHlaCsrReaderChunk:
                 raw_csr_tcr_loops=tcr_loops,
                 raw_csr_tcr_int_fields=tcr_int_fields,
                 raw_csr_tcr_int_field_names=tuple(int_field_names),
+                cdr_freq=cdr_freq,
             )
     def read_sparse_indices_of_counts(self):
         """
@@ -2198,90 +2223,163 @@ class MleZprobsWriter:
 
 
 
-class TCRLikelihoodLoss(tf.keras.layers.Layer):
-    """
-    Computes Negative Log-Likelihood and L2 regularization for dense TCR binding.
-    Optimized via matrix multiplication for large-scale datasets.
-    """
-    def __init__(self, donor_hla_matrix, beta=4.0, pad_token=-1., 
-                 l2_reg_lambda=1e-5, reduction='sum', 
-                 poisson_approx_untyped_hlas=False, **kwargs):
-        super().__init__(**kwargs)
-        self.beta = beta
-        self.pad_token = pad_token
-        self.l2_reg_lambda = l2_reg_lambda
-        self.reduction = reduction
-        self.poisson_approx_untyped_hlas = poisson_approx_untyped_hlas
-        
-        # self.X_T shape: (A, N) 
-        # A: Total Alleles, N: Total Donors
-        self.X_T = tf.constant(donor_hla_matrix.T, dtype=tf.float32)
 
-    def l2_reg(self, z_logits, mask):
-        """L2 regularization normalized by valid positions."""
-        if self.l2_reg_lambda:
-            n_valid = tf.reduce_sum(mask)
-            n_valid = tf.maximum(n_valid, 1.0)  # avoid division by zero
-            return self.l2_reg_lambda * tf.reduce_sum(tf.pow(z_logits, 2) * mask) / n_valid
-        return 0.
+# ═══════════════════════════════════════════════════════════════════
+# 1.  CdrFreqWriter — writes CDR freq profiles into existing H5
+# ═══════════════════════════════════════════════════════════════════
+CDR_NAMES = ("cdr3", "cdr1", "cdr2", "cdr25")
+N_SYM = 21  # 20 amino acids + gap
 
-    def call(self, z_logits, binder_dense_set, pos_donor_indices):
+class CdrFreqWriter:
+    """
+    Append-mode HDF5 writer that adds CDR amino-acid frequency profiles
+    into an existing dataset_pval.h5 under ``clusters/cdr_freq/``.
+
+    Storage layout (ragged — each cluster has variable alignment length):
+    ::
+        clusters/cdr_freq/
+            cdr3_freq     (total_rows, 21) float32   — concatenated freq matrices
+            cdr3_indptr   (num_clusters+1,)  int64    — row boundaries per cluster
+            cdr1_freq     ...
+            cdr1_indptr   ...
+            cdr2_freq     ...
+            cdr2_indptr   ...
+            cdr25_freq    ...
+            cdr25_indptr  ...
+
+    Follows the same append pattern as ``MleZprobsWriter``.
+
+    Parameters
+    ----------
+    path : str | Path
+        Path to the HDF5 file to append into (must already exist).
+    num_clusters : int
+        Total number of clusters in the file.
+    chunk_nnz : int
+        HDF5 chunk size (rows) for the freq data arrays.
+    chunk_rows : int
+        HDF5 chunk size for the indptr arrays.
+    compression : dict | None
+        HDF5 compression kwargs.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        num_clusters: int,
+        chunk_nnz: int = 50_000,
+        chunk_rows: int = 10_000,
+        compression: Optional[dict] = None,
+    ) -> None:
+        self.path = Path(path)
+        self.num_clusters = int(num_clusters)
+        self.chunk_nnz = int(chunk_nnz)
+        self.chunk_rows = int(chunk_rows)
+        self.comp = compression or {}
+        self._h5: Optional[h5py.File] = None
+        # track how many freq rows have been written per CDR
+        self._nnz_written: Dict[str, int] = {nm: 0 for nm in CDR_NAMES}
+
+    def __enter__(self) -> "CdrFreqWriter":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def open(self) -> None:
+        """Open the H5 in append mode and create datasets if missing."""
+        if self._h5 is not None:
+            return
+        self._h5 = h5py.File(self.path, "a")
+        clusters_grp = self._h5["clusters"]
+        # create cdr_freq group if it doesn't exist
+        if "cdr_freq" not in clusters_grp:
+            grp = clusters_grp.create_group("cdr_freq")
+            # store metadata
+            grp.attrs["n_symbols"] = N_SYM
+            grp.attrs["aa_alphabet"] = "ACDEFGHIKLMNPQRSTVWY"
+            grp.attrs["gap_index"] = 20
+            for nm in CDR_NAMES:
+                # indptr — fixed size, pre-filled with zeros
+                grp.create_dataset(
+                    f"{nm}_indptr",
+                    shape=(self.num_clusters + 1,),
+                    dtype=np.int64,
+                    chunks=(min(self.chunk_rows, self.num_clusters + 1),),
+                    **self.comp,
+                )
+                grp[f"{nm}_indptr"][:] = 0
+                # freq data — resizable (rows grow, cols = N_SYM)
+                grp.create_dataset(
+                    f"{nm}_freq",
+                    shape=(0, N_SYM),
+                    maxshape=(None, N_SYM),
+                    dtype=np.float32,
+                    chunks=(min(self.chunk_nnz, 10_000), N_SYM),
+                    **self.comp,
+                )
+
+    def close(self) -> None:
+        """Flush and close the H5 file handle."""
+        if self._h5 is not None:
+            self._h5.flush()
+            self._h5.close()
+            self._h5 = None
+
+    def write_chunk(
+        self,
+        cluster_start: int,
+        cluster_end: int,
+        freq_data: Dict[str, List[np.ndarray]],
+    ) -> None:
         """
+        Write frequency profiles for a contiguous block of clusters.
+
         Parameters
         ----------
-        z_logits : tf.Tensor
-            Logits predicted by Transformer over ALL alleles. Shape: (B, A)
-        binder_dense_set : tf.Tensor
-            Binary mask of TCR-HLA co-occurrences. Shape: (B, A)
-        pos_donor_indices : tf.Tensor
-            Indices of positive donors (padded with pad_token). Shape: (B, P)
+        cluster_start : int
+            Global index of the first cluster in this chunk.
+        cluster_end : int
+            Global index one past the last cluster (exclusive).
+        freq_data : dict[str, list[np.ndarray]]
+            Keys are CDR names ('cdr3','cdr1','cdr2','cdr25').
+            Values are lists (length = cluster_end - cluster_start)
+            of float32 arrays with shape (alignment_len_i, 21).
         """
-        # 1. Masking and Probabilities
-        mask = tf.cast(binder_dense_set, tf.float32)
-        
-        # z_prob (gamma_ia) shape: (B, A) 
-        z_prob = tf.sigmoid(z_logits) * mask
-        
-        # 2. Regularization
-        regularization_term = self.l2_reg(z_logits, mask)
-        
-        # 3. Likelihood Calculation (p_ni)
-        if self.poisson_approx_untyped_hlas:
-            # MODE: Continuous x_na (Poisson Approximation)
-            # p_ni = 1 - exp(-sum(x_na * gamma_ia))
-            sum_x_gamma = tf.matmul(z_prob, self.X_T) # (B, A) @ (A, N) -> (B, N)
-            p_ni = 1.0 - tf.exp(-sum_x_gamma)
-        else:
-            # MODE: Binary x_na (Exact Calculation)
-            # p_ni = 1 - exp(sum(x_na * log(1 - gamma_ia)))
-            z_prob_safe = tf.minimum(z_prob, 1.0 - 1e-7)
-            log_1_minus_z = tf.math.log(1.0 - z_prob_safe)
-            log_prod = tf.matmul(log_1_minus_z, self.X_T) # (B, A) @ (A, N) -> (B, N)
-            p_ni = 1.0 - tf.exp(log_prod)
-            
-        p_ni_safe = tf.maximum(p_ni, 1e-7)
-        
-        # 4. Positive Donors (Reward)
-        safe_pos_indices = tf.maximum(pos_donor_indices, 0)
-        pos_mask = tf.cast(tf.not_equal(pos_donor_indices, tf.cast(self.pad_token, tf.int32)), tf.float32)
-        
-        # p_pos shape: (B, P)
-        p_pos = tf.gather(p_ni_safe, safe_pos_indices, batch_dims=1)
-        reward = tf.reduce_sum(tf.math.log(p_pos) * pos_mask, axis=1)
-        
-        # 5. Negative Donors (Penalty via Beta-Binomial)
-        n_i = tf.reduce_sum(pos_mask, axis=1)
-        sum_p_all = tf.reduce_sum(p_ni_safe, axis=1)
-        sum_p_pos = tf.reduce_sum(p_pos * pos_mask, axis=1)
-        n_tilde = sum_p_all - sum_p_pos
-        
-        penalty = tf.math.lgamma(n_tilde + self.beta) - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
-        log_likelihood = reward + penalty
-        
-        # 6. Reduction
-        if self.reduction == 'sum':
-            nll = -tf.reduce_sum(log_likelihood)
-        else:
-            nll = -tf.reduce_mean(log_likelihood)
-            
-        return nll, regularization_term
+        if self._h5 is None:
+            self.open()
+        n_cl = cluster_end - cluster_start
+        grp = self._h5["clusters"]["cdr_freq"]
+        for nm in CDR_NAMES:
+            blocks = freq_data[nm]
+            assert len(blocks) == n_cl, (
+                f"freq_data['{nm}'] has {len(blocks)} entries, expected {n_cl}"
+            )
+            # compute new row counts per cluster
+            row_counts = np.array([b.shape[0] for b in blocks], dtype=np.int64)
+            total_new = int(row_counts.sum())
+            # concatenate all freq blocks for this CDR
+            if total_new > 0:
+                new_data = np.vstack(blocks).astype(np.float32)
+            else:
+                new_data = np.empty((0, N_SYM), dtype=np.float32)
+            # append freq data
+            ds = grp[f"{nm}_freq"]
+            old_rows = ds.shape[0]
+            ds.resize(old_rows + total_new, axis=0)
+            if total_new > 0:
+                ds[old_rows:] = new_data
+            # update indptr (cumulative offsets)
+            indptr_ds = grp[f"{nm}_indptr"]
+            base = self._nnz_written[nm]
+            cumsum = base + np.cumsum(row_counts)
+            indptr_ds[cluster_start + 1 : cluster_end + 1] = cumsum
+            self._nnz_written[nm] = int(cumsum[-1]) if cumsum.size > 0 else base
+        # flush periodically
+        self._h5.flush()
+
+
+
+    

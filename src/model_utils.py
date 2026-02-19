@@ -1740,7 +1740,92 @@ class LogSpaceExactLikelihood(keras.losses.Loss):
 
 
         
+class TCRLikelihoodLoss(tf.keras.layers.Layer):
+    """
+    Computes Negative Log-Likelihood and L2 regularization for dense TCR binding.
+    Optimized via matrix multiplication for large-scale datasets.
+    """
+    def __init__(self, donor_hla_matrix, beta=4.0, pad_token=-1., 
+                 l2_reg_lambda=1e-5, reduction='sum', 
+                 poisson_approx_untyped_hlas=False, **kwargs):
+        super().__init__(**kwargs)
+        self.beta = beta
+        self.pad_token = pad_token
+        self.l2_reg_lambda = l2_reg_lambda
+        self.reduction = reduction
+        self.poisson_approx_untyped_hlas = poisson_approx_untyped_hlas
+        
+        # self.X_T shape: (A, N) 
+        # A: Total Alleles, N: Total Donors
+        self.X_T = tf.constant(donor_hla_matrix.T, dtype=tf.float32)
 
+    def l2_reg(self, z_logits, mask):
+        """L2 regularization normalized by valid positions."""
+        if self.l2_reg_lambda:
+            n_valid = tf.reduce_sum(mask)
+            n_valid = tf.maximum(n_valid, 1.0)  # avoid division by zero
+            return self.l2_reg_lambda * tf.reduce_sum(tf.pow(z_logits, 2) * mask) / n_valid
+        return 0.
+
+    def call(self, z_logits, binder_dense_set, pos_donor_indices):
+        """
+        Parameters
+        ----------
+        z_logits : tf.Tensor
+            Logits predicted by Transformer over ALL alleles. Shape: (B, A)
+        binder_dense_set : tf.Tensor
+            Binary mask of TCR-HLA co-occurrences. Shape: (B, A)
+        pos_donor_indices : tf.Tensor
+            Indices of positive donors (padded with pad_token). Shape: (B, P)
+        """
+        # 1. Masking and Probabilities
+        mask = tf.cast(binder_dense_set, tf.float32)
+        
+        # z_prob (gamma_ia) shape: (B, A) 
+        z_prob = tf.sigmoid(z_logits) * mask
+        
+        # 2. Regularization
+        regularization_term = self.l2_reg(z_logits, mask)
+        
+        # 3. Likelihood Calculation (p_ni)
+        if self.poisson_approx_untyped_hlas:
+            # MODE: Continuous x_na (Poisson Approximation)
+            # p_ni = 1 - exp(-sum(x_na * gamma_ia))
+            sum_x_gamma = tf.matmul(z_prob, self.X_T) # (B, A) @ (A, N) -> (B, N)
+            p_ni = 1.0 - tf.exp(-sum_x_gamma)
+        else:
+            # MODE: Binary x_na (Exact Calculation)
+            # p_ni = 1 - exp(sum(x_na * log(1 - gamma_ia)))
+            z_prob_safe = tf.minimum(z_prob, 1.0 - 1e-7)
+            log_1_minus_z = tf.math.log(1.0 - z_prob_safe)
+            log_prod = tf.matmul(log_1_minus_z, self.X_T) # (B, A) @ (A, N) -> (B, N)
+            p_ni = 1.0 - tf.exp(log_prod)
+            
+        p_ni_safe = tf.maximum(p_ni, 1e-7)
+        
+        # 4. Positive Donors (Reward)
+        safe_pos_indices = tf.maximum(pos_donor_indices, 0)
+        pos_mask = tf.cast(tf.not_equal(pos_donor_indices, tf.cast(self.pad_token, tf.int32)), tf.float32)
+        
+        # p_pos shape: (B, P)
+        p_pos = tf.gather(p_ni_safe, safe_pos_indices, batch_dims=1)
+        reward = tf.reduce_sum(tf.math.log(p_pos) * pos_mask, axis=1)
+        
+        # 5. Negative Donors (Penalty via Beta-Binomial)
+        n_i = tf.reduce_sum(pos_mask, axis=1)
+        sum_p_all = tf.reduce_sum(p_ni_safe, axis=1)
+        sum_p_pos = tf.reduce_sum(p_pos * pos_mask, axis=1)
+        n_tilde = sum_p_all - sum_p_pos
+        
+        penalty = tf.math.lgamma(n_tilde + self.beta) - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
+        log_likelihood = reward + penalty
+        
+        # 6. Reduction
+        if self.reduction == 'sum':
+            nll = -tf.reduce_sum(log_likelihood)
+        else:
+            nll = -tf.reduce_mean(log_likelihood)
+        return nll, regularization_term
 
 
 
