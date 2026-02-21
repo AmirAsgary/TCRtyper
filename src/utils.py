@@ -2981,17 +2981,31 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
     """
     def __init__(self, donor_hla_matrix, beta=4.0, pad_token=-1., 
                  l2_reg_lambda=1e-5, reduction='sum', 
-                 poisson_approx_untyped_hlas=False, **kwargs):
+                 poisson_approx_untyped_hlas=False,
+                 hla_bias_init=None, invariant_lambda=1e-5, **kwargs):
         super().__init__(**kwargs)
         self.beta = beta
         self.pad_token = pad_token
         self.l2_reg_lambda = l2_reg_lambda
         self.reduction = reduction
         self.poisson_approx_untyped_hlas = poisson_approx_untyped_hlas
+        self.invariant_lambda = invariant_lambda
         
         # self.X_T shape: (A, N) 
         # A: Total Alleles, N: Total Donors
         self.X_T = tf.constant(donor_hla_matrix.T, dtype=tf.float32)
+        # Store the prior as a constant tensor
+        if hla_bias_init is not None:
+            self.prior_logits = tf.constant(hla_bias_init, dtype=tf.float32)
+        else:
+            self.prior_logits = 0.0
+
+    def logit_drift_penalty(self, z_logits):
+        """Prevents sigmoid saturation by pulling logits gently back to the empirical prior."""
+        if self.l2_reg_lambda > 0:
+            # Penalize the squared distance from the prior log-odds, NOT from zero!
+            return self.l2_reg_lambda * tf.reduce_mean(tf.square(z_logits - self.prior_logits))
+        return 0.0
 
     def l2_reg(self, z_logits, mask):
         """L2 regularization normalized by valid positions."""
@@ -3000,6 +3014,24 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
             n_valid = tf.maximum(n_valid, 1.0)  # avoid division by zero
             return self.l2_reg_lambda * tf.reduce_sum(tf.pow(z_logits, 2) * mask) / n_valid
         return 0.
+    
+    def scale_invariant_sparsity(self, z_prob, active_mask):
+        """
+        Implements lambda * (||gamma_i||_1 / ||gamma_i||_2) from the manuscript.
+        Applied only to the active (co-occurring) alleles to force the model
+        to pick a single winner from the haplotype block without shrinking the max prob.
+        """
+        if self.l2_reg_lambda > 0:
+            # Mask the probabilities so we only penalize spreading among active alleles
+            masked_probs = z_prob * active_mask
+            # L1 norm (sum of probabilities)
+            l1 = tf.reduce_sum(masked_probs, axis=-1)
+            # L2 norm (sqrt of sum of squares, with epsilon to prevent NaN gradients)
+            l2 = tf.sqrt(tf.reduce_sum(tf.square(masked_probs), axis=-1) + 1e-8)
+            # Calculate ratio per TCR, average over batch
+            sparsity_penalty = l1 / l2
+            return self.l2_reg_lambda * tf.reduce_mean(sparsity_penalty)
+        return 0.0
 
     def call(self, z_logits, binder_dense_set, pos_donor_indices):
         """
@@ -3016,10 +3048,11 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         mask = tf.cast(binder_dense_set, tf.float32)
         
         # z_prob (gamma_ia) shape: (B, A) 
-        z_prob = tf.sigmoid(z_logits) * mask
-        
-        # 2. Regularization
-        regularization_term = self.l2_reg(z_logits, mask)
+        z_prob = tf.sigmoid(z_logits) #* mask
+        # 2. Regularization (Anchor to the prior)
+        regularization_term = self.logit_drift_penalty(z_logits)
+        # 2. Regularization this one pushes probs to 0.5
+        #regularization_term = self.l2_reg(z_logits, mask)
         
         # 3. Likelihood Calculation (p_ni)
         if self.poisson_approx_untyped_hlas:
@@ -3035,7 +3068,7 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
             log_prod = tf.matmul(log_1_minus_z, self.X_T) # (B, A) @ (A, N) -> (B, N)
             p_ni = 1.0 - tf.exp(log_prod)
             
-        p_ni_safe = tf.maximum(p_ni, 1e-7)
+        p_ni_safe = p_ni + 1e-7 #tf.maximum(p_ni, 1e-7)
         
         # 4. Positive Donors (Reward)
         safe_pos_indices = tf.maximum(pos_donor_indices, 0)

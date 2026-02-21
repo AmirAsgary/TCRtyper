@@ -111,7 +111,7 @@ def parse_args():
     # ── loss / likelihood ────────────────────────────────────────────
     p.add_argument("--beta", type=float, default=4.0,
                    help="Beta-Binomial prior parameter")
-    p.add_argument("--l2_reg", type=float, default=1e-6,
+    p.add_argument("--l2_reg", type=float, default=0.0,
                    help="L2 regularisation on z_logits")
     p.add_argument("--reduction", type=str, default="sum",
                    choices=["sum", "mean"],
@@ -164,6 +164,20 @@ def parse_args():
                         "pipeline for all epochs (much faster)")
     p.add_argument("--num_shards", type=int, default=16,
                    help="Number of TFRecord shard files for parallel reads")
+    # ── donor filtering ──────────────────────────────────────────────
+    # Only keep clusters whose n_donors >= this threshold during
+    # TFRecord generation and HDF5 streaming.  Default 1 keeps all.
+    p.add_argument("--keep_only_upperthan_n_donors", type=int, default=1,
+                   help="Only store/use clusters with at least N donors. "
+                        "Clusters with fewer donors are skipped during "
+                        "TFRecord generation and HDF5 streaming (default: 1)")
+    # ── custom TFRecord path ─────────────────────────────────────────
+    # If set, the model reads/writes/resumes TFRecord cache files from
+    # this path instead of the default <output_dir>/tfrecord_cache_*.
+    p.add_argument("--tf_record_path", type=str, default="",
+                   help="Custom base directory for TFRecord cache files. "
+                        "If set, TFRecords are read/written/resumed from "
+                        "this path instead of the default output_dir")
     return p.parse_args()
 # ═════════════════════════════════════════════════════════════════════
 # 2.  HARDWARE SETUP
@@ -361,70 +375,111 @@ def convert_h5_to_tfrecords(h5_path: str, output_dir: str, args,
     """One-time conversion: stream HDF5 → sharded TFRecord files.
     Each shard stores individual clusters (not batches) so tf.data
     can shuffle and batch them freely.
+    Clusters with n_donors < args.keep_only_upperthan_n_donors are
+    skipped (filtered out) and not written to any shard.
+    If args.tf_record_path is set, TFRecords are written there instead
+    of the default <output_dir>/tfrecord_cache_<tag>/.
     Args:
         h5_path:    path to PublicTcrHlaCsrReaderChunk-compatible H5
-        output_dir: directory to write shard files into
-        args:       parsed flags (pad/mask/sep tokens, masking_rate=0 for cache)
+        output_dir: directory to write shard files into (fallback)
+        args:       parsed flags (pad/mask/sep tokens, masking_rate=0 for cache,
+                    keep_only_upperthan_n_donors, tf_record_path)
         num_shards: number of output files for parallel reads
         tag:        prefix for shard filenames (train / valid)
     Returns:
         list of shard file paths
     """
-    tfr_dir = os.path.join(output_dir, f"tfrecord_cache_{tag}")
+    # ── resolve TFRecord base directory ──────────────────────────────
+    # Use custom tf_record_path if provided, otherwise default to output_dir
+    tfr_base = args.tf_record_path if args.tf_record_path else output_dir
+    tfr_dir = os.path.join(tfr_base, f"tfrecord_cache_{tag}")
     os.makedirs(tfr_dir, exist_ok=True)
+    # ── minimum donor threshold for filtering ────────────────────────
+    min_donors = int(args.keep_only_upperthan_n_donors)
     # Check if already converted (idempotent)
     manifest_path = os.path.join(tfr_dir, "manifest.json")
     if os.path.exists(manifest_path):
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
-        if manifest.get("source_h5") == h5_path:
+        # Reuse only if source H5 AND min_donors threshold match
+        if (manifest.get("source_h5") == h5_path and
+                manifest.get("min_donors", 1) == min_donors):
             print(f"  [CACHE] Reusing existing TFRecords in {tfr_dir} "
                   f"({manifest['num_clusters']} clusters, "
-                  f"{manifest['num_shards']} shards)")
+                  f"{manifest['num_shards']} shards, "
+                  f"min_donors={min_donors})")
             return manifest["shard_paths"]
     print(f"  [CACHE] Converting {h5_path} → TFRecords in {tfr_dir} ...")
+    if min_donors > 1:
+        print(f"  [CACHE] Filtering: keeping only clusters with "
+              f"n_donors >= {min_donors}")
     t0 = time.time()
     # Open shard writers
     shard_paths = [os.path.join(tfr_dir, f"{tag}_{i:04d}.tfrecord")
                    for i in range(num_shards)]
     writers = [tf.io.TFRecordWriter(p) for p in shard_paths]
-    cluster_count = 0
+    cluster_count = 0   # clusters actually written (after filtering)
+    skipped_count = 0   # clusters skipped due to donor threshold
     shard_idx = 0
     # Read HDF5 in large chunks for speed, write individual examples
     with PublicTcrHlaCsrReaderChunk(
             h5_path, include_counts=True, include_donors=True,
             include_pvals=False, include_cdr_freq=True) as reader:
-        for chunk in reader.iter_cluster_chunks(chunk_rows=4096):
+        
+        for chunk in reader.iter_cluster_chunks(chunk_rows=10000):
             if chunk.counts_dense is None or chunk.cdr_freq is None:
                 continue
+            
             B = chunk.counts_dense.shape[0]
-            # Donor indices per cluster
+            
+            # 1. Vectorized Filtering
+            keep_mask = chunk.n_donors >= min_donors
+            valid_indices = np.where(keep_mask)[0]
+            
+            if len(valid_indices) == 0:
+                skipped_count += B
+                continue
+            
+            skipped_count += (B - len(valid_indices))
+            
+            # 2. Fast Vectorized Numpy Prep (Process the whole chunk at once)
             donor_lists = split_ragged_to_list(
                 chunk.raw_csr_donor_indices, chunk.raw_csr_donor_indptr)
-            # CDR freq arrays (no masking during cache — masking is applied
-            # at train time via tf.data .map())
-            cdr1_list  = chunk.cdr_freq["cdr1"][:]
-            cdr2_list  = chunk.cdr_freq["cdr2"][:]
-            cdr25_list = chunk.cdr_freq["cdr25"][:]
-            cdr3_list  = chunk.cdr_freq["cdr3"][:]
-            # Binder dense
-            binder = (chunk.counts_dense > 0).astype(np.float32)
-            for i in range(B):
-                # Build per-cluster concatenated CDR + mask (numpy, no masking)
-                cdrs = [cdr1_list[i], cdr2_list[i], cdr25_list[i], cdr3_list[i]]
-                parts_f, parts_m = [], []
-                for ci, c in enumerate(cdrs):
-                    L_k = c.shape[0]
-                    parts_f.append(c.astype(np.float32))
-                    parts_m.append(np.ones(L_k, dtype=np.int32))  # NORMAL
-                    if ci < 3:  # separator
-                        parts_f.append(np.zeros((1, 21), dtype=np.float32))
-                        parts_m.append(np.full(1, args.sep_token, dtype=np.int32))
-                combined_cdr  = np.concatenate(parts_f, axis=0)  # (L, 21)
-                combined_mask = np.concatenate(parts_m, axis=0)  # (L,)
-                donor_idx = donor_lists[i].astype(np.int32)
+            donor_pad, _ = pad_list_to_array_without_max(donor_lists, args.pad_token)
+            
+            cdr1, m1 = _pad_and_mask_numpy(chunk.cdr_freq["cdr1"][:], args.pad_token, args.mask_token, 0.0)
+            cdr2, m2 = _pad_and_mask_numpy(chunk.cdr_freq["cdr2"][:], args.pad_token, args.mask_token, 0.0)
+            cdr25, m25 = _pad_and_mask_numpy(chunk.cdr_freq["cdr25"][:], args.pad_token, args.mask_token, 0.0)
+            cdr3, m3 = _pad_and_mask_numpy(chunk.cdr_freq["cdr3"][:], args.pad_token, args.mask_token, 0.0)
+            
+            combined_np, mask_np = _concat_cdrs_with_sep_numpy(
+                [cdr1, cdr2, cdr25, cdr3], [m1, m2, m25, m3], sep_mask_val=args.sep_token)
+                
+            binder_np = (chunk.counts_dense > 0).astype(np.float32)
+            
+            # 3. Apply the valid indices filter all at once
+            combined_np = combined_np[valid_indices]
+            mask_np = mask_np[valid_indices]
+            binder_np = binder_np[valid_indices]
+            donor_pad = donor_pad[valid_indices]
+            
+            # 4. Calculate actual unpadded lengths (Vectorized)
+            seq_lens = np.sum(mask_np != args.pad_token, axis=1)
+            donor_lens = np.sum(donor_pad != args.pad_token, axis=1)
+            
+            # 5. Fast Loop for Protobuf Serialization
+            for i in range(len(valid_indices)):
+                s_len = seq_lens[i]
+                d_len = donor_lens[i]
+                
+                # Instantly strip padding using array slicing
+                actual_cdr = combined_np[i, :s_len]
+                actual_mask = mask_np[i, :s_len]
+                actual_donors = donor_pad[i, :d_len]
+                
                 serialized = _serialize_cluster(
-                    combined_cdr, combined_mask, binder[i], donor_idx)
+                    actual_cdr, actual_mask, binder_np[i], actual_donors)
+                
                 writers[shard_idx % num_shards].write(serialized)
                 shard_idx += 1
                 cluster_count += 1
@@ -432,20 +487,25 @@ def convert_h5_to_tfrecords(h5_path: str, output_dir: str, args,
     for w in writers:
         w.close()
     elapsed = time.time() - t0
-    # Write manifest
+    # Write manifest (includes min_donors for idempotency check)
     manifest = {
         "source_h5": h5_path,
         "num_clusters": cluster_count,
+        "num_clusters_skipped": skipped_count,
         "num_shards": num_shards,
-        "num_alleles": int(binder.shape[1]),
+        "num_alleles": args.num_alleles,
         "shard_paths": shard_paths,
         "pad_token": args.pad_token,
         "sep_token": args.sep_token,
+        "min_donors": min_donors,
     }
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"  [CACHE] Wrote {cluster_count} clusters to {num_shards} shards "
-          f"in {elapsed:.1f}s ({cluster_count/elapsed:.0f} clusters/s)")
+          f"in {elapsed:.1f}s ({cluster_count/max(elapsed,1e-6):.0f} clusters/s)")
+    if skipped_count > 0:
+        print(f"  [CACHE] Skipped {skipped_count} clusters with "
+              f"n_donors < {min_donors}")
     return shard_paths
 def build_tfrecord_dataset(shard_paths: List[str], args,
                            num_alleles: int,
@@ -513,7 +573,7 @@ def build_tfrecord_dataset(shard_paths: List[str], args,
                               num_parallel_calls=tf.data.AUTOTUNE)
     # ── shuffle ──────────────────────────────────────────────────────
     if shuffle:
-        dataset = dataset.shuffle(buffer_size=min(50000, 10 * args.batch_size))
+        dataset = dataset.shuffle(buffer_size=min(250000, 100 * args.batch_size), reshuffle_each_iteration=True)
     # ── batch with dynamic padding ───────────────────────────────────
     # Pad CDR and mask to max-in-batch length, donors to max-in-batch count
     pad_shapes = (
@@ -650,6 +710,8 @@ def save_config(args, output_dir: str, device_type: str,
             "resume": args.resume,
             "use_tfrecord": args.use_tfrecord,
             "num_shards": args.num_shards,
+            "keep_only_upperthan_n_donors": args.keep_only_upperthan_n_donors,
+            "tf_record_path": args.tf_record_path,
         },
         "tokens": {
             "pad": args.pad_token,
@@ -690,7 +752,7 @@ class MaskedGlobalAveragePooling(layers.Layer):
         cfg = super().get_config()
         cfg["pad_token"] = self.pad_token
         return cfg
-def build_model(args, hla_embed_matrix: Optional[np.ndarray] = None):
+def build_model(args, hla_embed_matrix: Optional[np.ndarray] = None, hla_bias_init: Optional[np.ndarray] = None):
     """
     Build the TCRtyper Keras functional model.
     Architecture:
@@ -739,9 +801,13 @@ def build_model(args, hla_embed_matrix: Optional[np.ndarray] = None):
         hla_init = tf.keras.initializers.Constant(hla_embed_matrix)
     else:
         hla_init = "glorot_uniform"
+    # Apply the log-odds as the bias initializer
+    if hla_bias_init is not None:
+        bias_init = tf.keras.initializers.Constant(hla_bias_init)
+    else:
+        bias_init = "zeros"
     z_logits = layers.Dense(
-        args.num_alleles, kernel_initializer=hla_init,
-        name="hla_head")(h)
+        args.num_alleles, kernel_initializer=hla_init, bias_initializer=bias_init, name="hla_head")(h)
     # ── assemble model ───────────────────────────────────────────────
     model = keras.Model(inputs=[inp_seq, inp_mask], outputs=z_logits,
                         name="TCRtyper")
@@ -867,16 +933,14 @@ def compute_diagnostics(z_logits, binder_dense):
         "min_active_prob": min_active_prob,
         "mean_n_active_alleles": mean_n_active,
     }
-@tf.function
-def eval_step(model, loss_fn, batch):
-    """Forward-only evaluation step.  Returns the SAME metrics as train_step
-    (except grad_norm) so validation TensorBoard curves are directly
-    comparable to training curves."""
-    z_logits = model(
-        [batch["combined_cdr"], batch["combined_mask"]], training=False)
-    nll, reg = loss_fn(z_logits, batch["binder_dense"], batch["donor_indices"])
+@tf.function(reduce_retracing=True)
+def eval_step(model, loss_fn,
+              combined_cdr, combined_mask, binder_dense, donor_indices):
+    """Forward-only evaluation step matching train_step's tensor signature."""
+    z_logits = model([combined_cdr, combined_mask], training=False)
+    nll, reg = loss_fn(z_logits, binder_dense, donor_indices)
     total_loss = nll + reg
-    diag = compute_diagnostics(z_logits, batch["binder_dense"])
+    diag = compute_diagnostics(z_logits, binder_dense)
     return {"total_loss": total_loss, "nll": nll, "reg": reg, **diag}
 # ═════════════════════════════════════════════════════════════════════
 # 8.  METRIC LOGGER (CSV + JSON + TensorBoard)
@@ -884,22 +948,21 @@ def eval_step(model, loss_fn, batch):
 import csv
 class MetricLogger:
     """Writes every epoch's averaged metrics to CSV, JSON, and TensorBoard.
-    CSV columns:  epoch, split, metric_name_1, metric_name_2, ...
-    JSON:         list of {epoch, split, metrics} dicts (full history)
-    TensorBoard:  tf.summary.scalar per metric per epoch
-    Files are flushed after every epoch so they survive crashes.
+    Args:
+        output_dir: root experiment directory
+        tb_writer:  tf.summary.FileWriter for TensorBoard
     """
     def __init__(self, output_dir: str, tb_writer):
         self.csv_path = os.path.join(output_dir, "metrics.csv")
         self.json_path = os.path.join(output_dir, "metrics.json")
         self.tb_writer = tb_writer
-        self._history: List[dict] = []
+        self._history: List[Dict] = []
         self._csv_file = None
         self._csv_writer = None
         self._header_written = False
-    def log_epoch(self, epoch: int, split: str, metrics: Dict[str, float],
-                  extra: Optional[Dict[str, float]] = None):
-        """Record one epoch's averaged metrics for a given split.
+    def log_epoch(self, epoch: int, split: str, metrics: Dict,
+                  extra: Optional[Dict] = None):
+        """Log one epoch's metrics to CSV, JSON, and TensorBoard.
         Args:
             epoch:   0-based epoch index
             split:   'train' or 'valid'
@@ -946,17 +1009,38 @@ def _prefetch_batches(reader, args, prefetch_q, max_prefetch=3):
     """Background thread: reads HDF5 chunks, prepares numpy→tf batches,
     and pushes them into a queue.  The training loop pops from the queue
     so GPU never waits for data prep.
+    Clusters with n_donors < args.keep_only_upperthan_n_donors are
+    filtered out via vectorised boolean indexing after batch preparation.
     Args:
         reader:       opened PublicTcrHlaCsrReaderChunk context
-        args:         parsed flags
+        args:         parsed flags (includes keep_only_upperthan_n_donors)
         prefetch_q:   queue.Queue shared with main thread
         max_prefetch: queue capacity (limits CPU memory usage)
     """
+    # ── cache the donor threshold for fast access ────────────────────
+    min_donors = int(args.keep_only_upperthan_n_donors)
     for chunk in reader.iter_cluster_chunks(chunk_rows=args.batch_size):
         if chunk.counts_dense is None or chunk.counts_dense.shape[0] == 0:
             continue
         if chunk.cdr_freq is None:
             continue
+        # ── donor-count filtering (vectorised boolean mask) ──────────
+        if min_donors > 1:
+            keep_mask = chunk.n_donors >= min_donors
+            # Skip entire chunk if no cluster passes the threshold
+            if not np.any(keep_mask):
+                continue
+            # If all pass, no filtering needed — fall through
+            if not np.all(keep_mask):
+                # Build batch first, then gather only kept rows
+                batch = prepare_batch(chunk, args)
+                keep_idx = tf.constant(
+                    np.where(keep_mask)[0], dtype=tf.int32)
+                batch = {k: tf.gather(v, keep_idx)
+                         for k, v in batch.items()}
+                prefetch_q.put(batch)  # blocks if queue is full
+                continue
+        # No filtering needed (all clusters pass or threshold is 1)
         batch = prepare_batch(chunk, args)
         prefetch_q.put(batch)  # blocks if queue is full
     prefetch_q.put(None)  # sentinel: end of epoch
@@ -1188,12 +1272,24 @@ def main():
     print(f"  Batch size: {args.batch_size}")
     print(f"  LR:         {args.lr}")
     print(f"  Epochs:     {args.epochs}")
+    # ── print new flags ──────────────────────────────────────────────
+    if args.keep_only_upperthan_n_donors > 1:
+        print(f"  Min donors: {args.keep_only_upperthan_n_donors} "
+              f"(clusters below this are skipped)")
+    if args.tf_record_path:
+        print(f"  TFRecord:   {args.tf_record_path} (custom path)")
     print(f"{'='*60}\n")
     # ── load donor HLA matrix ────────────────────────────────────────
     print("[DATA] Loading donor HLA matrix...")
     donor_data = np.load(args.donor_hla_matrix)
     donor_hla_matrix = donor_data["donor_hla_matrix"]
     print(f"  Donor HLA matrix shape: {donor_hla_matrix.shape}")
+    # Compute empirical allele frequencies (f_a) and their log-odds
+    # We use a small epsilon to prevent log(0) or division by zero for rare/missing alleles
+    epsilon = 1e-7
+    allele_freqs = np.clip(donor_hla_matrix.mean(axis=0), epsilon, 1.0 - epsilon)
+    hla_log_odds = np.log(allele_freqs / (1.0 - allele_freqs)).astype(np.float32)
+    print(f"  Computed log-odds bias initialization for {len(hla_log_odds)} alleles.")
     # ── load idx_to_hla ──────────────────────────────────────────────
     print("[DATA] Loading HLA index mapping...")
     with open(args.idx_to_hla, "r") as f:
@@ -1234,13 +1330,14 @@ def main():
         print("[DATA] No HLA embeddings provided — random init")
     # ── build model ──────────────────────────────────────────────────
     print("\n[MODEL] Building TCRtyper...")
-    model = build_model(args, hla_embed_matrix)
+    model = build_model(args, hla_embed_matrix, hla_bias_init=hla_log_odds)
     model.summary(line_length=100)
     # ── loss function ────────────────────────────────────────────────
     loss_fn = TCRLikelihoodLoss(
         donor_hla_matrix, beta=args.beta, pad_token=args.pad_token,
         l2_reg_lambda=args.l2_reg, reduction=args.reduction,
-        poisson_approx_untyped_hlas=args.poisson_approx)
+        poisson_approx_untyped_hlas=args.poisson_approx,
+        hla_bias_init=hla_log_odds)
     # ── count dataset size for LR schedule ───────────────────────────
     n_train = 0
     if args.mode == "train":
@@ -1279,18 +1376,23 @@ def main():
         tb_writer = tf.summary.create_file_writer(log_dir)
         metric_logger = MetricLogger(args.output_dir, tb_writer)
         # ── optional TFRecord cache conversion ───────────────────────
+        # Resolve the base directory: use tf_record_path if set,
+        # otherwise fall back to output_dir.
+        tfr_base = args.tf_record_path if args.tf_record_path else args.output_dir
         train_tfr_ds, valid_tfr_ds = None, None
         if args.use_tfrecord:
             print("\n[CACHE] Converting datasets to TFRecords ...")
+            if args.tf_record_path:
+                print(f"  [CACHE] Using custom TFRecord path: {tfr_base}")
             train_shard_paths = convert_h5_to_tfrecords(
-                args.train_ds, args.output_dir, args,
+                args.train_ds, tfr_base, args,
                 num_shards=args.num_shards, tag="train")
             train_tfr_ds = build_tfrecord_dataset(
                 train_shard_paths, args, num_alleles=args.num_alleles,
                 shuffle=True, drop_remainder=False)
             if args.valid_ds and os.path.exists(args.valid_ds):
                 valid_shard_paths = convert_h5_to_tfrecords(
-                    args.valid_ds, args.output_dir, args,
+                    args.valid_ds, tfr_base, args,
                     num_shards=max(1, args.num_shards // 4), tag="valid")
                 valid_tfr_ds = build_tfrecord_dataset(
                     valid_shard_paths, args, num_alleles=args.num_alleles,
@@ -1384,9 +1486,10 @@ def main():
         print(f"  logs/        — TensorBoard events")
         print(f"  checkpoints/ — best + latest model weights")
         if args.use_tfrecord:
-            print(f"  tfrecord_cache_train/ — cached TFRecord shards")
+            tfr_loc = args.tf_record_path if args.tf_record_path else args.output_dir
+            print(f"  {tfr_loc}/tfrecord_cache_train/ — cached TFRecord shards")
             if args.valid_ds:
-                print(f"  tfrecord_cache_valid/ — cached TFRecord shards")
+                print(f"  {tfr_loc}/tfrecord_cache_valid/ — cached TFRecord shards")
         print(f"{'='*60}")
     # ════════════════════════════════════════════════════════════════
     # INFERENCE MODE
