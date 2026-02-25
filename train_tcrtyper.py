@@ -113,6 +113,8 @@ def parse_args():
                    help="Beta-Binomial prior parameter")
     p.add_argument("--l2_reg", type=float, default=0.0,
                    help="L2 regularisation on z_logits")
+    p.add_argument("--invariant_lambda", type=float, default=0.0,
+                   help="lambda of sparsity inducing regularization term")
     p.add_argument("--reduction", type=str, default="sum",
                    choices=["sum", "mean"],
                    help="Loss reduction mode")
@@ -693,6 +695,7 @@ def save_config(args, output_dir: str, device_type: str,
             "l2_reg": args.l2_reg,
             "reduction": args.reduction,
             "poisson_approx": args.poisson_approx,
+            "invariant_lambda": args.invariant_lambda,
         },
         "training": {
             "mode": args.mode,
@@ -1213,40 +1216,55 @@ def run_inference(model, h5_path, output_path, args):
         num_clusters = reader.num_clusters
     print(f"  Total clusters: {num_clusters}")
     # Open writer
+    from tqdm import tqdm
+    import math
+    total_steps = math.ceil(num_clusters / args.batch_size)
     with MleZprobsWriter(output_path, num_clusters=num_clusters) as writer:
         with PublicTcrHlaCsrReaderChunk(
                 output_path, include_counts=True, include_donors=True,
                 include_pvals=False, include_cdr_freq=True) as reader:
-            for chunk in reader.iter_cluster_chunks(chunk_rows=args.batch_size):
+            
+            # Wrap the generator with tqdm and pass the total_steps
+            for chunk in tqdm(reader.iter_cluster_chunks(chunk_rows=args.batch_size), 
+                              total=total_steps, 
+                              desc="Inferring z_probs", 
+                              unit="batch"):
+                
                 if chunk.counts_dense is None or chunk.cdr_freq is None:
                     continue
+                
                 batch = prepare_batch(chunk, args)
+                
                 # Forward pass (no gradient)
                 z_logits = model(
                     [batch["combined_cdr"], batch["combined_mask"]],
                     training=False)
                 z_probs = tf.sigmoid(z_logits).numpy()
+                
                 # binder_sets: padded allele indices per cluster
                 binder = chunk.counts_dense  # (B, A) dense
+                
                 # Convert dense to padded sparse indices for the writer
                 binder_binary = (binder > 0).astype(np.float32)
+                
                 # Write z_probs aligned with binder indices
-                # The writer expects binder_sets (padded indices) and z_probs (padded probs)
-                # For dense z_probs we create index arrays
                 n_chunk = z_probs.shape[0]
                 max_hlas = int(binder_binary.sum(axis=1).max())
                 binder_sets_padded = np.full(
                     (n_chunk, max_hlas), args.pad_token, dtype=np.float32)
                 z_probs_padded = np.full(
                     (n_chunk, max_hlas), 0.0, dtype=np.float32)
+                
                 for i in range(n_chunk):
                     nz_idx = np.where(binder_binary[i] > 0)[0]
                     binder_sets_padded[i, :len(nz_idx)] = nz_idx
                     z_probs_padded[i, :len(nz_idx)] = z_probs[i, nz_idx]
+                
                 writer.write_chunk(
                     chunk.cluster_start, chunk.cluster_end,
                     binder_sets_padded, z_probs_padded,
                     pad_token=args.pad_token)
+                
     print(f"  ✓ Inference complete → {output_path}")
 # ═════════════════════════════════════════════════════════════════════
 # 11. MAIN
@@ -1337,7 +1355,7 @@ def main():
         donor_hla_matrix, beta=args.beta, pad_token=args.pad_token,
         l2_reg_lambda=args.l2_reg, reduction=args.reduction,
         poisson_approx_untyped_hlas=args.poisson_approx,
-        hla_bias_init=hla_log_odds)
+        hla_bias_init=hla_log_odds, invariant_lambda=args.invariant_lambda)
     # ── count dataset size for LR schedule ───────────────────────────
     n_train = 0
     if args.mode == "train":
