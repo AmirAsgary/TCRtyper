@@ -27,7 +27,7 @@ from utils import (
     assess_explanation_for_donors, analyze_model_predictions,
     evaluate_model_performance, compute_precision_at_k, 
     plot_precision_at_k_heatmap, plot_precision_at_k_curves, save_metrics_json,
-    PublicTcrHlaCsrReader
+    PublicTcrHlaCsrReader, PublicTcrHlaCsrReaderChunk  # add the new reader
 )
 
 
@@ -42,7 +42,7 @@ def parse_args():
     # Training hyperparameters
     parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs (default: 10)')
     parser.add_argument('--batch_size', type=int, default=512, help='Batch size (default: 512)')
-    parser.add_argument('--learning_rate', type=float, default=0.01, help='Learning rate (default: 0.01)')
+    parser.add_argument('--learning_rate', type=float, default=1.0, help='Learning rate (default: 0.01)')
     parser.add_argument('--beta', type=float, default=4.0, help='Beta hyperparameter (default: 4.0)')
     parser.add_argument('--l2_reg', type=float, default=1e-5, help='L2 regularization lambda (default: 1e-5)')
     parser.add_argument('--pad_token', type=float, default=-1.0, help='Padding token value (default: -1.0)')
@@ -83,18 +83,26 @@ def load_config_file(config_path):
 
 
 def load_data(data_dir, donor_matrix_path, pad_token=-1.):
-    """Load dataset and return all required arrays."""
-
+    """Load dataset and return all required arrays.
+    Supports both old (y_counts) and new (clusters/counts) HDF5 layouts
+    by trying PublicTcrHlaCsrReaderChunk first, then falling back to PublicTcrHlaCsrReader.
+    """
     data_dir = Path(data_dir)
     print(f"Loading data from {data_dir}...")
     # Load binder sets (ground truth)
     true_hla_set = np.load(data_dir / "synthetic_binder_sets.npy", mmap_mode="r")
     # Load donor indices
     donor_indices = np.load(data_dir / "synthetic_donor_indices.npy", mmap_mode="r")
-    # Load counts from H5 file
+    # Load counts from H5 file — try new chunk format first, fall back to legacy
     h5_path = data_dir / 'synthetic_tcr_hla_counts.h5'
-    with PublicTcrHlaCsrReader(str(h5_path)) as reader:
-        counts_set, max_all = reader.read_sparse_indices()
+    try:
+        with PublicTcrHlaCsrReaderChunk(str(h5_path)) as reader:
+            counts_set, max_all = reader.read_sparse_indices_of_counts()
+    except KeyError:
+        # Fall back to legacy y_counts layout
+        with PublicTcrHlaCsrReader(str(h5_path)) as reader:
+            counts_set, max_all = reader.read_sparse_indices()
+    # Pad variable-length lists into fixed-width array
     binder_sets = pad_list_to_array(counts_set, max_all, pad_token)
     # Load donor HLA matrix
     donor_hla_matrix = np.load(donor_matrix_path)['donor_hla_matrix']
@@ -109,7 +117,6 @@ def load_data(data_dir, donor_matrix_path, pad_token=-1.):
         'num_tcrs': num_tcrs, 'max_hlas_per_tcr': max_hlas_per_tcr,
         'num_alleles': num_alleles, 'num_donors': num_donors
     }
-
 
 def train_model(data, args, output_path):
     """Train the SparseTCRModel and return trained model + history."""
@@ -133,7 +140,7 @@ def train_model(data, args, output_path):
     print("Starting training...")
     history = model.fit(train_dataset, epochs=args.epochs, verbose=args.verbose)
     # Save model and history
-    model.save(os.path.join(output_path, 'model.keras'))
+    model.save_weights(os.path.join(output_path, 'model.weights.h5'))
     with open(os.path.join(output_path, 'history.json'), 'w') as f:
         json.dump({k: [float(v) for v in vals] for k, vals in history.history.items()}, f, indent=2)
     print(f"Model saved to: {output_path}")

@@ -2976,13 +2976,30 @@ class CdrFreqWriter:
 
 class TCRLikelihoodLoss(tf.keras.layers.Layer):
     """
-    Computes Negative Log-Likelihood and L2 regularization for dense TCR binding.
-    Optimized via matrix multiplication for large-scale datasets.
+    Computes the Negative Log-Likelihood for dense TCR-HLA binding prediction.
+    
+    Implements the marginalised likelihood from the manuscript:
+    
+        LL_i = Σ_{n: y_ni=1} log(p_ni) + log Γ(Ñ_i + β) - log Γ(N_i + Ñ_i + β + 1)
+    
+    where:
+        p_ni = 1 - Π_a (1 - x_na · γ_ia)       ... Eq. 7  (prob TCR i can bind donor n)
+        γ_ia = σ(z_ia)                           ... binding probability from logits
+        N_i  = Σ_n y_ni                          ... number of positive donors
+        Ñ_i  = Σ_{n: y_ni=0} p_ni               ... expected negatives (Eq. 8)
+    
+    This version avoids all intermediate precision loss by working in log-space
+    throughout, using the identities:
+        log(1 - σ(z)) = -softplus(z)             ... exact for all z
+        1 - exp(x)    = -expm1(x)                ... exact near x ≈ 0
+        log(1 - exp(x)) = log1mexp(x)            ... stable two-branch formula
     """
-    def __init__(self, donor_hla_matrix, beta=4.0, pad_token=-1., 
-                 l2_reg_lambda=1e-5, reduction='sum', 
+
+    def __init__(self, donor_hla_matrix, beta=4.0, pad_token=-1.,
+                 l2_reg_lambda=1e-5, reduction='sum',
                  poisson_approx_untyped_hlas=False,
-                 hla_bias_init=None, invariant_lambda=0.0, **kwargs):
+                 hla_bias_init=None, invariant_lambda=0.0,
+                 false_pos_lambda=0.0, **kwargs):
         super().__init__(**kwargs)
         self.beta = beta
         self.pad_token = pad_token
@@ -2990,111 +3007,264 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         self.reduction = reduction
         self.poisson_approx_untyped_hlas = poisson_approx_untyped_hlas
         self.invariant_lambda = invariant_lambda
-        
-        # self.X_T shape: (A, N) 
-        # A: Total Alleles, N: Total Donors
+        self.false_pos_lambda = false_pos_lambda
+
+        # X_T shape: (A, N) — transposed donor-allele matrix
+        # A: total alleles, N: total donors
+        # x_na ∈ {0, 1}: whether donor n carries allele a
         self.X_T = tf.constant(donor_hla_matrix.T, dtype=tf.float32)
-        # Store the prior as a constant tensor
+
+        # Prior log-odds bias: ensures γ_ia = f_a when the learned logit is zero.
+        # This corresponds to the offset term ln(f_a / (1 - f_a)) in the manuscript.
         if hla_bias_init is not None:
             self.prior_logits = tf.constant(hla_bias_init, dtype=tf.float32)
         else:
             self.prior_logits = 0.0
 
+    # ------------------------------------------------------------------
+    # Regularisation terms (applied to logits or probabilities)
+    # ------------------------------------------------------------------
+
     def logit_drift_penalty(self, z_logits):
-        """Prevents sigmoid saturation by pulling logits gently back to the empirical prior."""
+        """
+        Prevents logit explosion by penalising deviation from the cold prior.
+        
+        This serves THREE purposes:
+        1. Keeps γ small early in training → preserves (1-p_ni) gradients
+        2. Provides implicit L2 on the dot products (not the bias)
+        3. Creates a soft "innocent until proven guilty" prior:
+        alleles stay near their population baseline unless the 
+        likelihood provides strong evidence to move them
+        
+        Lambda should be small enough that the likelihood can override it
+        for truly associated alleles, but large enough to suppress
+        the rare-allele flat-gradient artifact.
+        """
         if self.l2_reg_lambda > 0:
-            # Penalize the squared distance from the prior log-odds, NOT from zero!
-            return self.l2_reg_lambda * tf.reduce_mean(tf.square(z_logits - self.prior_logits))
+            return self.l2_reg_lambda * tf.reduce_sum(
+                tf.square(z_logits - self.prior_logits)
+            )
         return 0.0
 
-    def l2_reg(self, z_logits, mask):
-        """L2 regularization normalized by valid positions."""
-        if self.l2_reg_lambda:
-            n_valid = tf.reduce_sum(mask)
-            n_valid = tf.maximum(n_valid, 1.0)  # avoid division by zero
-            return self.l2_reg_lambda * tf.reduce_sum(tf.pow(z_logits, 2) * mask) / n_valid
-        return 0.
-    
     def scale_invariant_sparsity(self, z_prob, active_mask):
         """
-        Implements lambda * (||gamma_i||_1 / ||gamma_i||_2) from the manuscript.
-        Applied only to the active (co-occurring) alleles to force the model
-        to pick a single winner from the haplotype block without shrinking the max prob.
+        Sparsity regulariser: λ · mean( ||γ_i||_1 / ||γ_i||_2 )
+        
+        Applied only over co-occurring alleles (active_mask = binder_dense_set).
+        
+        This ratio equals 1 when exactly one γ is nonzero (maximally sparse),
+        and √K when K alleles share equal probability. It encourages the model
+        to pick a single winner from correlated haplotype blocks without
+        shrinking the magnitude of the winning probability (unlike L1).
         """
         if self.invariant_lambda > 0:
-            # Mask the probabilities so we only penalize spreading among active alleles
             masked_probs = z_prob * active_mask
-            # L1 norm (sum of probabilities)
             l1 = tf.reduce_sum(masked_probs, axis=-1)
-            # L2 norm (sqrt of sum of squares, with epsilon to prevent NaN gradients)
             l2 = tf.sqrt(tf.reduce_sum(tf.square(masked_probs), axis=-1) + 1e-8)
-            # Calculate ratio per TCR, average over batch
-            sparsity_penalty = l1 / l2
-            return self.invariant_lambda * tf.reduce_mean(sparsity_penalty)
+            sparsity_ratio = l1 / l2
+            return self.invariant_lambda * tf.reduce_mean(sparsity_ratio)
         return 0.0
+
+    def false_positive_penalty(self, z_prob, inactive_mask):
+        """
+        Penalises probability mass on alleles that never co-occur with this TCR.
+        
+        Penalises: λ_fp · mean( γ_ia · (1 - binder_dense_set)_ia )
+        
+        The likelihood gradient already pushes γ_ia → 0 for non-co-occurring
+        alleles (see Eq. 30 in manuscript), but convergence can be slow when
+        the product Π_{a≠a*}(1 - γ_ia)^{x_na} is near zero. This penalty
+        provides a direct, fast-acting gradient to suppress false positives.
+        """
+        if self.false_pos_lambda > 0:
+            return self.false_pos_lambda * tf.reduce_mean(z_prob * inactive_mask)
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Stable helper: log(1 - exp(x)) for x <= 0
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def log1mexp(x):
+        """
+        Computes log(1 - exp(x)) for x <= 0 in a numerically stable way.
+        
+        This is needed for: log(p_ni) = log(1 - exp(log_prod))
+        where log_prod = Σ_a x_na · log(1 - γ_ia) <= 0.
+        
+        Two branches avoid catastrophic cancellation:
+          - When x < -0.693 (i.e. exp(x) < 0.5):
+                Use log1p(-exp(x)), since -exp(x) is well away from 0.
+          - When x >= -0.693 (i.e. exp(x) close to 1):
+                Use log(-expm1(x)), since expm1 is accurate near 0.
+        
+        Reference: Mächler (2012), "Accurately Computing log(1 − exp(−|a|))"
+        """
+        return tf.where(
+            x < -0.693,
+            tf.math.log1p(-tf.exp(x)),
+            tf.math.log(-tf.math.expm1(x))
+        )
+
+    # ------------------------------------------------------------------
+    # Main forward pass
+    # ------------------------------------------------------------------
 
     def call(self, z_logits, binder_dense_set, pos_donor_indices):
         """
         Parameters
         ----------
-        z_logits : tf.Tensor
-            Logits predicted by Transformer over ALL alleles. Shape: (B, A)
-        binder_dense_set : tf.Tensor
-            Binary mask of TCR-HLA co-occurrences. Shape: (B, A)
-        pos_donor_indices : tf.Tensor
-            Indices of positive donors (padded with pad_token). Shape: (B, P)
+        z_logits : tf.Tensor, shape (B, A)
+            Raw logits from the model. γ_ia = σ(z_ia).
+        binder_dense_set : tf.Tensor, shape (B, A)
+            Binary mask: 1 if TCR i and allele a co-occur in at least one donor.
+        pos_donor_indices : tf.Tensor, shape (B, P)
+            Indices of positive donors for each TCR (padded with pad_token).
+
+        Returns
+        -------
+        nll : scalar
+            Negative log-likelihood (summed or averaged over batch).
+        total_reg : scalar
+            Sum of all regularisation terms.
         """
-        # 1. Masking and Probabilities
-        mask = tf.cast(binder_dense_set, tf.float32)
-        
-        # z_prob (gamma_ia) shape: (B, A) 
-        z_prob = tf.sigmoid(z_logits) #* mask
-        #### Regularizations
-        # 2A. Push toward hla background frequency
-        regularization_term = self.logit_drift_penalty(z_logits)
-        # 2B. Pushes probs to 0.5
-        #regularization_term = self.l2_reg(z_logits, mask)
-        # 2C. Induces Sparsity in Z prob
-        regularization_sparsity = self.scale_invariant_sparsity(z_prob, mask)
-        # 3. Likelihood Calculation (p_ni)
+
+        # ============================================================
+        # 1. Masks and probabilities
+        # ============================================================
+        mask = tf.cast(binder_dense_set, tf.float32)       # (B, A) co-occurrence mask
+        inactive_mask = 1.0 - mask                          # alleles that do NOT co-occur
+
+        # γ_ia = σ(z_ia) — only needed for the regularisers.
+        # The likelihood itself works entirely through z_logits.
+        z_prob = tf.sigmoid(z_logits)                       # (B, A)
+
+        # ============================================================
+        # 2. Regularisation (uses z_logits and z_prob)
+        # ============================================================
+        reg_drift = self.logit_drift_penalty(z_logits)
+        reg_sparsity = self.scale_invariant_sparsity(z_prob, mask)
+        reg_false_pos = self.false_positive_penalty(z_prob, inactive_mask)
+
+        # ============================================================
+        # 3. Core likelihood: compute p_ni and log(p_ni)
+        # ============================================================
+        #
+        # From Eq. 7:  p_ni = 1 - Π_a (1 - x_na · γ_ia)
+        #
+        # For binary x_na: (1 - x_na · γ_ia) = (1 - γ_ia)^{x_na}
+        #   so  log Π_a (...) = Σ_a x_na · log(1 - γ_ia)
+        #
+        # Key identity:  log(1 - σ(z)) = log(σ(-z)) = -softplus(z)
+        #   This is exact and avoids computing σ(z) then log(1 - σ(z)),
+        #   which catastrophically loses precision when z >> 0 (γ ≈ 1).
+        #
+        # So:  log(1 - γ_ia) = -softplus(z_ia)
+
         if self.poisson_approx_untyped_hlas:
-            # MODE: Continuous x_na (Poisson Approximation)
-            # p_ni = 1 - exp(-sum(x_na * gamma_ia))
-            sum_x_gamma = tf.matmul(z_prob, self.X_T) # (B, A) @ (A, N) -> (B, N)
-            p_ni = 1.0 - tf.exp(-sum_x_gamma)
+            # -----------------------------------------------------------
+            # MODE A: Poisson approximation (for continuous x_na)
+            #
+            #   p_ni ≈ 1 - exp(-Σ_a x_na · γ_ia)
+            #
+            # This comes from: 1 - x_na·γ_ia ≈ exp(-x_na·γ_ia)
+            # Valid when x_na·γ_ia is small, which holds for continuous
+            # x_na from incomplete HLA typing.
+            # -----------------------------------------------------------
+            sum_x_gamma = tf.matmul(z_prob, self.X_T)       # (B, N): Σ_a γ_ia · x_na
+            # p_ni = 1 - exp(-sum) — use expm1 for stability near 0
+            p_ni = -tf.math.expm1(-sum_x_gamma)             # (B, N)
+            # log(p_ni) = log(1 - exp(-sum))
+            log_p_ni = self.log1mexp(-sum_x_gamma)          # (B, N)
+
         else:
-            # MODE: Binary x_na (Exact Calculation)
-            # p_ni = 1 - exp(sum(x_na * log(1 - gamma_ia)))
-            z_prob_safe = tf.minimum(z_prob, 1.0 - 1e-7)
-            log_1_minus_z = tf.math.log(1.0 - z_prob_safe)
-            log_prod = tf.matmul(log_1_minus_z, self.X_T) # (B, A) @ (A, N) -> (B, N)
-            p_ni = 1.0 - tf.exp(log_prod)
-            
-        p_ni_safe = p_ni + 1e-7 #tf.maximum(p_ni, 1e-7)
-        
-        # 4. Positive Donors (Reward)
+            # -----------------------------------------------------------
+            # MODE B: Exact binary calculation
+            #
+            #   log_prod_ni = Σ_a x_na · log(1 - γ_ia)
+            #                = matmul( -softplus(z), X^T )
+            #
+            # Then:
+            #   p_ni     = 1 - exp(log_prod)  = -expm1(log_prod)
+            #   log(p_ni) = log(1 - exp(log_prod)) = log1mexp(log_prod)
+            #
+            # Note: log_prod <= 0 always (sum of non-positive terms).
+            # -----------------------------------------------------------
+            log_1_minus_gamma = -tf.math.softplus(z_logits)  # (B, A): exact log(1 - γ_ia)
+            log_prod = tf.matmul(log_1_minus_gamma, self.X_T)  # (B, N): Σ_a x_na log(1 - γ_ia)
+
+            p_ni = -tf.math.expm1(log_prod)                 # (B, N): exact 1 - exp(log_prod)
+            log_p_ni = self.log1mexp(log_prod)               # (B, N): exact log(p_ni)
+
+        # ============================================================
+        # 4. Positive donors: reward term
+        # ============================================================
+        #
+        # From Eq. 15:  reward = Σ_{n: y_ni=1} log(p_ni)
+        #
+        # pos_donor_indices (B, P) contains the indices of donors where
+        # TCR i was observed, padded with pad_token for variable lengths.
+        # We gather log(p_ni) directly — no epsilon needed since log1mexp
+        # handles the full range.
+
         safe_pos_indices = tf.maximum(pos_donor_indices, 0)
-        pos_mask = tf.cast(tf.not_equal(pos_donor_indices, tf.cast(self.pad_token, tf.int32)), tf.float32)
-        
-        # p_pos shape: (B, P)
-        p_pos = tf.gather(p_ni_safe, safe_pos_indices, batch_dims=1)
-        reward = tf.reduce_sum(tf.math.log(p_pos) * pos_mask, axis=1)
-        
-        # 5. Negative Donors (Penalty via Beta-Binomial)
-        n_i = tf.reduce_sum(pos_mask, axis=1)
-        sum_p_all = tf.reduce_sum(p_ni_safe, axis=1)
-        sum_p_pos = tf.reduce_sum(p_pos * pos_mask, axis=1)
-        n_tilde = sum_p_all - sum_p_pos
-        
-        penalty = tf.math.lgamma(n_tilde + self.beta) - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
-        log_likelihood = reward + penalty
-        
-        # 6. Reduction
+        pos_mask = tf.cast(
+            tf.not_equal(pos_donor_indices, tf.cast(self.pad_token, tf.int32)),
+            tf.float32
+        )  # (B, P): 1 for real donors, 0 for padding
+
+        # Gather log(p_ni) for positive donors
+        log_p_pos = tf.gather(log_p_ni, safe_pos_indices, batch_dims=1)  # (B, P)
+        reward = tf.reduce_sum(log_p_pos * pos_mask, axis=1)             # (B,)
+
+        # N_i = number of positive donors per TCR (Eq. 8)
+        n_i = tf.reduce_sum(pos_mask, axis=1)                            # (B,)
+
+        # ============================================================
+        # 5. Negative donors: Beta-Binomial penalty term
+        # ============================================================
+        #
+        # From Eq. 8:   Ñ_i = Σ_{n: y_ni=0} p_ni
+        #
+        # We compute this as: Ñ_i = (Σ_n p_ni) - (Σ_{n: y_ni=1} p_ni)
+        # This avoids needing a (B, N) negative-donor mask.
+        #
+        # We use clean p_ni (no epsilon) so the lgamma terms are unbiased.
+
+        sum_p_all = tf.reduce_sum(p_ni, axis=1)                          # (B,)
+        p_pos = tf.gather(p_ni, safe_pos_indices, batch_dims=1)          # (B, P)
+        sum_p_pos = tf.reduce_sum(p_pos * pos_mask, axis=1)              # (B,)
+        n_tilde = sum_p_all - sum_p_pos                                  # (B,): Ñ_i
+
+        # From Eq. 13 (dropping constants w.r.t. γ):
+        #
+        #   penalty = log Γ(Ñ_i + β) - log Γ(N_i + Ñ_i + β + 1)
+        #
+        # The full Beta-Binomial normaliser is:
+        #   β · Γ(N_i + 1) · Γ(Ñ_i + β) / Γ(N_i + Ñ_i + β + 1)
+        #
+        # Since Γ(N_i + 1) = N_i! and β are constant w.r.t. γ, we drop them.
+        # This term penalises solutions where many negative donors have high p_ni,
+        # which would indicate the model is predicting binding to too many alleles.
+
+        penalty = (
+            tf.math.lgamma(n_tilde + self.beta)
+            - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
+        )  # (B,)
+
+        # ============================================================
+        # 6. Combine: LL_i = reward + penalty
+        # ============================================================
+        log_likelihood = reward + penalty                                 # (B,)
+
         if self.reduction == 'sum':
             nll = -tf.reduce_sum(log_likelihood)
         else:
             nll = -tf.reduce_mean(log_likelihood)
-        return nll, regularization_term + regularization_sparsity
+
+        total_reg = reg_drift + reg_sparsity + reg_false_pos
+
+        return nll, total_reg
 
 
 import re
@@ -3287,15 +3457,6 @@ def encode_msa_frequencies(freq_batch):
     freq_batch = tf.cast(freq_batch, tf.float32)
     return tf.matmul(freq_batch, BLOSUM_TENSOR)
 
-
-@tf.function(jit_compile=True)
-def encode_msa_frequencies(freq_batch):
-    """BLOSUM62-weighted averaging on MSA frequency tensors.
-    Args:  freq_batch  (B, L, 21) float32, rows should sum to 1.
-    Returns: (B, L, 21) expected BLOSUM scores.
-    """
-    freq_batch = tf.cast(freq_batch, tf.float32)
-    return tf.matmul(freq_batch, BLOSUM_TENSOR)
 
 
 # ======================================================================

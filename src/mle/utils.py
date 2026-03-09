@@ -983,97 +983,127 @@ def analyze_model_predictions(model, binder_sets, num_total_alleles, threshold=0
     }
 
 
-def evaluate_model_performance(model, binder_sets, true_hla_set, num_total_alleles=440, 
+def evaluate_model_performance(model, binder_sets, true_hla_set, num_total_alleles=440,
                                 output_path=None, pad_token=-1.):
-    """Calculate PR Curve, ROC Curve, and statistical metrics (optimized sparse version)."""
+    """Calculate PR Curve, ROC Curve, and statistical metrics (optimized sparse version).
+    Handles non-candidate alleles (implicit prob=0) by appending boundary points
+    so that ROC spans [0,1] on both axes and PR covers full recall range.
+    """
     if output_path: os.makedirs(output_path, exist_ok=True)
     print(f"\n--- Performance Evaluation (PR & ROC) ---")
-    
+    # Extract trained probabilities from z_embedding
     z_logits = model.z_embedding.get_weights()[0]
     candidate_probs = tf.sigmoid(z_logits).numpy()
     num_tcrs = binder_sets.shape[0]
-    
-    # Build sparse representation
+    # Build sparse representation of candidate predictions
     valid_mask = (binder_sets != pad_token)
     pred_probs_sparse = candidate_probs[valid_mask]
     pred_allele_ids = binder_sets[valid_mask].astype(int)
     pred_tcr_ids = np.repeat(np.arange(num_tcrs), binder_sets.shape[1])[valid_mask.flatten()]
-    
-    # True allele lookup
+    # Build true allele lookup sets per TCR
     true_allele_sets = []
     for i in range(num_tcrs):
         valid_true = true_hla_set[i] >= 0
         true_allele_sets.append(set(true_hla_set[i][valid_true].astype(int)))
-    
-    # Create binary labels
+    # Create binary labels for each candidate prediction
     y_true_sparse = np.array([
         1 if pred_allele_ids[j] in true_allele_sets[pred_tcr_ids[j]] else 0
         for j in range(len(pred_probs_sparse))
     ], dtype=np.int32)
-    
+    # Count positives and negatives across the full allele space
     total_true_positives = sum(len(s) for s in true_allele_sets)
-    true_positives_in_candidates = np.sum(y_true_sparse)
+    true_positives_in_candidates = int(np.sum(y_true_sparse))
     fn_from_non_candidates = total_true_positives - true_positives_in_candidates
     total_negatives = num_tcrs * num_total_alleles - total_true_positives
-    
-    # Sort by probability descending
+    neg_in_candidates = int(np.sum(1 - y_true_sparse))
+    neg_outside_candidates = total_negatives - neg_in_candidates
+    # Sort candidate predictions by descending probability
     sorted_indices = np.argsort(-pred_probs_sparse)
     y_true_sorted = y_true_sparse[sorted_indices]
     y_pred_sorted = pred_probs_sparse[sorted_indices]
-    
-    tps = np.cumsum(y_true_sorted)
-    fps = np.cumsum(1 - y_true_sorted)
-    
-    # Compute curves
-    precision = tps / (tps + fps + 1e-7)
-    recall = tps / (total_true_positives + 1e-7)
-    fpr = fps / (total_negatives + 1e-7)
-    tpr = recall
-    
-    # Metrics
-    roc_auc = np.trapz(tpr, fpr)
-    average_precision = np.sum(np.diff(np.concatenate([[0], recall])) * precision)
-    f1_scores = 2 * (precision * recall) / (precision + recall + 1e-7)
-    best_f1_idx = np.argmax(f1_scores)
-    best_threshold = y_pred_sorted[best_f1_idx] if best_f1_idx < len(y_pred_sorted) else 0.5
-    best_f1 = f1_scores[best_f1_idx]
-    
+    # Cumulative TP and FP along the sorted candidate list
+    tps_cand = np.cumsum(y_true_sorted)
+    fps_cand = np.cumsum(1 - y_true_sorted)
+    # --- Build complete curves including non-candidate boundary ---
+    # After exhausting all candidates at threshold->0, non-candidate pairs
+    # (all at implicit prob=0) contribute additional FN and TN.
+    # Append one final point: all non-candidate positives become TP,
+    # all non-candidate negatives become FP (threshold below any candidate).
+    tps_full = np.concatenate([[0], tps_cand, [tps_cand[-1] + fn_from_non_candidates]])
+    fps_full = np.concatenate([[0], fps_cand, [fps_cand[-1] + neg_outside_candidates]])
+    # Compute ROC: TPR = TP / total_positives, FPR = FP / total_negatives
+    tpr = tps_full / max(total_true_positives, 1)
+    fpr = fps_full / max(total_negatives, 1)
+    # Compute PR: Precision = TP / (TP + FP), Recall = TP / total_positives
+    recall = tps_full / max(total_true_positives, 1)
+    precision = np.divide(tps_full, tps_full + fps_full,
+                          out=np.ones_like(tps_full, dtype=np.float64),
+                          where=(tps_full + fps_full) > 0)
+    # --- Metrics ---
+    # AUC-ROC via trapezoidal integration over the complete curve
+    roc_auc = float(np.trapz(tpr, fpr))
+    # Average precision: sum of precision * delta-recall
+    delta_recall = np.diff(recall)
+    average_precision = float(np.sum(delta_recall * precision[1:]))
+    # Best F1 score (only over candidate thresholds, indices 1:-1)
+    p_cand = precision[1:-1]
+    r_cand = recall[1:-1]
+    f1_scores = 2 * (p_cand * r_cand) / (p_cand + r_cand + 1e-7)
+    best_f1_idx = int(np.argmax(f1_scores))
+    best_threshold = float(y_pred_sorted[best_f1_idx]) if best_f1_idx < len(y_pred_sorted) else 0.5
+    best_f1 = float(f1_scores[best_f1_idx])
     print(f"AUC ROC: {roc_auc:.5f} | AP: {average_precision:.5f} | Best F1: {best_f1:.5f}")
-    
+    print(f"  Candidates: {len(pred_probs_sparse)} | TP in candidates: {true_positives_in_candidates}/{total_true_positives}")
+    # --- Plotting ---
     if output_path:
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        # PR curve
         axes[0].plot(recall, precision, color='#2ca02c', lw=2, label=f'AP = {average_precision:.3f}')
         axes[0].set_title('Precision-Recall Curve')
         axes[0].set_xlabel('Recall')
         axes[0].set_ylabel('Precision')
+        axes[0].set_xlim([0, 1.02])
+        axes[0].set_ylim([0, 1.02])
         axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        # ROC curve
         axes[1].plot(fpr, tpr, color='#1f77b4', lw=2, label=f'AUC = {roc_auc:.3f}')
         axes[1].plot([0, 1], [0, 1], 'gray', linestyle='--')
         axes[1].set_title('ROC Curve')
         axes[1].set_xlabel('FPR')
         axes[1].set_ylabel('TPR')
+        axes[1].set_xlim([0, 1.02])
+        axes[1].set_ylim([0, 1.02])
         axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
         plt.tight_layout()
         fig.savefig(os.path.join(output_path, "performance_curves.png"), dpi=150, bbox_inches='tight')
         fig.savefig(os.path.join(output_path, "performance_curves.pdf"), bbox_inches='tight')
         plt.close(fig)
-        np.savez(os.path.join(output_path, "curve_data.npz"), precision=precision, recall=recall,
-                 fpr=fpr, tpr=tpr, y_pred_sorted=y_pred_sorted)
-    
+        # Save curve data for later use
+        np.savez(os.path.join(output_path, "curve_data.npz"),
+                 precision=precision, recall=recall, fpr=fpr, tpr=tpr,
+                 y_pred_sorted=y_pred_sorted,
+                 total_true_positives=total_true_positives,
+                 total_negatives=total_negatives,
+                 fn_from_non_candidates=fn_from_non_candidates)
     return {'auc': roc_auc, 'ap': average_precision, 'best_f1': best_f1, 'best_threshold': best_threshold}
 
 
 def compute_precision_at_k(output_dir, data_dir, max_k=20, pad_token=-1.):
     """Compute Precision@k and Recall@k for k=1,2,...,max_k."""
     output_dir, data_dir = Path(output_dir), Path(data_dir)
-    
     arrays_path = output_dir / "figures" / "analysis_arrays.npz"
     arrays = np.load(arrays_path)
     trained_probs = arrays['trained_probs']
-    
+    # Load counts — try new chunk format first, fall back to legacy
     h5_path = data_dir / 'synthetic_tcr_hla_counts.h5'
-    with PublicTcrHlaCsrReader(str(h5_path)) as reader:
-        counts_set, max_all = reader.read_sparse_indices()
+    try:
+        with PublicTcrHlaCsrReaderChunk(str(h5_path)) as reader:
+            counts_set, max_all = reader.read_sparse_indices_of_counts()
+    except KeyError:
+        with PublicTcrHlaCsrReader(str(h5_path)) as reader:
+            counts_set, max_all = reader.read_sparse_indices()
     
     num_tcrs = len(counts_set)
     binder_sets = np.full((num_tcrs, max_all), pad_token)
