@@ -124,6 +124,20 @@ def parse_args():
                    help="Loss reduction mode")
     p.add_argument("--poisson_approx", action="store_true", default=False,
                    help="Use Poisson approximation for untyped HLAs")
+    p.add_argument('--alpha_0', type=float, default=1.0,
+                        help='Alpha_0 MAP hyperparameter (default: 1.0)')
+    p.add_argument('--alpha_1', type=float, default=1.5,
+                        help='Alpha_1 MAP hyperparameter (default: 2.5)')
+    p.add_argument('--alpha', type=float, default=2.0,
+                        help='Alpha MAP hyperparameter (default: 2.0, Exponential)')
+    p.add_argument('--B', type=float, default=30.0,
+                        help='B MAP hyperparameter (default: 30.0)')         
+    p.add_argument("--diversity_lambda", type=float, default=0.0,
+                    help="Weight for batch-level allele diversity penalty. "
+                        "Maximises entropy of batch-marginal allele usage "
+                        "to prevent mode collapse.")
+    p.add_argument("--map_weight", type=float, default=1.0,
+                    help="weight for prior in MAP.")
     # ── training hyper-parameters ────────────────────────────────────
     p.add_argument("--batch_size", type=int, default=1024,
                    help="Cluster-level batch size (chunk_rows)")
@@ -1133,8 +1147,8 @@ def train_step_lean(model, loss_fn, optimizer,
     """
     with tf.GradientTape() as tape:
         z_logits = model([combined_cdr, combined_mask], training=True)
-        nll, reg = loss_fn(z_logits, binder_dense, donor_indices)
-        total_loss = nll + reg
+        nll, reg, total_map = loss_fn(z_logits, binder_dense, donor_indices)
+        total_loss = nll + reg + total_map
         # Mixed-precision: scale loss to prevent float16 underflow
         if hasattr(optimizer, "get_scaled_loss"):
             scaled_loss = optimizer.get_scaled_loss(total_loss)
@@ -1152,7 +1166,7 @@ def train_step_lean(model, loss_fn, optimizer,
     else:
         grad_norm = tf.linalg.global_norm(grads)
     optimizer.apply_gradients(zip(grads, trainable_vars))
-    return {"total_loss": total_loss, "nll": nll, "reg": reg,
+    return {"total_loss": total_loss, "nll": nll, "reg": reg, "total_map": total_map,
             "grad_norm": grad_norm}
 
 
@@ -1173,8 +1187,8 @@ def train_step_with_diag(model, loss_fn, optimizer,
     """
     with tf.GradientTape() as tape:
         z_logits = model([combined_cdr, combined_mask], training=True)
-        nll, reg = loss_fn(z_logits, binder_dense, donor_indices)
-        total_loss = nll + reg
+        nll, reg, total_map = loss_fn(z_logits, binder_dense, donor_indices)
+        total_loss = nll + reg + total_map
         # Mixed-precision: scale loss to prevent float16 underflow
         if hasattr(optimizer, "get_scaled_loss"):
             scaled_loss = optimizer.get_scaled_loss(total_loss)
@@ -1193,7 +1207,7 @@ def train_step_with_diag(model, loss_fn, optimizer,
         grad_norm = tf.linalg.global_norm(grads)
     optimizer.apply_gradients(zip(grads, trainable_vars))
     diag = compute_diagnostics(z_logits, binder_dense, model)
-    return {"total_loss": total_loss, "nll": nll, "reg": reg,
+    return {"total_loss": total_loss, "nll": nll, "reg": reg, "total_map":total_map,
             "grad_norm": grad_norm, **diag}
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1286,36 +1300,36 @@ def compute_diagnostics(z_logits, binder_dense, model=None):
         "max_batch_frac_global": max_batch_fraction_global,
         # ── top-5 global: idx, mean_prob, co-occurrence fraction ──
         "top5g_idx_0": tf.cast(top5g_idx[0], tf.float32),
-        "top5g_idx_1": tf.cast(top5g_idx[1], tf.float32),
-        "top5g_idx_2": tf.cast(top5g_idx[2], tf.float32),
-        "top5g_idx_3": tf.cast(top5g_idx[3], tf.float32),
-        "top5g_idx_4": tf.cast(top5g_idx[4], tf.float32),
+        #"top5g_idx_1": tf.cast(top5g_idx[1], tf.float32),
+        #"top5g_idx_2": tf.cast(top5g_idx[2], tf.float32),
+        #"top5g_idx_3": tf.cast(top5g_idx[3], tf.float32),
+        #"top5g_idx_4": tf.cast(top5g_idx[4], tf.float32),
         "top5g_prob_0": top5g_prob[0],
-        "top5g_prob_1": top5g_prob[1],
-        "top5g_prob_2": top5g_prob[2],
-        "top5g_prob_3": top5g_prob[3],
-        "top5g_prob_4": top5g_prob[4],
+        #"top5g_prob_1": top5g_prob[1],
+        #"top5g_prob_2": top5g_prob[2],
+        #"top5g_prob_3": top5g_prob[3],
+        #"top5g_prob_4": top5g_prob[4],
         "top5g_frac_0": top5g_frac[0],
-        "top5g_frac_1": top5g_frac[1],
-        "top5g_frac_2": top5g_frac[2],
-        "top5g_frac_3": top5g_frac[3],
-        "top5g_frac_4": top5g_frac[4],
+        #"top5g_frac_1": top5g_frac[1],
+        #"top5g_frac_2": top5g_frac[2],
+        #"top5g_frac_3": top5g_frac[3],
+        #"top5g_frac_4": top5g_frac[4],
         # ── top-5 active: idx, mean_prob, co-occurrence fraction ──
         "top5a_idx_0": tf.cast(top5a_idx[0], tf.float32),
-        "top5a_idx_1": tf.cast(top5a_idx[1], tf.float32),
-        "top5a_idx_2": tf.cast(top5a_idx[2], tf.float32),
-        "top5a_idx_3": tf.cast(top5a_idx[3], tf.float32),
-        "top5a_idx_4": tf.cast(top5a_idx[4], tf.float32),
+        #"top5a_idx_1": tf.cast(top5a_idx[1], tf.float32),
+        #"top5a_idx_2": tf.cast(top5a_idx[2], tf.float32),
+        #"top5a_idx_3": tf.cast(top5a_idx[3], tf.float32),
+        #"top5a_idx_4": tf.cast(top5a_idx[4], tf.float32),
         "top5a_prob_0": top5a_prob[0],
-        "top5a_prob_1": top5a_prob[1],
-        "top5a_prob_2": top5a_prob[2],
-        "top5a_prob_3": top5a_prob[3],
-        "top5a_prob_4": top5a_prob[4],
+        #"top5a_prob_1": top5a_prob[1],
+        #"top5a_prob_2": top5a_prob[2],
+        #"top5a_prob_3": top5a_prob[3],
+        #"top5a_prob_4": top5a_prob[4],
         "top5a_frac_0": top5a_frac[0],
-        "top5a_frac_1": top5a_frac[1],
-        "top5a_frac_2": top5a_frac[2],
-        "top5a_frac_3": top5a_frac[3],
-        "top5a_frac_4": top5a_frac[4],
+        #"top5a_frac_1": top5a_frac[1],
+        #"top5a_frac_2": top5a_frac[2],
+        #"top5a_frac_3": top5a_frac[3],
+        #"top5a_frac_4": top5a_frac[4],
         "temperature": temperature, 
     }
 
@@ -1324,10 +1338,10 @@ def eval_step(model, loss_fn,
               combined_cdr, combined_mask, binder_dense, donor_indices):
     """Forward-only evaluation step matching train_step's tensor signature."""
     z_logits = model([combined_cdr, combined_mask], training=False)
-    nll, reg = loss_fn(z_logits, binder_dense, donor_indices)
-    total_loss = nll + reg
+    nll, reg, total_map = loss_fn(z_logits, binder_dense, donor_indices)
+    total_loss = nll + reg, total_map
     diag = compute_diagnostics(z_logits, binder_dense, model)
-    return {"total_loss": total_loss, "nll": nll, "reg": reg, **diag}
+    return {"total_loss": total_loss, "nll": nll, "reg": reg, "total_map": total_map, **diag}
 # ═════════════════════════════════════════════════════════════════════
 # 8.  METRIC LOGGER (CSV + JSON + TensorBoard)
 # ═════════════════════════════════════════════════════════════════════
@@ -1497,6 +1511,7 @@ def run_epoch(model, loss_fn, optimizer, h5_path, args,
                   f"loss={float(metrics['total_loss']):.4f} "
                   f"nll={float(metrics['nll']):.4f} "
                   f"reg={float(metrics['reg']):.6f} "
+                  f"total_map={float(metrics['total_map']):.4f}"
                   f"gnorm={float(metrics.get('grad_norm', 0)):.3f}")
         if is_train:
             global_step += 1
@@ -1877,7 +1892,12 @@ def main():
         l2_reg_lambda=args.l2_reg, reduction=args.reduction,
         poisson_approx_untyped_hlas=args.poisson_approx,
         hla_bias_init=hla_log_odds, invariant_lambda=args.invariant_lambda,
-        false_pos_lambda=args.false_pos_lambda)
+        false_pos_lambda=args.false_pos_lambda, alpha_0=args.alpha_0,
+        alpha_1=args.alpha_1,
+        alpha=args.alpha,
+        B=args.B,
+        diversity_lambda=args.diversity_lambda,
+        map_weight=args.map_weight,)
     # ── count dataset size for LR schedule ───────────────────────────
     n_train = 0
     if args.mode == "train":

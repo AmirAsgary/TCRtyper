@@ -30,33 +30,279 @@ from utils import (
     PublicTcrHlaCsrReader, PublicTcrHlaCsrReaderChunk  # add the new reader
 )
 
+# ---------- Macro-averaging helpers ----------
+from sklearn.metrics import roc_auc_score, average_precision_score
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend for servers
+import matplotlib.pyplot as plt
+
+
+def compute_macro_metrics(model, binder_sets, true_hla_set, num_tcrs,
+                          num_alleles, pad_token=-1.0):
+    """Compute per-TCR ROC-AUC and AP (macro-averaged) in two evaluation modes.
+
+    **full_space** — all ``num_alleles`` are evaluated; non-candidate alleles
+    receive prob = 0.  This penalises the model for true positives that were
+    never among its candidates (they are tied with non-candidate negatives).
+
+    **candidate_only** — only candidate alleles (those in ``binder_sets``)
+    are evaluated per TCR.  This measures how well the model *ranks within
+    its candidate set*, independent of candidate selection quality.
+
+    Returns
+    -------
+    dict  with keys (prefixed by scope ``full_`` or ``cand_``):
+        per_tcr_auc_full, per_tcr_ap_full, valid_tcr_indices_full
+        per_tcr_auc_cand, per_tcr_ap_cand, valid_tcr_indices_cand
+        median_auc_full … / median_auc_cand …   (+ mean, std, q25, q75)
+        num_valid_tcrs_full, num_valid_tcrs_cand
+        candidate_recall  — fraction of TPs that are in the candidate set
+    """
+    # Extract candidate probabilities (same as evaluate_model_performance)
+    z_logits = model.z_embedding.get_weights()[0]            # (num_tcrs, max_hlas)
+    candidate_probs = 1.0 / (1.0 + np.exp(-z_logits))       # sigmoid, numpy
+    valid_candidate_mask = (binder_sets != pad_token)         # (num_tcrs, max_hlas)
+
+    # Accumulators for both modes
+    full_auc,  full_ap,  full_idx  = [], [], []
+    cand_auc,  cand_ap,  cand_idx  = [], [], []
+    total_tp, tp_in_candidates = 0, 0
+
+    for i in range(num_tcrs):
+        # Ground-truth alleles
+        true_alleles = np.asarray(true_hla_set[i])
+        true_alleles = true_alleles[true_alleles >= 0].astype(int)
+        if len(true_alleles) == 0:
+            continue
+        true_set = set(true_alleles)
+        total_tp += len(true_set)
+
+        # Candidate info for this TCR
+        cand_mask_i = valid_candidate_mask[i]
+        cand_ids = binder_sets[i][cand_mask_i].astype(int)
+        cand_probs_i = candidate_probs[i][cand_mask_i]
+        cand_set = set(cand_ids)
+        tp_in_candidates += len(true_set & cand_set)
+
+        # ── Full-space evaluation ──
+        if len(true_alleles) < num_alleles:          # need both classes
+            y_true_full = np.zeros(num_alleles, dtype=np.float32)
+            y_pred_full = np.zeros(num_alleles, dtype=np.float32)
+            y_true_full[true_alleles] = 1.0
+            y_pred_full[cand_ids] = cand_probs_i
+
+            full_auc.append(roc_auc_score(y_true_full, y_pred_full))
+            full_ap.append(average_precision_score(y_true_full, y_pred_full))
+            full_idx.append(i)
+
+        # ── Candidate-only evaluation ──
+        n_cand = len(cand_ids)
+        if n_cand >= 2:
+            y_true_cand = np.array(
+                [1.0 if aid in true_set else 0.0 for aid in cand_ids],
+                dtype=np.float32,
+            )
+            n_pos_cand = int(y_true_cand.sum())
+            n_neg_cand = n_cand - n_pos_cand
+            if n_pos_cand > 0 and n_neg_cand > 0:
+                cand_auc.append(roc_auc_score(y_true_cand, cand_probs_i))
+                cand_ap.append(average_precision_score(y_true_cand, cand_probs_i))
+                cand_idx.append(i)
+
+    # Convert to arrays
+    full_auc = np.asarray(full_auc)
+    full_ap  = np.asarray(full_ap)
+    cand_auc = np.asarray(cand_auc)
+    cand_ap  = np.asarray(cand_ap)
+
+    def _stat_block(auc_arr, ap_arr, suffix):
+        out = {}
+        for arr, name in [(auc_arr, "auc"), (ap_arr, "ap")]:
+            if len(arr) == 0:
+                for s in ("median", "mean", "std", "q25", "q75"):
+                    out[f"{s}_{name}_{suffix}"] = 0.0
+            else:
+                out[f"median_{name}_{suffix}"] = float(np.median(arr))
+                out[f"mean_{name}_{suffix}"]   = float(np.mean(arr))
+                out[f"std_{name}_{suffix}"]    = float(np.std(arr))
+                out[f"q25_{name}_{suffix}"]    = float(np.percentile(arr, 25))
+                out[f"q75_{name}_{suffix}"]    = float(np.percentile(arr, 75))
+        return out
+
+    result = {
+        # Raw arrays (for plots / downstream)
+        "per_tcr_auc_full":        full_auc,
+        "per_tcr_ap_full":         full_ap,
+        "valid_tcr_indices_full":  np.array(full_idx),
+        "num_valid_tcrs_full":     len(full_idx),
+        "per_tcr_auc_cand":        cand_auc,
+        "per_tcr_ap_cand":         cand_ap,
+        "valid_tcr_indices_cand":  np.array(cand_idx),
+        "num_valid_tcrs_cand":     len(cand_idx),
+        # What fraction of ground-truth positives are candidates at all
+        "candidate_recall":        tp_in_candidates / max(total_tp, 1),
+        # Legacy aliases so old key names still work (point to full-space)
+        "per_tcr_auc":             full_auc,
+        "per_tcr_ap":              full_ap,
+        "valid_tcr_indices":       np.array(full_idx),
+        "num_valid_tcrs":          len(full_idx),
+    }
+    result.update(_stat_block(full_auc, full_ap, "full"))
+    result.update(_stat_block(cand_auc, cand_ap, "cand"))
+    # Legacy un-suffixed stats (point to full-space)
+    result.update({
+        "median_auc": result.get("median_auc_full", 0.0),
+        "mean_auc":   result.get("mean_auc_full", 0.0),
+        "std_auc":    result.get("std_auc_full", 0.0),
+        "q25_auc":    result.get("q25_auc_full", 0.0),
+        "q75_auc":    result.get("q75_auc_full", 0.0),
+        "median_ap":  result.get("median_ap_full", 0.0),
+        "mean_ap":    result.get("mean_ap_full", 0.0),
+        "std_ap":     result.get("std_ap_full", 0.0),
+        "q25_ap":     result.get("q25_ap_full", 0.0),
+        "q75_ap":     result.get("q75_ap_full", 0.0),
+    })
+    return result
+
+
+def plot_macro_metrics(macro_results, output_path):
+    """Save distribution plots for per-TCR AUC and AP (both evaluation modes)."""
+
+    def _plot_pair(auc_arr, ap_arr, med_auc, med_ap, label_suffix, fname_suffix):
+        """Histogram + boxplot for one evaluation mode."""
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # AUC histogram
+        ax = axes[0]
+        ax.hist(auc_arr, bins=50, edgecolor="black", alpha=0.75, color="#4C72B0")
+        ax.axvline(med_auc, color="red", linestyle="--", linewidth=1.5,
+                   label=f"Median = {med_auc:.4f}")
+        ax.set_xlabel("Per-TCR ROC-AUC")
+        ax.set_ylabel("Count")
+        ax.set_title(f"ROC-AUC Distribution ({label_suffix})")
+        ax.legend()
+
+        # AP histogram
+        ax = axes[1]
+        ax.hist(ap_arr, bins=50, edgecolor="black", alpha=0.75, color="#55A868")
+        ax.axvline(med_ap, color="red", linestyle="--", linewidth=1.5,
+                   label=f"Median = {med_ap:.4f}")
+        ax.set_xlabel("Per-TCR Average Precision")
+        ax.set_ylabel("Count")
+        ax.set_title(f"AP Distribution ({label_suffix})")
+        ax.legend()
+
+        plt.tight_layout()
+        fig_file = os.path.join(output_path, f"macro_metrics_distribution_{fname_suffix}.png")
+        fig.savefig(fig_file, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Macro-metrics plot saved to: {fig_file}")
+
+        # Boxplot
+        fig2, ax2 = plt.subplots(figsize=(6, 5))
+        bp = ax2.boxplot([auc_arr, ap_arr], labels=["ROC-AUC", "Avg Precision"],
+                         patch_artist=True, showmeans=True,
+                         meanprops=dict(marker="D", markerfacecolor="red",
+                                        markersize=6))
+        colors = ["#4C72B0", "#55A868"]
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.6)
+        ax2.set_ylabel("Score")
+        ax2.set_title(f"Per-TCR Metric Distributions ({label_suffix})")
+        ax2.set_ylim(-0.05, 1.05)
+        fig2_file = os.path.join(output_path, f"macro_metrics_boxplot_{fname_suffix}.png")
+        fig2.savefig(fig2_file, dpi=150, bbox_inches="tight")
+        plt.close(fig2)
+        print(f"  Macro-metrics boxplot saved to: {fig2_file}")
+
+    # Full-space plots
+    if len(macro_results["per_tcr_auc_full"]) > 0:
+        _plot_pair(
+            macro_results["per_tcr_auc_full"],
+            macro_results["per_tcr_ap_full"],
+            macro_results["median_auc_full"],
+            macro_results["median_ap_full"],
+            "Full-Space", "full",
+        )
+
+    # Candidate-only plots
+    if len(macro_results["per_tcr_auc_cand"]) > 0:
+        _plot_pair(
+            macro_results["per_tcr_auc_cand"],
+            macro_results["per_tcr_ap_cand"],
+            macro_results["median_auc_cand"],
+            macro_results["median_ap_cand"],
+            "Candidate-Only", "cand",
+        )
+
+    # Side-by-side comparison boxplot
+    has_full = len(macro_results["per_tcr_auc_full"]) > 0
+    has_cand = len(macro_results["per_tcr_auc_cand"]) > 0
+    if has_full and has_cand:
+        fig3, axes = plt.subplots(1, 2, figsize=(12, 5))
+        for ax, metric, title in [
+            (axes[0], "auc", "ROC-AUC"),
+            (axes[1], "ap", "Average Precision"),
+        ]:
+            bp = ax.boxplot(
+                [macro_results[f"per_tcr_{metric}_full"],
+                 macro_results[f"per_tcr_{metric}_cand"]],
+                labels=["Full-Space", "Candidate-Only"],
+                patch_artist=True, showmeans=True,
+                meanprops=dict(marker="D", markerfacecolor="red", markersize=6),
+            )
+            bp["boxes"][0].set_facecolor("#4C72B0")
+            bp["boxes"][0].set_alpha(0.6)
+            bp["boxes"][1].set_facecolor("#DD8452")
+            bp["boxes"][1].set_alpha(0.6)
+            ax.set_ylabel(title)
+            ax.set_title(f"Per-TCR {title}")
+            ax.set_ylim(-0.05, 1.05)
+        plt.tight_layout()
+        fig3_file = os.path.join(output_path, "macro_metrics_comparison.png")
+        fig3.savefig(fig3_file, dpi=150, bbox_inches="tight")
+        plt.close(fig3)
+        print(f"  Macro-metrics comparison plot saved to: {fig3_file}")
+
+
+# ---------- Original pipeline code (unchanged except for macro integration) ----------
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='TCR-HLA Binding Model Training Pipeline')
-    # Data input options
+    ### Data input options
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('--data_dir', type=str, help='Path to single dataset directory')
     input_group.add_argument('--df', type=str, help='Path to CSV/TSV/JSON file with multiple dataset configs')
     parser.add_argument('--donor_matrix', type=str, help='Path to donor HLA matrix (.npz). Required if --data_dir is used')
     parser.add_argument('--output_dir', type=str, required=True, help='Output directory for results')
-    # Training hyperparameters
+    ### Training hyperparameters
     parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs (default: 10)')
     parser.add_argument('--batch_size', type=int, default=512, help='Batch size (default: 512)')
     parser.add_argument('--learning_rate', type=float, default=1.0, help='Learning rate (default: 0.01)')
-    parser.add_argument('--beta', type=float, default=4.0, help='Beta hyperparameter (default: 4.0)')
     parser.add_argument('--l2_reg', type=float, default=1e-5, help='L2 regularization lambda (default: 1e-5)')
     parser.add_argument('--pad_token', type=float, default=-1.0, help='Padding token value (default: -1.0)')
     parser.add_argument('--threshold', type=float, default=0.5, help='Decision threshold (default: 0.5)')
-    # Analysis flags
+    # MAP
+    parser.add_argument('--beta', type=float, default=4.0, help='Beta hyperparameter (default: 4.0)')
+    parser.add_argument('--alpha_0', type=float, default=1.0, help='Alpha_0 MAP hyperparameter (default: 1.0)')
+    parser.add_argument('--alpha_1', type=float, default=2.5, help='Alpha_1 MAP hyperparameter (default: 2.5)')
+    parser.add_argument('--alpha', type=float, default=2.0, help='Alpha MAP hyperparameter (default: 2.0)')
+    parser.add_argument('--B', type=float, default=30.0, help='B MAP hyperparameter (default: 30.0)')
+    ### Analysis flags
     parser.add_argument('--analyze_all', action='store_true', help='Run all analysis modules')
     parser.add_argument('--analyze_donors', action='store_true', help='Run donor explanation analysis')
     parser.add_argument('--analyze_predictions', action='store_true', help='Run model predictions analysis')
     parser.add_argument('--analyze_performance', action='store_true', help='Run PR/ROC performance analysis')
     parser.add_argument('--analyze_precision_k', action='store_true', help='Run Precision@k analysis')
+    parser.add_argument('--analyze_macro', action='store_true',
+                        help='Run macro-averaged per-TCR AUC/AP analysis')
     parser.add_argument('--max_k', type=int, default=20, help='Max k for Precision@k (default: 20)')
     # Other options
     parser.add_argument('--seed', type=int, default=42, help='Random seed (default: 42)')
     parser.add_argument('--verbose', type=int, default=1, help='Verbosity level (default: 1)')
+
     return parser.parse_args()
 
 
@@ -133,7 +379,8 @@ def train_model(data, args, output_path):
     model = SparseTCRModel(
         num_tcrs=data['num_tcrs'], max_hlas_per_tcr=data['max_hlas_per_tcr'],
         donor_hla_matrix=data['donor_hla_matrix'], binder_sets=data['binder_sets'],
-        beta=args.beta, mode='continuous', pad_token=args.pad_token, l2_reg_lambda=args.l2_reg)
+        beta=args.beta, mode='continuous', pad_token=args.pad_token, l2_reg_lambda=args.l2_reg,
+        alpha_0=args.alpha_0, alpha_1=args.alpha_1, alpha=args.alpha, B=args.B)
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     model.compile(optimizer=optimizer)
     # Train
@@ -182,7 +429,63 @@ def run_analysis(model, data, args, output_path):
     else:
         perf_metrics = {'auc': 0.0, 'ap': 0.0, 'best_f1': 0.0}
         results['performance'] = perf_metrics
-    # Save final metrics summary
+
+    # ---- Macro-averaged per-TCR metrics (NEW) ----
+    if args.analyze_all or args.analyze_macro:
+        print(f"\n{'='*60}\nMacro-Averaged Per-TCR Metrics\n{'='*60}")
+        macro = compute_macro_metrics(
+            model,
+            binder_sets=data['binder_sets'],
+            true_hla_set=data['true_hla_set'],
+            num_tcrs=data['num_tcrs'],
+            num_alleles=data['num_alleles'],
+            pad_token=args.pad_token,
+        )
+        # Console report
+        cand_recall = macro['candidate_recall']
+        print(f"  Candidate recall (TP in candidates / total TP): {cand_recall:.4f}")
+        print(f"\n  [Full-space]  ({macro['num_valid_tcrs_full']} TCRs)")
+        print(f"    ROC-AUC  — median: {macro['median_auc_full']:.4f}  "
+              f"mean: {macro['mean_auc_full']:.4f}  std: {macro['std_auc_full']:.4f}  "
+              f"IQR: [{macro['q25_auc_full']:.4f}, {macro['q75_auc_full']:.4f}]")
+        print(f"    Avg Prec — median: {macro['median_ap_full']:.4f}  "
+              f"mean: {macro['mean_ap_full']:.4f}  std: {macro['std_ap_full']:.4f}  "
+              f"IQR: [{macro['q25_ap_full']:.4f}, {macro['q75_ap_full']:.4f}]")
+        print(f"\n  [Candidate-only]  ({macro['num_valid_tcrs_cand']} TCRs)")
+        print(f"    ROC-AUC  — median: {macro['median_auc_cand']:.4f}  "
+              f"mean: {macro['mean_auc_cand']:.4f}  std: {macro['std_auc_cand']:.4f}  "
+              f"IQR: [{macro['q25_auc_cand']:.4f}, {macro['q75_auc_cand']:.4f}]")
+        print(f"    Avg Prec — median: {macro['median_ap_cand']:.4f}  "
+              f"mean: {macro['mean_ap_cand']:.4f}  std: {macro['std_ap_cand']:.4f}  "
+              f"IQR: [{macro['q25_ap_cand']:.4f}, {macro['q75_ap_cand']:.4f}]")
+
+        # Plots
+        plot_macro_metrics(macro, figures_path)
+
+        # Persist — serialisable subset (drop large numpy arrays)
+        macro_serialisable = {k: v for k, v in macro.items()
+                              if not isinstance(v, np.ndarray)}
+        macro_json_path = os.path.join(output_path, "macro_metrics.json")
+        with open(macro_json_path, "w") as f:
+            json.dump(macro_serialisable, f, indent=2, cls=NumpyEncoder)
+        print(f"  Macro-metrics JSON saved to: {macro_json_path}")
+
+        # Also save the raw per-TCR arrays for downstream consumers
+        np.savez_compressed(
+            os.path.join(output_path, "macro_metrics_per_tcr.npz"),
+            per_tcr_auc_full=macro["per_tcr_auc_full"],
+            per_tcr_ap_full=macro["per_tcr_ap_full"],
+            valid_tcr_indices_full=macro["valid_tcr_indices_full"],
+            per_tcr_auc_cand=macro["per_tcr_auc_cand"],
+            per_tcr_ap_cand=macro["per_tcr_ap_cand"],
+            valid_tcr_indices_cand=macro["valid_tcr_indices_cand"],
+        )
+
+        results['macro'] = macro_serialisable
+    else:
+        results['macro'] = {}
+
+    # Save final metrics summary (unchanged call — backward compatible)
     if args.analyze_all or args.analyze_donors or args.analyze_predictions or args.analyze_performance:
         save_metrics_json(output_path, perf_metrics, analysis_results, donor_stats, args.threshold)
     return results

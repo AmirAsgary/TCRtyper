@@ -545,6 +545,186 @@ class PublicTcrHlaCsrWriter:
         self._buffer_nnz.clear()
 
 
+class NonSparseTCRModel(tf.keras.Model):
+    """
+    Dense TCR Binding Model evaluating ALL HLA alleles.
+    Allows for full optimization of MAP hyperparameters across non-occurring alleles.
+    """
+    def __init__(self, num_tcrs, num_total_alleles, donor_hla_matrix, 
+                 beta=4.0, pad_token=-1., accumulation_steps=1, reduction='sum',
+                 alpha_0=1.0, alpha_1=2.5, alpha=1.0, B=30.0): # alpha=1.0 for Exponential
+        super().__init__()
+        self.beta = beta
+        self.pad_token = pad_token
+        self.accumulation_steps = accumulation_steps
+        self.reduction = reduction
+        
+        # Store donor matrix transposed: (NumAlleles, NumDonors)
+        # Used for fast matrix multiplication: (Batch, NumAlleles) x (NumAlleles, NumDonors) -> (Batch, NumDonors)
+        self.X_T = tf.constant(donor_hla_matrix.T, dtype=tf.float32)
+
+        # Dense Embedding layer for z parameters
+        # Output dim is now the TOTAL number of alleles in the dataset (e.g., 440)
+        self.z_embedding = tf.keras.layers.Embedding(
+            input_dim=num_tcrs, output_dim=num_total_alleles,
+            embeddings_initializer=tf.keras.initializers.RandomNormal(mean=-1.25, stddev=0.75),
+            name="z_values_dense")
+
+        # Metric trackers
+        self.loss_tracker = tf.keras.metrics.Mean(name="loss")
+        self.final_loss_tracker = tf.keras.metrics.Mean(name="final_loss")
+        self.map_tracker = tf.keras.metrics.Mean(name="map_term")
+        
+        # MAP Hyperparameters
+        self.alpha_0 = tf.constant(alpha_0, dtype=tf.float32)
+        self.alpha_1 = tf.constant(alpha_1, dtype=tf.float32)
+        self.alpha = tf.constant(alpha, dtype=tf.float32)
+        self.B = tf.constant(B, dtype=tf.float32)
+
+        self._grad_accumulators = None
+        self._accum_step = None
+
+    @property
+    def metrics(self):
+        return [self.loss_tracker, self.final_loss_tracker, self.map_tracker]
+
+    def compute_map(self, z_logits, z_probs):
+        """
+        Computes MAP penalties across ALL alleles (no masking).
+        """
+        # 1. Direct Beta Prior Penalty (Mode at 0 in probability space)
+        # Formula: -(alpha_0 - 1) * h_ia + (alpha_0 + alpha_1 - 2) * softplus(h_ia)
+        neg_logit_beta_penalty = -(self.alpha_0 - 1.0) * z_logits + (self.alpha_0 + self.alpha_1 - 2.0) * tf.math.softplus(z_logits)
+        
+        # Sum over ALL alleles
+        neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1)
+        
+        # 2. Gamma/Exponential Sum Penalty
+        sum_gamma = tf.reduce_sum(z_probs, axis=-1)
+        sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
+        
+        # Formula: (alpha / B) * sum_gamma - (alpha - 1) * ln(sum_gamma)
+        neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
+        
+        return neg_logit_beta_penalty, neg_log_p_g
+
+    def call(self, inputs):
+        """Compute negative log-likelihood loss across all alleles."""
+        # inputs: (tcr_idx, pos_donor_indices)
+        tcr_idx, pos_donor_indices = inputs
+        
+        # Get logits and bounded probabilities for all alleles
+        z_logits = self.z_embedding(tcr_idx) # (Batch, NumAlleles)
+        z_prob = tf.math.sigmoid(z_logits)   # (Batch, NumAlleles)
+        
+        # -----------------------------------------------------------
+        # Fast, exact calculation of p_ni using Matrix Multiplication
+        # log_prod_ni = Σ_a x_na · log(1 - γ_ia)
+        # -----------------------------------------------------------
+        # log(1 - γ_ia) exactly equals -softplus(z_ia)
+        log_1_minus_gamma = -tf.math.softplus(z_logits) # (Batch, NumAlleles)
+        
+        # Matrix multiply: (Batch, NumAlleles) x (NumAlleles, NumDonors) -> (Batch, NumDonors)
+        log_prod = tf.matmul(log_1_minus_gamma, self.X_T) 
+        
+        # p_ni = 1 - exp(log_prod). We use -expm1 for numerical stability near 0
+        p_ni = -tf.math.expm1(log_prod)
+        p_ni_safe = tf.maximum(p_ni, 1e-7)
+
+        # -----------------------------------------------------------
+        # Positive donors (Reward)
+        # -----------------------------------------------------------
+        safe_pos_indices = tf.maximum(pos_donor_indices, 0)
+        pos_mask = tf.cast(tf.not_equal(pos_donor_indices, tf.cast(self.pad_token, tf.int32)), tf.float32)
+        
+        p_pos = tf.gather(p_ni_safe, safe_pos_indices, batch_dims=1)
+        reward = tf.reduce_sum(tf.math.log(p_pos) * pos_mask, axis=1)
+
+        # -----------------------------------------------------------
+        # Negative donors (Penalty via Beta-Binomial)
+        # -----------------------------------------------------------
+        n_i = tf.reduce_sum(pos_mask, axis=1)
+        sum_p_all = tf.reduce_sum(p_ni_safe, axis=1)
+        sum_p_pos = tf.reduce_sum(p_pos * pos_mask, axis=1)
+        
+        n_tilde = sum_p_all - sum_p_pos # Expected false positives
+        
+        penalty = tf.math.lgamma(n_tilde + self.beta) - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
+        
+        # -----------------------------------------------------------
+        # Combine Likelihood and MAP
+        # -----------------------------------------------------------
+        log_likelihood = reward + penalty
+        
+        neg_logit_beta_penalty, neg_log_p_g = self.compute_map(z_logits, z_prob)
+        map_penalties = neg_logit_beta_penalty + neg_log_p_g
+
+        if self.reduction == 'sum':
+            nll = -tf.reduce_sum(log_likelihood)
+            total_map = tf.reduce_sum(map_penalties)
+        else:
+            nll = -tf.reduce_mean(log_likelihood)
+            total_map = tf.reduce_mean(map_penalties)
+            
+        return nll, total_map
+
+    # -----------------------------------------------------------
+    # Gradient Accumulation and Training Step
+    # -----------------------------------------------------------
+    def _ensure_accumulators(self):
+        if self._grad_accumulators is None:
+            gpus = tf.config.list_logical_devices("GPU")
+            device = gpus[0].name if gpus else "/CPU:0"
+            with tf.device(device):
+                self._grad_accumulators = [
+                    tf.Variable(tf.zeros_like(v), trainable=False, name=f"grad_acc_{i}")
+                    for i, v in enumerate(self.trainable_variables)
+                ]
+                self._accum_step = tf.Variable(0, trainable=False, dtype=tf.int32)
+
+    def _apply_and_reset(self):
+        self.optimizer.apply_gradients(zip(self._grad_accumulators, self.trainable_variables))
+        for acc in self._grad_accumulators:
+            acc.assign(tf.zeros_like(acc))
+        return tf.constant(0.0)
+
+    def train_step(self, data):
+        with tf.GradientTape() as tape:
+            loss, total_map = self(data, training=True)
+            final_loss = loss + total_map
+
+        gradients = tape.gradient(final_loss, self.trainable_variables)
+
+        if self.accumulation_steps <= 1:
+            self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        else:
+            self._ensure_accumulators()
+            accum_f = tf.cast(self.accumulation_steps, tf.float32)
+            for acc, grad in zip(self._grad_accumulators, gradients):
+                if grad is not None:
+                    acc.assign_add(grad / accum_f)
+            self._accum_step.assign_add(1)
+            tf.cond(
+                tf.equal(self._accum_step % self.accumulation_steps, 0),
+                true_fn=self._apply_and_reset,
+                false_fn=lambda: tf.constant(0.0),
+            )
+
+        batch_size = tf.cast(tf.shape(data[0])[0], tf.float32)
+        if self.reduction == 'sum':
+            display_loss = loss / batch_size
+            display_final = final_loss / batch_size
+            display_map = total_map / batch_size
+        else:
+            display_loss = loss
+            display_final = final_loss
+            display_map = total_map
+            
+        self.loss_tracker.update_state(display_loss)
+        self.final_loss_tracker.update_state(display_final)
+        self.map_tracker.update_state(display_map)
+        
+        return {m.name: m.result() for m in self.metrics}
 
 
 # --- MODEL DEFINITION ---
@@ -564,7 +744,8 @@ class SparseTCRModel(tf.keras.Model):
     """
     def __init__(self, num_tcrs, max_hlas_per_tcr, donor_hla_matrix, binder_sets, 
                  beta=4.0, mode='continuous', pad_token=-1., l2_reg_lambda=1e-5,
-                 accumulation_steps=1, reduction='sum'):
+                 accumulation_steps=1, reduction='sum',
+                 alpha_0=1.0, alpha_1=2.5, alpha=2.0, B=30.0):
         super().__init__()
         self.beta = beta
         self.mode = mode
@@ -586,6 +767,12 @@ class SparseTCRModel(tf.keras.Model):
         self.loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.final_loss_tracker = tf.keras.metrics.Mean(name="final_loss")
         self.reg_tracker = tf.keras.metrics.Mean(name="reg_term")
+        self.map_tracker = tf.keras.metrics.Mean(name="map_term")
+        # MAP Hyperparameters
+        self.alpha_0 = tf.constant(alpha_0, dtype=tf.float32)
+        self.alpha_1 = tf.constant(alpha_1, dtype=tf.float32)
+        self.alpha = tf.constant(alpha, dtype=tf.float32)
+        self.B = tf.constant(B, dtype=tf.float32)
         # Gradient accumulation state (built lazily on first train_step)
         self._grad_accumulators = None
         self._accum_step = None
@@ -603,6 +790,21 @@ class SparseTCRModel(tf.keras.Model):
     def get_z_probabilities(self, z_logits, mask):
         """Toggle between continuous relaxation and binary sampling."""
         return tf.sigmoid(z_logits) * mask
+
+    def compute_map(self, z_logits, z_probs, mask=None):
+        # 1. Direct Beta Prior Penalty (Mode at 0 in probability space)
+        # Formula: -(alpha_0 - 1) * h_ia + (alpha_0 + alpha_1 - 2) * softplus(h_ia)
+        neg_logit_beta_penalty = -(self.alpha_0 - 1.0) * z_logits + (self.alpha_0 + self.alpha_1 - 2.0) * tf.math.softplus(z_logits)
+        # Apply mask if we are in SparseTCRModel (not needed for TCRtyper if dense)
+        if mask is not None:
+            neg_logit_beta_penalty = neg_logit_beta_penalty * mask
+        neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1)
+        # 2. Gamma Sum Penalty
+        sum_gamma = tf.reduce_sum(z_probs, axis=-1)
+        sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
+        # Formula: (alpha / B) * sum_gamma - (alpha - 1) * ln(sum_gamma)
+        neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
+        return neg_logit_beta_penalty, neg_log_p_g
 
     def call(self, inputs):
         """Compute negative log-likelihood loss for a batch of TCRs."""
@@ -632,16 +834,22 @@ class SparseTCRModel(tf.keras.Model):
         n_tilde = sum_p_all - sum_p_pos
         penalty = tf.math.lgamma(n_tilde + self.beta) - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
         log_likelihood = reward + penalty
+        # MAP Penalties
+        neg_logit_beta_penalty, neg_log_p_g = self.compute_map(z_logits, z_prob, batch_mask)
+        map_penalties = neg_logit_beta_penalty + neg_log_p_g
         # Reduction: sum makes gradient per z_i independent of batch_size
         if self.reduction == 'sum':
             nll = -tf.reduce_sum(log_likelihood)
+            total_map = tf.reduce_sum(map_penalties)
         else:
             nll = -tf.reduce_mean(log_likelihood)
-        return nll, regularization_term
+            total_map = tf.reduce_mean(map_penalties)
+            
+        return nll, regularization_term, total_map
 
     @property
     def metrics(self):
-        return [self.loss_tracker, self.final_loss_tracker, self.reg_tracker]
+        return [self.loss_tracker, self.final_loss_tracker, self.reg_tracker, self.map_tracker]
 
     def _ensure_accumulators(self):
             """Create gradient accumulator variables on the same device as the model."""
@@ -666,8 +874,8 @@ class SparseTCRModel(tf.keras.Model):
 
     def train_step(self, data):
         with tf.GradientTape() as tape:
-            loss, reg_term = self(data, training=True)
-            final_loss = loss + reg_term
+            loss, reg_term, total_map = self(data, training=True)
+            final_loss = loss + reg_term + total_map
 
         gradients = tape.gradient(final_loss, self.trainable_variables)
 
@@ -694,12 +902,15 @@ class SparseTCRModel(tf.keras.Model):
         if self.reduction == 'sum':
             display_loss = loss / batch_size
             display_final = final_loss / batch_size
+            display_map = total_map / batch_size
         else:
             display_loss = loss
             display_final = final_loss
+            display_map = total_map
         self.loss_tracker.update_state(display_loss)
         self.final_loss_tracker.update_state(display_final)
         self.reg_tracker.update_state(reg_term)
+        self.map_tracker.update_state(display_map)
         return {m.name: m.result() for m in self.metrics}
 
 
@@ -986,8 +1197,21 @@ def analyze_model_predictions(model, binder_sets, num_total_alleles, threshold=0
 def evaluate_model_performance(model, binder_sets, true_hla_set, num_total_alleles=440,
                                 output_path=None, pad_token=-1.):
     """Calculate PR Curve, ROC Curve, and statistical metrics (optimized sparse version).
-    Handles non-candidate alleles (implicit prob=0) by appending boundary points
-    so that ROC spans [0,1] on both axes and PR covers full recall range.
+
+    Two evaluation scopes are reported:
+
+    **Full-space** (original) — non-candidate alleles get implicit prob=0.
+    Boundary points are appended so ROC spans [0,1] and PR covers full recall.
+
+    **Candidate-only** — only alleles in ``binder_sets`` are evaluated.
+    This measures ranking quality within the candidate set, unaffected by
+    how many true positives are missing from candidates.
+
+    Returns
+    -------
+    dict with keys:
+        auc, ap, best_f1, best_threshold              — full-space (unchanged)
+        auc_cand, ap_cand, best_f1_cand, best_threshold_cand  — candidate-only
     """
     if output_path: os.makedirs(output_path, exist_ok=True)
     print(f"\n--- Performance Evaluation (PR & ROC) ---")
@@ -1024,52 +1248,84 @@ def evaluate_model_performance(model, binder_sets, true_hla_set, num_total_allel
     # Cumulative TP and FP along the sorted candidate list
     tps_cand = np.cumsum(y_true_sorted)
     fps_cand = np.cumsum(1 - y_true_sorted)
-    # --- Build complete curves including non-candidate boundary ---
-    # After exhausting all candidates at threshold->0, non-candidate pairs
-    # (all at implicit prob=0) contribute additional FN and TN.
-    # Append one final point: all non-candidate positives become TP,
-    # all non-candidate negatives become FP (threshold below any candidate).
+
+    # ================================================================
+    # FULL-SPACE curves (original logic — unchanged)
+    # ================================================================
     tps_full = np.concatenate([[0], tps_cand, [tps_cand[-1] + fn_from_non_candidates]])
     fps_full = np.concatenate([[0], fps_cand, [fps_cand[-1] + neg_outside_candidates]])
-    # Compute ROC: TPR = TP / total_positives, FPR = FP / total_negatives
-    tpr = tps_full / max(total_true_positives, 1)
-    fpr = fps_full / max(total_negatives, 1)
-    # Compute PR: Precision = TP / (TP + FP), Recall = TP / total_positives
-    recall = tps_full / max(total_true_positives, 1)
-    precision = np.divide(tps_full, tps_full + fps_full,
-                          out=np.ones_like(tps_full, dtype=np.float64),
-                          where=(tps_full + fps_full) > 0)
-    # --- Metrics ---
-    # AUC-ROC via trapezoidal integration over the complete curve
-    roc_auc = float(np.trapz(tpr, fpr))
-    # Average precision: sum of precision * delta-recall
-    delta_recall = np.diff(recall)
-    average_precision = float(np.sum(delta_recall * precision[1:]))
-    # Best F1 score (only over candidate thresholds, indices 1:-1)
-    p_cand = precision[1:-1]
-    r_cand = recall[1:-1]
-    f1_scores = 2 * (p_cand * r_cand) / (p_cand + r_cand + 1e-7)
-    best_f1_idx = int(np.argmax(f1_scores))
-    best_threshold = float(y_pred_sorted[best_f1_idx]) if best_f1_idx < len(y_pred_sorted) else 0.5
-    best_f1 = float(f1_scores[best_f1_idx])
-    print(f"AUC ROC: {roc_auc:.5f} | AP: {average_precision:.5f} | Best F1: {best_f1:.5f}")
+    tpr_full = tps_full / max(total_true_positives, 1)
+    fpr_full = fps_full / max(total_negatives, 1)
+    recall_full = tps_full / max(total_true_positives, 1)
+    precision_full = np.divide(tps_full, tps_full + fps_full,
+                               out=np.ones_like(tps_full, dtype=np.float64),
+                               where=(tps_full + fps_full) > 0)
+    roc_auc_full = float(np.trapz(tpr_full, fpr_full))
+    delta_recall_full = np.diff(recall_full)
+    ap_full = float(np.sum(delta_recall_full * precision_full[1:]))
+    p_cand_full = precision_full[1:-1]
+    r_cand_full = recall_full[1:-1]
+    f1_full = 2 * (p_cand_full * r_cand_full) / (p_cand_full + r_cand_full + 1e-7)
+    best_f1_idx_full = int(np.argmax(f1_full))
+    best_threshold_full = float(y_pred_sorted[best_f1_idx_full]) if best_f1_idx_full < len(y_pred_sorted) else 0.5
+    best_f1_full = float(f1_full[best_f1_idx_full])
+
+    print(f"[Full-space]  AUC ROC: {roc_auc_full:.5f} | AP: {ap_full:.5f} | Best F1: {best_f1_full:.5f}")
     print(f"  Candidates: {len(pred_probs_sparse)} | TP in candidates: {true_positives_in_candidates}/{total_true_positives}")
-    # --- Plotting ---
+
+    # ================================================================
+    # CANDIDATE-ONLY curves
+    # ================================================================
+    # Only consider alleles that appear in binder_sets.
+    # Positives = TPs within candidates;  Negatives = FPs within candidates.
+    total_pos_cand = max(true_positives_in_candidates, 1)
+    total_neg_cand = max(neg_in_candidates, 1)
+
+    # Prepend the (0,0) origin — no threshold exceeded yet
+    tps_co = np.concatenate([[0], tps_cand])
+    fps_co = np.concatenate([[0], fps_cand])
+
+    tpr_co = tps_co / total_pos_cand
+    fpr_co = fps_co / total_neg_cand
+    recall_co = tps_co / total_pos_cand
+    precision_co = np.divide(tps_co, tps_co + fps_co,
+                             out=np.ones_like(tps_co, dtype=np.float64),
+                             where=(tps_co + fps_co) > 0)
+
+    roc_auc_co = float(np.trapz(tpr_co, fpr_co))
+    delta_recall_co = np.diff(recall_co)
+    ap_co = float(np.sum(delta_recall_co * precision_co[1:]))
+
+    # Best F1 (over candidate thresholds, indices 1:)
+    p_co = precision_co[1:]
+    r_co = recall_co[1:]
+    f1_co = 2 * (p_co * r_co) / (p_co + r_co + 1e-7)
+    best_f1_idx_co = int(np.argmax(f1_co))
+    best_threshold_co = float(y_pred_sorted[best_f1_idx_co]) if best_f1_idx_co < len(y_pred_sorted) else 0.5
+    best_f1_co = float(f1_co[best_f1_idx_co])
+
+    print(f"[Candidate-only]  AUC ROC: {roc_auc_co:.5f} | AP: {ap_co:.5f} | Best F1: {best_f1_co:.5f}")
+    print(f"  Candidate positives: {true_positives_in_candidates} | Candidate negatives: {neg_in_candidates}")
+
+    # ================================================================
+    # PLOTTING
+    # ================================================================
     if output_path:
+        # --- Figure 1: Full-space curves (original, unchanged file name) ---
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-        # PR curve
-        axes[0].plot(recall, precision, color='#2ca02c', lw=2, label=f'AP = {average_precision:.3f}')
-        axes[0].set_title('Precision-Recall Curve')
+        axes[0].plot(recall_full, precision_full, color='#2ca02c', lw=2,
+                     label=f'AP = {ap_full:.3f}')
+        axes[0].set_title('Precision-Recall Curve (Full-Space)')
         axes[0].set_xlabel('Recall')
         axes[0].set_ylabel('Precision')
         axes[0].set_xlim([0, 1.02])
         axes[0].set_ylim([0, 1.02])
         axes[0].legend()
         axes[0].grid(True, alpha=0.3)
-        # ROC curve
-        axes[1].plot(fpr, tpr, color='#1f77b4', lw=2, label=f'AUC = {roc_auc:.3f}')
+        axes[1].plot(fpr_full, tpr_full, color='#1f77b4', lw=2,
+                     label=f'AUC = {roc_auc_full:.3f}')
         axes[1].plot([0, 1], [0, 1], 'gray', linestyle='--')
-        axes[1].set_title('ROC Curve')
+        axes[1].set_title('ROC Curve (Full-Space)')
         axes[1].set_xlabel('FPR')
         axes[1].set_ylabel('TPR')
         axes[1].set_xlim([0, 1.02])
@@ -1077,17 +1333,99 @@ def evaluate_model_performance(model, binder_sets, true_hla_set, num_total_allel
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
         plt.tight_layout()
-        fig.savefig(os.path.join(output_path, "performance_curves.png"), dpi=150, bbox_inches='tight')
-        fig.savefig(os.path.join(output_path, "performance_curves.pdf"), bbox_inches='tight')
+        fig.savefig(os.path.join(output_path, "performance_curves.png"),
+                    dpi=150, bbox_inches='tight')
+        fig.savefig(os.path.join(output_path, "performance_curves.pdf"),
+                    bbox_inches='tight')
         plt.close(fig)
-        # Save curve data for later use
+
+        # --- Figure 2: Candidate-only curves ---
+        fig2, axes2 = plt.subplots(1, 2, figsize=(16, 7))
+        axes2[0].plot(recall_co, precision_co, color='#d62728', lw=2,
+                      label=f'AP = {ap_co:.3f}')
+        axes2[0].set_title('Precision-Recall Curve (Candidate-Only)')
+        axes2[0].set_xlabel('Recall')
+        axes2[0].set_ylabel('Precision')
+        axes2[0].set_xlim([0, 1.02])
+        axes2[0].set_ylim([0, 1.02])
+        axes2[0].legend()
+        axes2[0].grid(True, alpha=0.3)
+        axes2[1].plot(fpr_co, tpr_co, color='#ff7f0e', lw=2,
+                      label=f'AUC = {roc_auc_co:.3f}')
+        axes2[1].plot([0, 1], [0, 1], 'gray', linestyle='--')
+        axes2[1].set_title('ROC Curve (Candidate-Only)')
+        axes2[1].set_xlabel('FPR')
+        axes2[1].set_ylabel('TPR')
+        axes2[1].set_xlim([0, 1.02])
+        axes2[1].set_ylim([0, 1.02])
+        axes2[1].legend()
+        axes2[1].grid(True, alpha=0.3)
+        plt.tight_layout()
+        fig2.savefig(os.path.join(output_path, "performance_curves_candidate_only.png"),
+                     dpi=150, bbox_inches='tight')
+        fig2.savefig(os.path.join(output_path, "performance_curves_candidate_only.pdf"),
+                     bbox_inches='tight')
+        plt.close(fig2)
+
+        # --- Figure 3: Side-by-side comparison (both scopes overlaid) ---
+        fig3, axes3 = plt.subplots(1, 2, figsize=(16, 7))
+        # PR comparison
+        axes3[0].plot(recall_full, precision_full, color='#2ca02c', lw=2,
+                      label=f'Full-space  AP={ap_full:.3f}')
+        axes3[0].plot(recall_co, precision_co, color='#d62728', lw=2,
+                      linestyle='--', label=f'Candidate-only  AP={ap_co:.3f}')
+        axes3[0].set_title('PR Curve Comparison')
+        axes3[0].set_xlabel('Recall')
+        axes3[0].set_ylabel('Precision')
+        axes3[0].set_xlim([0, 1.02])
+        axes3[0].set_ylim([0, 1.02])
+        axes3[0].legend()
+        axes3[0].grid(True, alpha=0.3)
+        # ROC comparison
+        axes3[1].plot(fpr_full, tpr_full, color='#1f77b4', lw=2,
+                      label=f'Full-space  AUC={roc_auc_full:.3f}')
+        axes3[1].plot(fpr_co, tpr_co, color='#ff7f0e', lw=2,
+                      linestyle='--', label=f'Candidate-only  AUC={roc_auc_co:.3f}')
+        axes3[1].plot([0, 1], [0, 1], 'gray', linestyle='--', alpha=0.5)
+        axes3[1].set_title('ROC Curve Comparison')
+        axes3[1].set_xlabel('FPR')
+        axes3[1].set_ylabel('TPR')
+        axes3[1].set_xlim([0, 1.02])
+        axes3[1].set_ylim([0, 1.02])
+        axes3[1].legend()
+        axes3[1].grid(True, alpha=0.3)
+        plt.tight_layout()
+        fig3.savefig(os.path.join(output_path, "performance_curves_comparison.png"),
+                     dpi=150, bbox_inches='tight')
+        fig3.savefig(os.path.join(output_path, "performance_curves_comparison.pdf"),
+                     bbox_inches='tight')
+        plt.close(fig3)
+
+        # Save curve data for later use (both scopes)
         np.savez(os.path.join(output_path, "curve_data.npz"),
-                 precision=precision, recall=recall, fpr=fpr, tpr=tpr,
+                 # Full-space (original keys preserved)
+                 precision=precision_full, recall=recall_full,
+                 fpr=fpr_full, tpr=tpr_full,
                  y_pred_sorted=y_pred_sorted,
                  total_true_positives=total_true_positives,
                  total_negatives=total_negatives,
-                 fn_from_non_candidates=fn_from_non_candidates)
-    return {'auc': roc_auc, 'ap': average_precision, 'best_f1': best_f1, 'best_threshold': best_threshold}
+                 fn_from_non_candidates=fn_from_non_candidates,
+                 # Candidate-only (new keys)
+                 precision_cand=precision_co, recall_cand=recall_co,
+                 fpr_cand=fpr_co, tpr_cand=tpr_co,
+                 true_positives_in_candidates=true_positives_in_candidates,
+                 neg_in_candidates=neg_in_candidates)
+
+    return {
+        # Full-space (original keys — backward compatible)
+        'auc': roc_auc_full, 'ap': ap_full,
+        'best_f1': best_f1_full, 'best_threshold': best_threshold_full,
+        # Candidate-only (new keys)
+        'auc_cand': roc_auc_co, 'ap_cand': ap_co,
+        'best_f1_cand': best_f1_co, 'best_threshold_cand': best_threshold_co,
+        # Diagnostic
+        'candidate_recall': true_positives_in_candidates / max(total_true_positives, 1),
+    }
 
 
 def compute_precision_at_k(output_dir, data_dir, max_k=20, pad_token=-1.):

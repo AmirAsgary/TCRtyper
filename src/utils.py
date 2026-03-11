@@ -2999,7 +2999,9 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
                  l2_reg_lambda=1e-5, reduction='sum',
                  poisson_approx_untyped_hlas=False,
                  hla_bias_init=None, invariant_lambda=0.0,
-                 false_pos_lambda=0.0, **kwargs):
+                 false_pos_lambda=0.0, alpha_0=1.0,
+                 alpha_1=2.5, alpha=2.0, B=30, diversity_lambda=1.0,
+                 map_weight=1.0, **kwargs):
         super().__init__(**kwargs)
         self.beta = beta
         self.pad_token = pad_token
@@ -3008,6 +3010,13 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         self.poisson_approx_untyped_hlas = poisson_approx_untyped_hlas
         self.invariant_lambda = invariant_lambda
         self.false_pos_lambda = false_pos_lambda
+        self.diversity_lambda = diversity_lambda
+        # MAP Hyperparameters
+        self.alpha_0 = tf.constant(alpha_0, dtype=tf.float32)
+        self.alpha_1 = tf.constant(alpha_1, dtype=tf.float32)
+        self.alpha = tf.constant(alpha, dtype=tf.float32)
+        self.B = tf.constant(B, dtype=tf.float32)
+        self.map_weight = map_weight
 
         # X_T shape: (A, N) — transposed donor-allele matrix
         # A: total alleles, N: total donors
@@ -3021,10 +3030,58 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         else:
             self.prior_logits = 0.0
 
+    
+    def batch_diversity_penalty(self, z_prob):
+
+        marginal = tf.reduce_mean(z_prob, axis=0)
+        q = marginal / (tf.reduce_sum(marginal) + 1e-8)
+
+        A = tf.cast(tf.shape(q)[0], tf.float32)
+        uniform = tf.ones_like(q) / A
+
+        kl = tf.reduce_sum(q * tf.math.log((q + 1e-8) / uniform))
+
+        return kl
+
+    def compute_map2(self, z_logits, z_probs):
+        # compute_logit_beta_penalty
+        # Computes the negative log-prior of the Logit-Beta distribution.
+        # Formula: - [ alpha_0 * h_ia - (alpha_0 + alpha_1) * ln(1 + exp(h_ia)) ]
+        neg_logit_beta_penalty = -(self.alpha_0 * z_logits) + ((self.alpha_0 + self.alpha_1) * tf.math.softplus(z_logits)) # (B, A)
+        neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1) # (B,)
+
+        # compute_gamma_sum_penalty
+        # Computes the negative log-prior of the Gamma distribution for expected bindings.
+        # Formula: - [ (alpha - 1) * ln(sum(gamma_ia)) - (alpha / B) * sum(gamma_ia) ]
+        sum_gamma = tf.reduce_sum(z_probs, axis=-1) # (B,)
+        sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
+        neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
+        
+        return neg_logit_beta_penalty, neg_log_p_g # Both are now (B,)
+
+    def compute_map(self, z_logits, z_probs):
+        """
+        Computes MAP penalties across ALL alleles (no masking).
+        """
+        # 1. Direct Beta Prior Penalty (Mode at 0 in probability space)
+        # Formula: -(alpha_0 - 1) * h_ia + (alpha_0 + alpha_1 - 2) * softplus(h_ia)
+        neg_logit_beta_penalty = -(self.alpha_0 - 1.0) * z_logits + (self.alpha_0 + self.alpha_1 - 2.0) * tf.math.softplus(z_logits)
+        
+        # Sum over ALL alleles
+        neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1)
+        
+        # 2. Gamma/Exponential Sum Penalty
+        sum_gamma = tf.reduce_sum(z_probs, axis=-1)
+        sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
+        
+        # Formula: (alpha / B) * sum_gamma - (alpha - 1) * ln(sum_gamma)
+        neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
+        
+        return neg_logit_beta_penalty, neg_log_p_g # Both are now (B,)
+
     # ------------------------------------------------------------------
     # Regularisation terms (applied to logits or probabilities)
     # ------------------------------------------------------------------
-
     def logit_drift_penalty(self, z_logits):
         """
         Prevents logit explosion by penalising deviation from the cold prior.
@@ -3041,7 +3098,7 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         the rare-allele flat-gradient artifact.
         """
         if self.l2_reg_lambda > 0:
-            return self.l2_reg_lambda * tf.reduce_sum(
+            return self.l2_reg_lambda * tf.reduce_mean(
                 tf.square(z_logits - self.prior_logits)
             )
         return 0.0
@@ -3143,8 +3200,11 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         # 2. Regularisation (uses z_logits and z_prob)
         # ============================================================
         reg_drift = self.logit_drift_penalty(z_logits)
-        reg_sparsity = self.scale_invariant_sparsity(z_prob, mask)
-        reg_false_pos = self.false_positive_penalty(z_prob, inactive_mask)
+        reg_sparsity = self.scale_invariant_sparsity(z_prob, mask) * 0.0
+        reg_false_pos = self.false_positive_penalty(z_prob, inactive_mask) * 0.0 # added for debug
+        reg_diversity = 0.0
+        if self.diversity_lambda > 0:
+            reg_diversity = self.diversity_lambda * self.batch_diversity_penalty(z_prob)
 
         # ============================================================
         # 3. Core likelihood: compute p_ni and log(p_ni)
@@ -3253,18 +3313,23 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         )  # (B,)
 
         # ============================================================
-        # 6. Combine: LL_i = reward + penalty
+        # 6. Combine: LL_i = reward + penalty 
         # ============================================================
-        log_likelihood = reward + penalty                                 # (B,)
-
+        # Keep the likelihood pure (these are negative numbers)
+        log_likelihood = reward + penalty # (B,)
+        # Get the MAP penalties (these are positive numbers acting as a loss)
+        neg_logit_beta_penalty, neg_log_p_g = self.compute_map(z_logits, z_prob)
+        map_penalties = neg_logit_beta_penalty + neg_log_p_g # (B,)
+        # the Negative Log-Posterior (NLP)
         if self.reduction == 'sum':
             nll = -tf.reduce_sum(log_likelihood)
+            total_map = tf.reduce_sum(map_penalties)
         else:
             nll = -tf.reduce_mean(log_likelihood)
-
-        total_reg = reg_drift + reg_sparsity + reg_false_pos
-
-        return nll, total_reg
+            total_map = tf.reduce_mean(map_penalties)
+        # The final target to minimize is the Negative Log-Posterior
+        total_reg = reg_drift + reg_sparsity + reg_false_pos + reg_diversity
+        return nll, total_reg, total_map * self.map_weight
 
 
 import re
