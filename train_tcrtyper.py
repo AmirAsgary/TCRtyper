@@ -56,6 +56,7 @@ from src.utils import (
     GatedTransformerLayer,
     TCRLikelihoodLoss,
     encode_msa_frequencies,
+    CLIPBindingHead
 )
 # ═════════════════════════════════════════════════════════════════════
 # 1.  FLAGS / ARGUMENT PARSER
@@ -867,146 +868,6 @@ def load_hla_embeddings_for_clip(args, idx_to_hla):
     return embed_matrix.astype(np.float32)
 
 
-class CLIPBindingHead(layers.Layer):
-    """
-    CLIP-style binding head that computes z_logits from the dot product
-    of TCR and HLA embeddings in a shared space.
-    
-    Architecture:
-        HLA path:  hla_raw (A, hla_input_dim) → Dense(clip_dim) → hla_embed (A, D)
-        TCR path:  tcr_embed (B, D)  [produced upstream by the TCR encoder]
-        Output:    z_logits = tcr_embed @ hla_embed^T + bias    (B, A)
-    
-    The HLA raw embeddings (from ESM) are stored as a trainable weight,
-    allowing gradient flow to fine-tune them during likelihood training.
-    The bias is initialised to the population log-odds ln(f_a / (1-f_a)),
-    ensuring γ_ia = f_a when the dot product is zero (manuscript Eq. 2.2.2).
-    
-    Parameters
-    ----------
-    num_alleles : int
-        Total number of HLA alleles (A).
-    clip_dim : int
-        Shared embedding dimension (D) for both TCR and HLA.
-    hla_input_dim : int
-        Dimensionality of the raw HLA embeddings from ESM (default 32).
-    hla_embed_init : np.ndarray or None, shape (A, hla_input_dim)
-        Pre-computed HLA embeddings. If None, random init is used.
-    bias_init : np.ndarray or None, shape (A,)
-        Log-odds bias initialisation. If None, zeros are used.
-    train_hla_proj : bool
-        Whether to allow gradients through the HLA projection.
-        If False, only the TCR encoder learns; HLA embeddings are fixed.
-    """
-
-    def __init__(self, num_alleles, clip_dim, hla_input_dim=32,
-                 hla_embed_init=None, bias_init=None,
-                 train_hla_proj=True, init_temperature=5.0, min_temperature=0.5,
-                 scale_hla_embed=True, **kwargs):
-        super().__init__(**kwargs)
-        self.num_alleles = num_alleles
-        self.clip_dim = clip_dim
-        self.hla_input_dim = hla_input_dim
-        self.train_hla_proj = train_hla_proj
-        self.scale_hla_embed = scale_hla_embed
-
-        # ── HLA raw embeddings: (A, hla_input_dim) ──────────────────
-        # These are the ESM-derived representations, stored as a weight
-        # so they can optionally be fine-tuned via backprop.
-        if hla_embed_init is not None:
-            init = tf.keras.initializers.Constant(hla_embed_init)
-            if scale_hla_embed:
-                # Normalize to unit norm, then scale down
-                norms = np.linalg.norm(hla_embed_init, axis=1, keepdims=True)
-                hla_embed_scaled = hla_embed_init / np.clip(norms, 1e-6, None)
-                hla_embed_scaled *= 0.1  # small norm → small dot products
-                init = tf.keras.initializers.Constant(hla_embed_scaled)
-        else:
-            init = tf.keras.initializers.RandomNormal(stddev=0.02)
-
-        self.hla_raw = self.add_weight(
-                name="hla_raw_embeddings",
-                shape=(num_alleles, hla_input_dim),
-                initializer=init,
-                trainable=train_hla_proj,
-            )
-
-        # ── HLA projection: (hla_input_dim) → (clip_dim) ────────────
-        # This is NN_φ from the manuscript — projects pseudo-sequence
-        # embeddings into the shared CLIP space.
-        self.hla_proj = layers.Dense(
-            clip_dim, use_bias=True, name="hla_clip_proj",
-            trainable=True, kernel_initializer=tf.keras.initializers.GlorotUniform(),
-            bias_initializer="zeros"
-        )
-
-        # ── Log-odds bias: (A,) ─────────────────────────────────────
-        # Ensures γ_ia = f_a when dot product is zero.
-        # Always trainable so the model can adjust allele-level offsets.
-        if bias_init is not None:
-            b_init = tf.keras.initializers.Constant(bias_init)
-        else:
-            b_init = "zeros"
-        self.allele_bias = self.add_weight(
-            name="allele_bias",
-            shape=(num_alleles,),
-            initializer=b_init,
-            trainable=False,  # frozen offset, as per manuscript
-        )
-
-        self.log_temperature = self.add_weight(
-            name="log_temperature",
-            shape=(),
-            initializer=tf.keras.initializers.Constant(
-                np.log(init_temperature)),
-            trainable=True,
-        )
-        self.min_temperature = min_temperature
-
-    def call(self, tcr_embed):
-        """
-        Parameters
-        ----------
-        tcr_embed : tf.Tensor, shape (B, clip_dim)
-            TCR representations from the encoder.
-        
-        Returns
-        -------
-        z_logits : tf.Tensor, shape (B, A)
-            Raw logits for all alleles. Apply sigmoid to get γ_ia.
-        """
-        # Project HLA embeddings into shared space:
-        #   (A, hla_input_dim) → (A, clip_dim)
-        hla_embed = self.hla_proj(self.hla_raw)          # (A, D)
-
-        # Temperature-scaled dot product
-        temperature = tf.maximum(
-            tf.exp(self.log_temperature), 
-            self.min_temperature
-        )
-
-        # Dot product: (B, D) @ (D, A) → (B, A)
-        z_logits = tf.matmul(tcr_embed, hla_embed, transpose_b=True) / temperature
-        # Add per-allele log-odds bias
-        z_logits = z_logits + self.allele_bias            # (B, A)
-
-        return z_logits
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({
-            "num_alleles": self.num_alleles,
-            "clip_dim": self.clip_dim,
-            "hla_input_dim": self.hla_input_dim,
-            "train_hla_proj": self.train_hla_proj,
-            "scale_hla_embed": self.scale_hla_embed,
-            "hla_embed_init": self.hla_embed_init,
-            "bias_init": self.bias_init,
-            "init_temperature": self.init_temperature,
-        })
-        return cfg
-
-
 # ═════════════════════════════════════════════════════════════════════
 # build_model — drop-in replacement
 # ═════════════════════════════════════════════════════════════════════
@@ -1685,23 +1546,38 @@ def load_checkpoint(model, optimizer, ckpt_dir, tag="latest"):
 # 10. INFERENCE
 # ═════════════════════════════════════════════════════════════════════
 def run_inference(model, h5_path, output_path, args):
-    """
-    Load best model and write z_probs into a copy of the input H5.
-    Uses MleZprobsWriter to append sparse z_probs per cluster.
+    """Load best model and write z_probs into a copy of the input H5.
+    Stores predictions for ALL learnable alleles (not just co-occurring).
     """
     print(f"\n{'='*60}")
     print("INFERENCE MODE")
     print(f"{'='*60}")
-    # Copy input H5 to output path
     shutil.copy2(h5_path, output_path)
     print(f"  Copied {h5_path} → {output_path}")
+    # Load learnable allele mask if available
+    learnable_mask = None
+    mask_path = os.path.join(args.output_dir, "learnable_allele_mask.npy")
+    if os.path.exists(mask_path):
+        learnable_mask = np.load(mask_path)
+        n_masked = int((learnable_mask == 0).sum())
+        n_learnable = int(learnable_mask.sum())
+        print(f"  [MASK] Loaded: {n_masked}/{len(learnable_mask)} "
+              f"alleles masked, {n_learnable} learnable")
+    else:
+        print(f"  [MASK] No learnable_allele_mask.npy found — writing all alleles")
+    # Precompute the fixed set of learnable allele indices
+    if learnable_mask is not None:
+        learnable_idx = np.where(learnable_mask > 0)[0]
+    else:
+        learnable_idx = np.arange(args.num_alleles)
+    n_store = len(learnable_idx)
+    print(f"  Storing {n_store} alleles per cluster")
     # Count clusters
     with PublicTcrHlaCsrReaderChunk(output_path, include_counts=True,
                                      include_donors=True,
                                      include_cdr_freq=True) as reader:
         num_clusters = reader.num_clusters
     print(f"  Total clusters: {num_clusters}")
-    # Open writer
     from tqdm import tqdm
     import math
     total_steps = math.ceil(num_clusters / args.batch_size)
@@ -1709,48 +1585,30 @@ def run_inference(model, h5_path, output_path, args):
         with PublicTcrHlaCsrReaderChunk(
                 output_path, include_counts=True, include_donors=True,
                 include_pvals=False, include_cdr_freq=True) as reader:
-            
-            # Wrap the generator with tqdm and pass the total_steps
-            for chunk in tqdm(reader.iter_cluster_chunks(chunk_rows=args.batch_size), 
-                              total=total_steps, 
-                              desc="Inferring z_probs", 
+            for chunk in tqdm(reader.iter_cluster_chunks(chunk_rows=args.batch_size),
+                              total=total_steps,
+                              desc="Inferring z_probs",
                               unit="batch"):
-                
                 if chunk.counts_dense is None or chunk.cdr_freq is None:
                     continue
-                
                 batch = prepare_batch(chunk, args)
-                
                 # Forward pass (no gradient)
                 z_logits = model(
                     [batch["combined_cdr"], batch["combined_mask"]],
                     training=False)
-                z_probs = tf.sigmoid(z_logits).numpy()
-                
-                # binder_sets: padded allele indices per cluster
-                binder = chunk.counts_dense  # (B, A) dense
-                
-                # Convert dense to padded sparse indices for the writer
-                binder_binary = (binder > 0).astype(np.float32)
-                
-                # Write z_probs aligned with binder indices
+                z_probs = tf.sigmoid(z_logits).numpy()  # (B, A)
+                # Apply learnable mask
+                if learnable_mask is not None:
+                    z_probs = z_probs * learnable_mask[np.newaxis, :]
+                # Store ALL learnable alleles per cluster (same indices for every row)
                 n_chunk = z_probs.shape[0]
-                max_hlas = int(binder_binary.sum(axis=1).max())
-                binder_sets_padded = np.full(
-                    (n_chunk, max_hlas), args.pad_token, dtype=np.float32)
-                z_probs_padded = np.full(
-                    (n_chunk, max_hlas), 0.0, dtype=np.float32)
-                
-                for i in range(n_chunk):
-                    nz_idx = np.where(binder_binary[i] > 0)[0]
-                    binder_sets_padded[i, :len(nz_idx)] = nz_idx
-                    z_probs_padded[i, :len(nz_idx)] = z_probs[i, nz_idx]
-                
+                binder_sets_padded = np.tile(
+                    learnable_idx.astype(np.float32), (n_chunk, 1))  # (B, n_store)
+                z_probs_padded = z_probs[:, learnable_idx]            # (B, n_store)
                 writer.write_chunk(
                     chunk.cluster_start, chunk.cluster_end,
                     binder_sets_padded, z_probs_padded,
                     pad_token=args.pad_token)
-                
     print(f"  ✓ Inference complete → {output_path}")
 
 def run_inference_tfrecord(model, tfrecord_dir, output_path, args):
@@ -1849,6 +1707,13 @@ def run_inference_tfrecord(model, tfrecord_dir, output_path, args):
     z_logits_all = np.concatenate(all_logits, axis=0)
     z_probs_all = np.concatenate(all_probs, axis=0)
     binder_all = np.concatenate(all_binders, axis=0)
+    # apply learnable mask
+    mask_path = os.path.join(args.output_dir, "learnable_allele_mask.npy")
+    if os.path.exists(mask_path):
+        learnable_mask = np.load(mask_path)
+        z_probs_all = z_probs_all * learnable_mask[np.newaxis, :]
+        z_logits_all = z_logits_all * learnable_mask[np.newaxis, :] + \
+                    (1 - learnable_mask[np.newaxis, :]) * (-1e9)
     # ── re-pad donor arrays to global max length ─────────────────────
     # Each batch may have different max donor count, so we unify them
     donor_unified = np.full((n_processed, max_donor_len),
@@ -1868,6 +1733,7 @@ def run_inference_tfrecord(model, tfrecord_dir, output_path, args):
         binder_dense=binder_all,
         donor_indices=donor_unified,
         n_donors=n_donors_all,
+        learnable_allele_mask=learnable_mask,
     )
     print(f"  Processed {n_processed} clusters")
     print(f"  z_logits      shape: {z_logits_all.shape}")
@@ -1956,6 +1822,10 @@ def main():
         map_weight=args.map_weight,
         mask_singleton_alleles=args.mask_singleton_alleles,
         min_donors_per_allele=args.min_donors_per_allele,)
+    np.save(
+    os.path.join(args.output_dir, "learnable_allele_mask.npy"),
+    loss_fn.learnable_allele_mask.numpy()
+    )
     # ── count dataset size for LR schedule ───────────────────────────
     n_train = 0
     if args.mode == "train":
@@ -2124,13 +1994,32 @@ def main():
     # INFERENCE MODE
     # ════════════════════════════════════════════════════════════════
     elif args.mode == "inference":
-        # Load best checkpoint
-        meta = load_checkpoint(model, optimizer, ckpt_dir, "best")
-        if meta is None:
-            meta = load_checkpoint(model, optimizer, ckpt_dir, "latest")
-        if meta is None:
-            print("ERROR: No checkpoint found for inference")
+        # Load best checkpoint weights directly (more reliable than tf.train.Checkpoint)
+        restored = False
+        for tag in ["best", "latest"]:
+            w_path = os.path.join(ckpt_dir, tag, "model.weights.h5")
+            meta_path = os.path.join(ckpt_dir, tag, "meta.json")
+            if os.path.exists(w_path):
+                model.load_weights(w_path)
+                if os.path.exists(meta_path):
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    print(f"  [CKPT] Loaded '{tag}' weights: "
+                        f"epoch={meta['epoch']} best_val={meta['best_val_loss']:.6f}")
+                else:
+                    print(f"  [CKPT] Loaded '{tag}' weights from {w_path}")
+                    meta = {}
+                restored = True
+                break
+        if not restored:
+            print("ERROR: No model.weights.h5 found for inference")
             sys.exit(1)
+        # Quick sanity check on a dummy input
+        dummy_logits = model([tf.zeros((1, 10, 21)), tf.ones((1, 10), dtype=tf.int32)], training=False)
+        dummy_probs = tf.sigmoid(dummy_logits).numpy()
+        print(f"  [SANITY] Dummy max γ={dummy_probs.max():.6f}  "
+            f"mean γ={dummy_probs.mean():.6f}  "
+            f"(expect max ~0.05, mean ~0.002)")
         # ── TFRecord-based inference ─────────────────────────────────
         if args.use_tfrecord:
             if not args.tf_record_path:

@@ -268,6 +268,7 @@ class MaskedGlobalAveragePooling(layers.Layer):
         return cfg
 def build_model_from_config(config: dict) -> keras.Model:
     """Rebuild TCRtyper architecture from saved config.json.
+    Supports both legacy Dense(hla_head) and CLIP binding head architectures.
     Args:
         config: dict loaded from {model_dir}/config.json
     Returns:
@@ -276,6 +277,8 @@ def build_model_from_config(config: dict) -> keras.Model:
     m = config["model"]
     t = config["tokens"]
     num_alleles = config["data"]["num_alleles"]
+    # Check if model was trained with CLIP binding head
+    use_clip_head = m.get("train_hla_head", False)
     inp_seq  = keras.Input(shape=(None, N_SYM), name="seq_input")
     inp_mask = keras.Input(shape=(None,), dtype=tf.int32, name="mask_input")
     h = SequenceEncoderLayer(
@@ -294,9 +297,28 @@ def build_model_from_config(config: dict) -> keras.Model:
             name=f"transformer_{i}",
         )([h, inp_mask])
     h = MaskedGlobalAveragePooling(pad_token=t["pad"], name="pool")([h, inp_mask])
-    h = layers.Dense(m["hla_proj_dim"], activation="gelu", name="hla_proj")(h)
-    h = layers.Dropout(m["dropout"], name="hla_drop")(h)
-    z_logits = layers.Dense(num_alleles, name="hla_head")(h)
+    if use_clip_head:
+        # CLIP architecture: project TCR into shared space, then dot-product with HLA embeddings
+        clip_dim = m.get("hla_proj_dim", m["embed_dim"])
+        h = layers.Dense(clip_dim, activation="gelu", name="tcr_clip_proj")(h)
+        h = layers.Dropout(m["dropout"], name="tcr_clip_drop")(h)
+        # CLIPBindingHead — initialise without pretrained HLA embeddings;
+        # weights will be restored from checkpoint
+        from src.utils import CLIPBindingHead
+        z_logits = CLIPBindingHead(
+            num_alleles=num_alleles,
+            clip_dim=clip_dim,
+            hla_input_dim=clip_dim,  # placeholder, will be overridden by checkpoint
+            hla_embed_init=None,
+            bias_init=None,
+            train_hla_proj=True,
+            name="clip_binding_head",
+        )(h)
+    else:
+        # Legacy architecture: simple Dense projection
+        h = layers.Dense(m["hla_proj_dim"], activation="gelu", name="hla_proj")(h)
+        h = layers.Dropout(m["dropout"], name="hla_drop")(h)
+        z_logits = layers.Dense(num_alleles, name="hla_head")(h)
     return keras.Model(inputs=[inp_seq, inp_mask], outputs=z_logits, name="TCRtyper")
 def load_model(model_dir: str) -> Tuple[keras.Model, dict]:
     """Load config, rebuild model, restore best checkpoint weights.
@@ -536,39 +558,238 @@ def evaluate(z_probs, hla_indices, labels, threshold=0.5):
 # 9.  HLA-HEAD WEIGHT EXTRACTION + SIMILARITY
 # ═════════════════════════════════════════════════════════════════════
 def extract_hla_similarity(model, idx_to_hla):
-    """Extract hla_head learned weights, compute cosine similarity between HLAs.
-    The hla_head Dense layer has:
-        kernel: (hla_proj_dim, A) — each column is one HLA's learned embedding
-        bias:   (A,) — per-allele log-odds prior
-    Cosine similarity between HLA i and j is computed on the kernel columns.
+    """Extract HLA embeddings and compute cosine similarity.
+    Supports both legacy Dense(hla_head) and CLIPBindingHead architectures.
     Args:
         model:      loaded TCRtyper keras model
-        idx_to_hla: dict mapping str(idx)→HLA name
+        idx_to_hla: dict mapping str(idx) -> HLA name
     Returns:
-        hla_embeddings: (A, hla_proj_dim) float32 — row per HLA
+        hla_embeddings: (A, D) float32 — row per HLA
         hla_bias:       (A,) float32
         cos_sim:        (A, A) float32 cosine similarity matrix
         hla_names:      list of A HLA name strings (ordered by index)
     """
-    hla_layer = model.get_layer("hla_head")
-    kernel, bias = hla_layer.get_weights()  # kernel: (D, A), bias: (A,)
-    # transpose so each row is one HLA embedding
-    hla_embeddings = kernel.T.astype(np.float32)  # (A, D)
-    hla_bias = bias.astype(np.float32)             # (A,)
-    # cosine similarity: normalise rows then dot product
+    # Try CLIP head first, fall back to legacy Dense
+    try:
+        clip_head = model.get_layer("clip_binding_head")
+        # Print weight names so we know the exact structure
+        for w in clip_head.weights:
+            print(f"  [HLA] weight: {w.name}  shape={w.shape}")
+        weights = clip_head.get_weights()
+        # CLIPBindingHead stores: hla_raw_embed (A, hla_input_dim),
+        #   hla_proj kernel+bias, allele_bias, temperature
+        # We need to figure out which is which from shapes
+        hla_raw = weights[0]  # (A, hla_input_dim) — raw ESM embeddings
+        # Find the projection kernel: shape (hla_input_dim, clip_dim)
+        hla_proj_k = None
+        hla_bias = None
+        for w_arr, w_var in zip(weights, clip_head.weights):
+            name = w_var.name.lower()
+            if "proj" in name and "kernel" in name:
+                hla_proj_k = w_arr
+            elif "allele_bias" in name or ("bias" in name and w_arr.shape == (hla_raw.shape[0],)):
+                hla_bias = w_arr
+        # Compute projected HLA embeddings
+        if hla_proj_k is not None:
+            hla_embeddings = (hla_raw @ hla_proj_k).astype(np.float32)
+            print(f"[HLA] CLIPBindingHead: raw={hla_raw.shape} @ proj={hla_proj_k.shape} -> {hla_embeddings.shape}")
+        else:
+            # No projection found, use raw embeddings directly
+            hla_embeddings = hla_raw.astype(np.float32)
+            print(f"[HLA] CLIPBindingHead: using raw embeddings {hla_embeddings.shape} (no proj found)")
+        if hla_bias is None:
+            hla_bias = np.zeros(hla_embeddings.shape[0], dtype=np.float32)
+    except ValueError:
+        # Legacy Dense head
+        hla_layer = model.get_layer("hla_head")
+        kernel, bias = hla_layer.get_weights()
+        hla_embeddings = kernel.T.astype(np.float32)  # (A, D)
+        hla_bias = bias.astype(np.float32)
+        print(f"[HLA] Legacy Dense head: {hla_embeddings.shape}")
+    # Cosine similarity
     norms = np.linalg.norm(hla_embeddings, axis=1, keepdims=True)
     norms = np.maximum(norms, 1e-12)
-    hla_normed = hla_embeddings / norms  # (A, D)
-    cos_sim = hla_normed @ hla_normed.T  # (A, A)
-    # ordered HLA names
+    hla_normed = hla_embeddings / norms
+    cos_sim = hla_normed @ hla_normed.T
     A = hla_embeddings.shape[0]
     hla_names = [idx_to_hla.get(str(i), f"HLA_{i}") for i in range(A)]
-    print(f"[HLA] Extracted embeddings: ({A}, {hla_embeddings.shape[1]}), "
+    print(f"[HLA] Embeddings: ({A}, {hla_embeddings.shape[1]}), "
           f"bias: ({A},), similarity: ({A}, {A})")
     return hla_embeddings, hla_bias, cos_sim, hla_names
 # ═════════════════════════════════════════════════════════════════════
 # 10. VISUALISATIONS
 # ═════════════════════════════════════════════════════════════════════
+def plot_roc_prc_heatmap(z_probs, hla_indices, labels, idx_to_hla,
+                         output_dir, learnable_mask=None,
+                         n_sample=100, seed=42):
+    """ROC curve, Precision-Recall curve, and a TCR×allele heatmap.
+    Produces a single three-panel figure saved as
+    ``roc_prc_heatmap.png`` in *output_dir*.
+    Args:
+        z_probs:        (N, A) predicted sigmoid probabilities (already masked
+                        if learnable_mask was applied earlier).
+        hla_indices:    (N,)   column index of the target HLA per sample.
+        labels:         (N,)   ground-truth 0/1.
+        idx_to_hla:     dict   str(idx) -> HLA name.
+        output_dir:     str    directory to write the figure.
+        learnable_mask: (A,) float32 or None.  1=learnable, 0=singleton.
+                        When provided the heatmap explicitly zeros non-learnable
+                        columns and marks them with a grey overlay.
+        n_sample:       int    number of TCRs to show in the heatmap.
+        seed:           int    random seed for reproducible TCR sampling.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.patches import Patch
+    import matplotlib.gridspec as gridspec
+    # ── derived arrays ──────────────────────────────────────────────
+    N, A = z_probs.shape
+    lab = labels.astype(np.int32)
+    pred_probs = z_probs[np.arange(N), hla_indices]  # (N,) prob at true HLA
+    n_pos = int(lab.sum())
+    n_neg = N - n_pos
+    # ── sort by score for ROC / PRC ─────────────────────────────────
+    order = np.argsort(-pred_probs)
+    sl = lab[order]
+    sp = pred_probs[order]
+    # cumulative TP / FP
+    tp_cum = np.cumsum(sl)
+    fp_cum = np.cumsum(1 - sl)
+    # ROC: TPR vs FPR with (0,0) anchor
+    tpr = np.concatenate([[0.0], tp_cum / max(n_pos, 1)])
+    fpr = np.concatenate([[0.0], fp_cum / max(n_neg, 1)])
+    auroc = float(np.trapz(tpr, fpr))
+    # PRC: Precision vs Recall with (0,1) anchor
+    precision = np.concatenate([[1.0], tp_cum / np.arange(1, N + 1)])
+    recall    = np.concatenate([[0.0], tp_cum / max(n_pos, 1)])
+    auprc = float(np.trapz(precision, recall))
+    # ── optimal threshold (Youden / F1) ─────────────────────────────
+    # Youden index for ROC
+    youden = tpr - fpr
+    best_youden_idx = int(np.argmax(youden))
+    best_youden_thr = float(sp[min(best_youden_idx, N - 1)]) if best_youden_idx > 0 else 0.5
+    # F1 for PRC
+    f1_arr = 2 * precision[1:] * recall[1:] / np.maximum(precision[1:] + recall[1:], 1e-8)
+    best_f1_idx = int(np.argmax(f1_arr))
+    best_f1_thr = float(sp[best_f1_idx]) if best_f1_idx < N else 0.5
+    # ════════════════════════════════════════════════════════════════
+    # Figure: 1 row × 3 columns  (ROC | PRC | heatmap)
+    # ════════════════════════════════════════════════════════════════
+    fig = plt.figure(figsize=(26, 8), facecolor="white")
+    gs = gridspec.GridSpec(1, 3, width_ratios=[1, 1, 2.2],
+                           wspace=0.30, left=0.04, right=0.97,
+                           top=0.90, bottom=0.10)
+    # ── Panel 1: ROC ────────────────────────────────────────────────
+    ax_roc = fig.add_subplot(gs[0])
+    ax_roc.plot(fpr, tpr, lw=2, color="#2196F3",
+                label=f"AUROC = {auroc:.4f}")
+    ax_roc.plot([0, 1], [0, 1], ls="--", lw=1, color="grey", alpha=0.6)
+    # mark optimal point
+    ax_roc.scatter(fpr[best_youden_idx], tpr[best_youden_idx],
+                   s=80, zorder=5, color="#F44336", edgecolors="k",
+                   label=f"Best Youden (thr={best_youden_thr:.3f})")
+    ax_roc.set_xlabel("False Positive Rate", fontsize=12)
+    ax_roc.set_ylabel("True Positive Rate", fontsize=12)
+    ax_roc.set_title("ROC Curve", fontsize=14, fontweight="bold")
+    ax_roc.legend(fontsize=10, loc="lower right")
+    ax_roc.set_xlim(-0.02, 1.02)
+    ax_roc.set_ylim(-0.02, 1.02)
+    ax_roc.grid(alpha=0.25)
+    ax_roc.set_aspect("equal")
+    # ── Panel 2: Precision-Recall ───────────────────────────────────
+    ax_prc = fig.add_subplot(gs[1])
+    ax_prc.plot(recall, precision, lw=2, color="#4CAF50",
+                label=f"AUPRC = {auprc:.4f}")
+    # baseline = prevalence
+    prevalence = n_pos / max(N, 1)
+    ax_prc.axhline(prevalence, ls="--", lw=1, color="grey", alpha=0.6,
+                    label=f"Baseline = {prevalence:.3f}")
+    # mark best-F1 point
+    ax_prc.scatter(recall[best_f1_idx + 1], precision[best_f1_idx + 1],
+                   s=80, zorder=5, color="#FF9800", edgecolors="k",
+                   label=f"Best F1={float(f1_arr[best_f1_idx]):.3f} "
+                         f"(thr={best_f1_thr:.3f})")
+    ax_prc.set_xlabel("Recall", fontsize=12)
+    ax_prc.set_ylabel("Precision", fontsize=12)
+    ax_prc.set_title("Precision-Recall Curve", fontsize=14, fontweight="bold")
+    ax_prc.legend(fontsize=9, loc="upper right")
+    ax_prc.set_xlim(-0.02, 1.02)
+    ax_prc.set_ylim(-0.02, 1.05)
+    ax_prc.grid(alpha=0.25)
+    ax_prc.set_aspect("equal")
+    # ── Panel 3: TCR × allele heatmap ───────────────────────────────
+    ax_hm = fig.add_subplot(gs[2])
+    # Sample n_sample TCRs: half positive, half negative for balance
+    rng = np.random.RandomState(seed)
+    pos_idx = np.where(lab == 1)[0]
+    neg_idx = np.where(lab == 0)[0]
+    n_pos_sample = min(n_sample // 2, len(pos_idx))
+    n_neg_sample = min(n_sample - n_pos_sample, len(neg_idx))
+    # if one class is too small, fill from the other
+    if n_neg_sample < n_sample - n_pos_sample:
+        n_pos_sample = min(n_sample - n_neg_sample, len(pos_idx))
+    sampled = np.concatenate([
+        rng.choice(pos_idx, n_pos_sample, replace=False),
+        rng.choice(neg_idx, n_neg_sample, replace=False),
+    ])
+    rng.shuffle(sampled)
+    # Build heatmap matrix — apply learnable mask if provided
+    hm = z_probs[sampled].copy()  # (n_sample, A)
+    if learnable_mask is not None:
+        hm = hm * learnable_mask[np.newaxis, :]
+    # Sort alleles by mean predicted prob so the heatmap isn't random noise
+    allele_order = np.argsort(-hm.mean(axis=0))
+    hm = hm[:, allele_order]
+    # Map original hla_indices into the reordered allele positions
+    inv_order = np.empty_like(allele_order)
+    inv_order[allele_order] = np.arange(A)
+    true_cols = inv_order[hla_indices[sampled]]  # column in reordered space
+    true_labels = lab[sampled]
+    # Plot heatmap
+    im = ax_hm.imshow(hm, aspect="auto", cmap="hot_r", interpolation="none",
+                       vmin=0, vmax=max(float(hm.max()), 0.05))
+    # Overlay true-HLA markers: green = positive, red = negative
+    for row_i in range(len(sampled)):
+        col_j = true_cols[row_i]
+        colour = "#00E676" if true_labels[row_i] == 1 else "#FF1744"
+        ax_hm.plot(col_j, row_i, marker="s", ms=3.5, color=colour,
+                   markeredgecolor="white", markeredgewidth=0.3)
+    # Grey band for non-learnable alleles (if mask provided)
+    if learnable_mask is not None:
+        non_learnable_reordered = (learnable_mask[allele_order] == 0)
+        for col_j in np.where(non_learnable_reordered)[0]:
+            ax_hm.axvline(col_j, color="grey", lw=0.15, alpha=0.35)
+    # Labels
+    ax_hm.set_xlabel("Alleles (sorted by mean predicted prob)", fontsize=11)
+    ax_hm.set_ylabel(f"Sampled TCRs  (n={len(sampled)}, "
+                      f"{int(true_labels.sum())} pos / "
+                      f"{int((1-true_labels).sum())} neg)", fontsize=11)
+    ax_hm.set_title("Predicted Binding Probabilities per TCR",
+                     fontsize=14, fontweight="bold")
+    # Colour bar
+    cb = fig.colorbar(im, ax=ax_hm, shrink=0.75, pad=0.02)
+    cb.set_label("γ  (predicted binding prob)", fontsize=10)
+    # Legend for markers
+    legend_elements = [
+        Patch(facecolor="#00E676", edgecolor="k", label="True HLA (positive)"),
+        Patch(facecolor="#FF1744", edgecolor="k", label="True HLA (negative)"),
+    ]
+    if learnable_mask is not None:
+        n_masked = int((learnable_mask == 0).sum())
+        legend_elements.append(
+            Patch(facecolor="grey", alpha=0.4,
+                  label=f"Non-learnable ({n_masked} alleles)"))
+    ax_hm.legend(handles=legend_elements, fontsize=8,
+                 loc="upper right", framealpha=0.85)
+    # ── Save ────────────────────────────────────────────────────────
+    fig.suptitle("VDJdb Evaluation — ROC / PRC / Prediction Heatmap",
+                 fontsize=15, fontweight="bold", y=0.97)
+    out_path = os.path.join(output_dir, "roc_prc_heatmap.png")
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {out_path}")
+ 
+
 def plot_hla_clustermap(cos_sim, hla_names, n_clusters, output_dir):
     """Plot HLA-HLA cosine similarity as a clustermap with dendrogram.
     Uses scipy hierarchical clustering + matplotlib (no seaborn dependency).
@@ -925,6 +1146,14 @@ def main():
     # ── 5. Run batched inference ─────────────────────────────────────
     print("\n[INFERENCE]")
     z_logits, z_probs = run_inference(model, data, batch_size=args.batch_size)
+    mask_path = os.path.join(args.model_dir, "learnable_allele_mask.npy")
+    if os.path.exists(mask_path):
+        learnable_mask = np.load(mask_path)  # (A,)
+        z_probs = z_probs * learnable_mask[np.newaxis, :]  # zero out singletons
+        z_logits = z_logits * learnable_mask[np.newaxis, :] + \
+                (1 - learnable_mask[np.newaxis, :]) * (-1e9)  # push singleton logits to -inf
+        n_masked = int((learnable_mask == 0).sum())
+        print(f"[MASK] Zeroed {n_masked} singleton alleles from predictions")
     # ── 6. Binary evaluation ─────────────────────────────────────────
     valid_mask = data["valid_mask"]
     valid_hla = data["hla_indices"][valid_mask]
@@ -994,6 +1223,20 @@ def main():
     plot_per_tcr_diagnostics(stats, args.output_dir)
     plot_neighbourhood_analysis(stats, args.output_dir)
     print(f"\nAll outputs saved to: {args.output_dir}")
+    # ROC, PRC curves and TCR×allele prediction heatmap
+    learnable_mask = None
+    mask_path = os.path.join(args.model_dir, "learnable_allele_mask.npy")
+    if os.path.exists(mask_path):
+        learnable_mask = np.load(mask_path)
+        print(f"[MASK] Loaded learnable_allele_mask: "
+              f"{int(learnable_mask.sum())}/{len(learnable_mask)} learnable")
+    plot_roc_prc_heatmap(
+        z_probs, valid_hla, valid_labels, idx_to_hla,
+        args.output_dir, learnable_mask=learnable_mask,
+        n_sample=100, seed=42,
+    )
     print("Done.")
 if __name__ == "__main__":
     main()
+
+

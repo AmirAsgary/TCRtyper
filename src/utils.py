@@ -3056,7 +3056,8 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         else:                                                                      #NEW
             learnable_np = np.ones(donor_hla_matrix.shape[1], dtype=np.float32)    #NEW
         self.learnable_allele_mask = tf.constant(learnable_np, dtype=tf.float32)   #NEW
-
+        if mask_singleton_alleles: # remove singleton alleles from donor hla matrix
+            self.X_T = self.X_T * self.learnable_allele_mask[:, tf.newaxis]  # (A,N) * (A,1) → (A,N)
     
     def batch_diversity_penalty(self, z_prob):
 
@@ -3977,4 +3978,143 @@ class GatedTransformerLayer(layers.Layer):
                 "normal_token": self.normal_token,
             }
         )
+        return cfg
+
+class CLIPBindingHead(layers.Layer):
+    """
+    CLIP-style binding head that computes z_logits from the dot product
+    of TCR and HLA embeddings in a shared space.
+    
+    Architecture:
+        HLA path:  hla_raw (A, hla_input_dim) → Dense(clip_dim) → hla_embed (A, D)
+        TCR path:  tcr_embed (B, D)  [produced upstream by the TCR encoder]
+        Output:    z_logits = tcr_embed @ hla_embed^T + bias    (B, A)
+    
+    The HLA raw embeddings (from ESM) are stored as a trainable weight,
+    allowing gradient flow to fine-tune them during likelihood training.
+    The bias is initialised to the population log-odds ln(f_a / (1-f_a)),
+    ensuring γ_ia = f_a when the dot product is zero (manuscript Eq. 2.2.2).
+    
+    Parameters
+    ----------
+    num_alleles : int
+        Total number of HLA alleles (A).
+    clip_dim : int
+        Shared embedding dimension (D) for both TCR and HLA.
+    hla_input_dim : int
+        Dimensionality of the raw HLA embeddings from ESM (default 32).
+    hla_embed_init : np.ndarray or None, shape (A, hla_input_dim)
+        Pre-computed HLA embeddings. If None, random init is used.
+    bias_init : np.ndarray or None, shape (A,)
+        Log-odds bias initialisation. If None, zeros are used.
+    train_hla_proj : bool
+        Whether to allow gradients through the HLA projection.
+        If False, only the TCR encoder learns; HLA embeddings are fixed.
+    """
+
+    def __init__(self, num_alleles, clip_dim, hla_input_dim=32,
+                 hla_embed_init=None, bias_init=None,
+                 train_hla_proj=True, init_temperature=5.0, min_temperature=0.5,
+                 scale_hla_embed=True, **kwargs):
+        super().__init__(**kwargs)
+        self.num_alleles = num_alleles
+        self.clip_dim = clip_dim
+        self.hla_input_dim = hla_input_dim
+        self.train_hla_proj = train_hla_proj
+        self.scale_hla_embed = scale_hla_embed
+
+        # ── HLA raw embeddings: (A, hla_input_dim) ──────────────────
+        # These are the ESM-derived representations, stored as a weight
+        # so they can optionally be fine-tuned via backprop.
+        if hla_embed_init is not None:
+            init = tf.keras.initializers.Constant(hla_embed_init)
+            if scale_hla_embed:
+                # Normalize to unit norm, then scale down
+                norms = np.linalg.norm(hla_embed_init, axis=1, keepdims=True)
+                hla_embed_scaled = hla_embed_init / np.clip(norms, 1e-6, None)
+                hla_embed_scaled *= 0.1  # small norm → small dot products
+                init = tf.keras.initializers.Constant(hla_embed_scaled)
+        else:
+            init = tf.keras.initializers.RandomNormal(stddev=0.02)
+
+        self.hla_raw = self.add_weight(
+                name="hla_raw_embeddings",
+                shape=(num_alleles, hla_input_dim),
+                initializer=init,
+                trainable=train_hla_proj,
+            )
+
+        # ── HLA projection: (hla_input_dim) → (clip_dim) ────────────
+        # This is NN_φ from the manuscript — projects pseudo-sequence
+        # embeddings into the shared CLIP space.
+        self.hla_proj = layers.Dense(
+            clip_dim, use_bias=True, name="hla_clip_proj",
+            trainable=True, kernel_initializer=tf.keras.initializers.GlorotUniform(),
+            bias_initializer="zeros"
+        )
+
+        # ── Log-odds bias: (A,) ─────────────────────────────────────
+        # Ensures γ_ia = f_a when dot product is zero.
+        # Always trainable so the model can adjust allele-level offsets.
+        if bias_init is not None:
+            b_init = tf.keras.initializers.Constant(bias_init)
+        else:
+            b_init = "zeros"
+        self.allele_bias = self.add_weight(
+            name="allele_bias",
+            shape=(num_alleles,),
+            initializer=b_init,
+            trainable=False,  # frozen offset, as per manuscript
+        )
+
+        self.log_temperature = self.add_weight(
+            name="log_temperature",
+            shape=(),
+            initializer=tf.keras.initializers.Constant(
+                np.log(init_temperature)),
+            trainable=True,
+        )
+        self.min_temperature = min_temperature
+
+    def call(self, tcr_embed):
+        """
+        Parameters
+        ----------
+        tcr_embed : tf.Tensor, shape (B, clip_dim)
+            TCR representations from the encoder.
+        
+        Returns
+        -------
+        z_logits : tf.Tensor, shape (B, A)
+            Raw logits for all alleles. Apply sigmoid to get γ_ia.
+        """
+        # Project HLA embeddings into shared space:
+        #   (A, hla_input_dim) → (A, clip_dim)
+        hla_embed = self.hla_proj(self.hla_raw)          # (A, D)
+
+        # Temperature-scaled dot product
+        temperature = tf.maximum(
+            tf.exp(self.log_temperature), 
+            self.min_temperature
+        )
+
+        # Dot product: (B, D) @ (D, A) → (B, A)
+        z_logits = tf.matmul(tcr_embed, hla_embed, transpose_b=True) / temperature
+        # Add per-allele log-odds bias
+        z_logits = z_logits + self.allele_bias            # (B, A)
+
+        return z_logits
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "num_alleles": self.num_alleles,
+            "clip_dim": self.clip_dim,
+            "hla_input_dim": self.hla_input_dim,
+            "train_hla_proj": self.train_hla_proj,
+            "scale_hla_embed": self.scale_hla_embed,
+            "hla_embed_init": self.hla_embed_init,
+            "bias_init": self.bias_init,
+            "init_temperature": self.init_temperature,
+        })
         return cfg
