@@ -202,6 +202,18 @@ def parse_args():
                    help="Custom base directory for TFRecord cache files. "
                         "If set, TFRecords are read/written/resumed from "
                         "this path instead of the default output_dir")
+    # ── singleton allele masking ─────────────────────────────────
+    p.add_argument("--mask_singleton_alleles", action="store_true",
+                   default=False,
+                   help="Zero out alleles with < min_donors_per_allele donors "
+                        "from labels, likelihood, MAP, and all regularisers.  "
+                        "These alleles are unidentifiable under the likelihood "
+                        "because a single donor provides no positive/negative "
+                        "contrast.")
+    p.add_argument("--min_donors_per_allele", type=int, default=2,
+                   help="Minimum number of donors an allele must appear in "
+                        "to remain learnable (default: 2).  Only effective "
+                        "when --mask_singleton_alleles is set.")
     return p.parse_args()
 # ═════════════════════════════════════════════════════════════════════
 # 2.  HARDWARE SETUP
@@ -425,14 +437,54 @@ def convert_h5_to_tfrecords(h5_path: str, output_dir: str, args,
     if os.path.exists(manifest_path):
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
-        # Reuse only if source H5 AND min_donors threshold match
-        if (manifest.get("source_h5") == h5_path and
-                manifest.get("min_donors", 1) == min_donors):
+        # ── check every field that must match ────────────────────────
+        mismatches = []
+        if manifest.get("source_h5") != h5_path:
+            mismatches.append(
+                f"  source_h5: was '{manifest.get('source_h5')}', "
+                f"now '{h5_path}'")
+        if manifest.get("min_donors", 1) != min_donors:
+            mismatches.append(
+                f"  min_donors: was {manifest.get('min_donors', 1)}, "
+                f"now {min_donors}")
+        if manifest.get("num_shards") != num_shards:
+            mismatches.append(
+                f"  num_shards: was {manifest.get('num_shards')}, "
+                f"now {num_shards}")
+        if manifest.get("num_alleles") != args.num_alleles:
+            mismatches.append(
+                f"  num_alleles: was {manifest.get('num_alleles')}, "
+                f"now {args.num_alleles}")
+
+        if not mismatches:
             print(f"  [CACHE] Reusing existing TFRecords in {tfr_dir} "
                   f"({manifest['num_clusters']} clusters, "
                   f"{manifest['num_shards']} shards, "
                   f"min_donors={min_donors})")
             return manifest["shard_paths"]
+
+        raise ValueError(
+            f"TFRecords already exist at {tfr_dir} but were generated "
+            f"with different settings:\n"
+            + "\n".join(mismatches) +
+            f"\n\nTo fix this, either:"
+            f"\n  1) Delete '{tfr_dir}' manually and re-run, or"
+            f"\n  2) Use --tf_record_path to point to a new directory."
+        )
+
+    # ── no manifest — check for orphaned .tfrecord files ─────────
+    existing_tfrecords = [
+        f for f in os.listdir(tfr_dir) if f.endswith(".tfrecord")
+    ] if os.path.isdir(tfr_dir) else []
+
+    if existing_tfrecords:
+        raise FileExistsError(
+            f"Found {len(existing_tfrecords)} .tfrecord files in "
+            f"'{tfr_dir}' but no manifest.json — likely from a "
+            f"crashed or incomplete conversion.\n"
+            f"Delete '{tfr_dir}' manually to regenerate."
+        )
+
     print(f"  [CACHE] Converting {h5_path} → TFRecords in {tfr_dir} ...")
     if min_donors > 1:
         print(f"  [CACHE] Filtering: keeping only clusters with "
@@ -737,6 +789,8 @@ def save_config(args, output_dir: str, device_type: str,
             "num_shards": args.num_shards,
             "keep_only_upperthan_n_donors": args.keep_only_upperthan_n_donors,
             "tf_record_path": args.tf_record_path,
+            "mask_singleton_alleles": args.mask_singleton_alleles,
+            "min_donors_per_allele": args.min_donors_per_allele,
         },
         "tokens": {
             "pad": args.pad_token,
@@ -744,6 +798,8 @@ def save_config(args, output_dir: str, device_type: str,
             "sep": args.sep_token,
             "normal": args.normal_token,
         },
+        
+
     }
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, "w") as f:
@@ -1339,7 +1395,7 @@ def eval_step(model, loss_fn,
     """Forward-only evaluation step matching train_step's tensor signature."""
     z_logits = model([combined_cdr, combined_mask], training=False)
     nll, reg, total_map = loss_fn(z_logits, binder_dense, donor_indices)
-    total_loss = nll + reg, total_map
+    total_loss = nll + reg + total_map
     diag = compute_diagnostics(z_logits, binder_dense, model)
     return {"total_loss": total_loss, "nll": nll, "reg": reg, "total_map": total_map, **diag}
 # ═════════════════════════════════════════════════════════════════════
@@ -1897,7 +1953,9 @@ def main():
         alpha=args.alpha,
         B=args.B,
         diversity_lambda=args.diversity_lambda,
-        map_weight=args.map_weight,)
+        map_weight=args.map_weight,
+        mask_singleton_alleles=args.mask_singleton_alleles,
+        min_donors_per_allele=args.min_donors_per_allele,)
     # ── count dataset size for LR schedule ───────────────────────────
     n_train = 0
     if args.mode == "train":

@@ -3001,7 +3001,10 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
                  hla_bias_init=None, invariant_lambda=0.0,
                  false_pos_lambda=0.0, alpha_0=1.0,
                  alpha_1=2.5, alpha=2.0, B=30, diversity_lambda=1.0,
-                 map_weight=1.0, **kwargs):
+                 map_weight=1.0,
+                 mask_singleton_alleles=False,   #NEW: flag to mask singleton alleles
+                 min_donors_per_allele=2,        #NEW: configurable threshold for singleton detection
+                 **kwargs):
         super().__init__(**kwargs)
         self.beta = beta
         self.pad_token = pad_token
@@ -3030,6 +3033,30 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         else:
             self.prior_logits = 0.0
 
+        # ══════════════════════════════════════════════════════════════
+        #NEW: Singleton allele mask
+        #NEW: Alleles carried by fewer than min_donors_per_allele donors
+        #NEW: are unidentifiable under the likelihood (no pos/neg contrast).
+        #NEW: When mask_singleton_alleles is True, we build a per-allele
+        #NEW: mask (A,) that is 1.0 for learnable alleles and 0.0 for
+        #NEW: singletons. This mask is applied in call(), compute_map(),
+        #NEW: and all regularisers so that singleton alleles produce
+        #NEW: exactly zero gradient — their logits stay at the prior.
+        # ══════════════════════════════════════════════════════════════
+        self.mask_singleton_alleles = mask_singleton_alleles                       #NEW
+        self.min_donors_per_allele = min_donors_per_allele                         #NEW
+        donor_counts = np.sum(donor_hla_matrix, axis=0)  # (A,) numpy             #NEW
+        if mask_singleton_alleles:                                                 #NEW
+            learnable_np = (donor_counts >= min_donors_per_allele).astype(np.float32)  #NEW
+            n_masked = int(np.sum(learnable_np == 0.0))                            #NEW
+            n_total = len(learnable_np)                                            #NEW
+            print(f"  [SINGLETON MASK] Masking {n_masked}/{n_total} alleles "      #NEW
+                  f"with < {min_donors_per_allele} donors "                        #NEW
+                  f"({n_total - n_masked} learnable)")                             #NEW
+        else:                                                                      #NEW
+            learnable_np = np.ones(donor_hla_matrix.shape[1], dtype=np.float32)    #NEW
+        self.learnable_allele_mask = tf.constant(learnable_np, dtype=tf.float32)   #NEW
+
     
     def batch_diversity_penalty(self, z_prob):
 
@@ -3048,12 +3075,16 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         # Computes the negative log-prior of the Logit-Beta distribution.
         # Formula: - [ alpha_0 * h_ia - (alpha_0 + alpha_1) * ln(1 + exp(h_ia)) ]
         neg_logit_beta_penalty = -(self.alpha_0 * z_logits) + ((self.alpha_0 + self.alpha_1) * tf.math.softplus(z_logits)) # (B, A)
+        #NEW: zero out singleton alleles before summing so they contribute no MAP gradient
+        neg_logit_beta_penalty = neg_logit_beta_penalty * self.learnable_allele_mask[tf.newaxis, :]  #NEW
         neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1) # (B,)
 
         # compute_gamma_sum_penalty
         # Computes the negative log-prior of the Gamma distribution for expected bindings.
         # Formula: - [ (alpha - 1) * ln(sum(gamma_ia)) - (alpha / B) * sum(gamma_ia) ]
-        sum_gamma = tf.reduce_sum(z_probs, axis=-1) # (B,)
+        #NEW: only sum over learnable alleles for gamma-sum penalty
+        z_probs_masked = z_probs * self.learnable_allele_mask[tf.newaxis, :]  #NEW
+        sum_gamma = tf.reduce_sum(z_probs_masked, axis=-1) # (B,)            #NEW: was z_probs
         sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
         neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
         
@@ -3067,11 +3098,16 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         # Formula: -(alpha_0 - 1) * h_ia + (alpha_0 + alpha_1 - 2) * softplus(h_ia)
         neg_logit_beta_penalty = -(self.alpha_0 - 1.0) * z_logits + (self.alpha_0 + self.alpha_1 - 2.0) * tf.math.softplus(z_logits)
         
+        #NEW: zero out singleton alleles before summing so they contribute no MAP gradient
+        neg_logit_beta_penalty = neg_logit_beta_penalty * self.learnable_allele_mask[tf.newaxis, :]  #NEW
+        
         # Sum over ALL alleles
         neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1)
         
         # 2. Gamma/Exponential Sum Penalty
-        sum_gamma = tf.reduce_sum(z_probs, axis=-1)
+        #NEW: only sum over learnable alleles for gamma-sum penalty
+        z_probs_masked = z_probs * self.learnable_allele_mask[tf.newaxis, :]  #NEW
+        sum_gamma = tf.reduce_sum(z_probs_masked, axis=-1)                    #NEW: was z_probs
         sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
         
         # Formula: (alpha / B) * sum_gamma - (alpha - 1) * ln(sum_gamma)
@@ -3098,9 +3134,10 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         the rare-allele flat-gradient artifact.
         """
         if self.l2_reg_lambda > 0:
-            return self.l2_reg_lambda * tf.reduce_mean(
-                tf.square(z_logits - self.prior_logits)
-            )
+            #NEW: only penalise learnable alleles — singletons stay frozen at prior
+            diff_sq = tf.square(z_logits - self.prior_logits)                           #NEW
+            diff_sq = diff_sq * self.learnable_allele_mask[tf.newaxis, :]                #NEW
+            return self.l2_reg_lambda * tf.reduce_mean(diff_sq)                          #NEW
         return 0.0
 
     def scale_invariant_sparsity(self, z_prob, active_mask):
@@ -3184,11 +3221,20 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
             Negative log-likelihood (summed or averaged over batch).
         total_reg : scalar
             Sum of all regularisation terms.
+        total_map : scalar
+            MAP prior penalty (weighted).
         """
 
         # ============================================================
         # 1. Masks and probabilities
         # ============================================================
+        #NEW: zero out singleton allele columns in binder_dense — as if
+        #NEW: those alleles did not exist in the label. Donors carrying
+        #NEW: only singleton alleles keep their other allele labels intact.
+        binder_dense_set = (                                                       #NEW
+            tf.cast(binder_dense_set, tf.float32)                                  #NEW
+            * self.learnable_allele_mask[tf.newaxis, :]                             #NEW
+        )                                                                          #NEW
         mask = tf.cast(binder_dense_set, tf.float32)       # (B, A) co-occurrence mask
         inactive_mask = 1.0 - mask                          # alleles that do NOT co-occur
 
@@ -3231,7 +3277,10 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
             # Valid when x_na·γ_ia is small, which holds for continuous
             # x_na from incomplete HLA typing.
             # -----------------------------------------------------------
-            sum_x_gamma = tf.matmul(z_prob, self.X_T)       # (B, N): Σ_a γ_ia · x_na
+            #NEW: zero singleton alleles in z_prob before matmul so they
+            #NEW: contribute nothing to the binding sum for any donor
+            z_prob_for_pni = z_prob * self.learnable_allele_mask[tf.newaxis, :]  #NEW
+            sum_x_gamma = tf.matmul(z_prob_for_pni, self.X_T)   # (B, N): Σ_a γ_ia · x_na  #NEW: was z_prob
             # p_ni = 1 - exp(-sum) — use expm1 for stability near 0
             p_ni = -tf.math.expm1(-sum_x_gamma)             # (B, N)
             # log(p_ni) = log(1 - exp(-sum))
@@ -3251,6 +3300,13 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
             # Note: log_prod <= 0 always (sum of non-positive terms).
             # -----------------------------------------------------------
             log_1_minus_gamma = -tf.math.softplus(z_logits)  # (B, A): exact log(1 - γ_ia)
+
+            #NEW: zero singleton allele log-factors so they contribute
+            #NEW: exp(0)=1 to the product, i.e. allele a is invisible.
+            #NEW: When mask[a]=0 → log_1_minus_gamma[:,a]=0
+            #NEW:   → matmul adds 0 for that allele → factor = 1
+            log_1_minus_gamma = log_1_minus_gamma * self.learnable_allele_mask[tf.newaxis, :]  #NEW
+
             log_prod = tf.matmul(log_1_minus_gamma, self.X_T)  # (B, N): Σ_a x_na log(1 - γ_ia)
 
             p_ni = -tf.math.expm1(log_prod)                 # (B, N): exact 1 - exp(log_prod)
