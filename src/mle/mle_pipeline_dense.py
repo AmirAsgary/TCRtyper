@@ -67,14 +67,17 @@ def parse_args():
     # MAP
     parser.add_argument('--beta', type=float, default=4.0,
                         help='Beta hyperparameter (default: 4.0)')
-    parser.add_argument('--alpha_0', type=float, default=1.0,
-                        help='Alpha_0 MAP hyperparameter (default: 1.0)')
-    parser.add_argument('--alpha_1', type=float, default=2.5,
-                        help='Alpha_1 MAP hyperparameter (default: 2.5)')
-    parser.add_argument('--alpha', type=float, default=1.0,
-                        help='Alpha MAP hyperparameter (default: 1.0, Exponential)')
+    parser.add_argument('--alpha_0', type=float, default=0.0,
+                        help='Alpha_0 MAP hyperparameter (default: 0.0)')
+    parser.add_argument('--alpha_1', type=float, default=0.5,
+                        help='Alpha_1 MAP hyperparameter (default: 0.5)')
+    parser.add_argument('--alpha', type=float, default=2.0,
+                        help='Alpha MAP hyperparameter (default: 2.0, Exponential)')
     parser.add_argument('--B', type=float, default=30.0,
                         help='B MAP hyperparameter (default: 30.0)')
+    #prior eni
+    parser.add_argument("--lambda_eni", type=float, default=2.0,
+                        help="lambda_eni hyperparameter (default: 2.0)")
     ### Analysis flags
     parser.add_argument('--analyze_all', action='store_true',
                         help='Run all analysis modules')
@@ -185,6 +188,7 @@ def train_model(data, args, output_path):
         alpha_1=args.alpha_1,
         alpha=args.alpha,
         B=args.B,
+        lambda_eni=args.lambda_eni,
     )
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     model.compile(optimizer=optimizer)
