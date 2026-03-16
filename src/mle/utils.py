@@ -691,7 +691,7 @@ class NonSparseTCRModel(tf.keras.Model):
         # -----------------------------------------------------------
         log_likelihood = reward + penalty
         # MAP
-        neg_logit_beta_penalty, neg_log_p_g = self.compute_map2(z_logits, z_prob)
+        neg_logit_beta_penalty, neg_log_p_g = self.compute_map_2(z_logits, z_prob)
         map_penalties = neg_logit_beta_penalty + neg_log_p_g
         # e_ni prior
         minus_e_ni_prior = self.compute_prior_on_eni(z_prob, safe_pos_indices, pos_mask)
@@ -916,7 +916,7 @@ class SparseTCRModel(tf.keras.Model):
         penalty = tf.math.lgamma(n_tilde + self.beta) - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
         log_likelihood = reward + penalty
         # MAP Penalties
-        neg_logit_beta_penalty, neg_log_p_g = self.compute_map2(z_logits, z_prob, batch_mask)
+        neg_logit_beta_penalty, neg_log_p_g = self.compute_map_2(z_logits, z_prob, batch_mask)
         map_penalties = neg_logit_beta_penalty + neg_log_p_g
         # e_ni prior
         minus_e_ni_prior = self.compute_prior_on_eni(z_prob, relevant_x, safe_pos_indices, pos_mask)
