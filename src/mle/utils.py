@@ -594,7 +594,7 @@ class NonSparseTCRModel(tf.keras.Model):
         return [self.loss_tracker, self.final_loss_tracker, self.map_tracker, self.eniprior_tracker]
 
     def compute_prior_on_eni(self, z_probs, safe_pos_indices, pos_mask):
-            """A prior on the expected number of alleles of donor n bound by TCR i."""
+        """A prior on the expected number of alleles of donor n bound by TCR i."""
         # - \lambda \sum_{n: y_{ni}=1} \left| \ln \sum_a \gamma_{ia} x_{na} \right|
         # first sum: |ln(sum_a(gamma_ia * x_ia))|
         e_ni = tf.matmul(z_probs, self.X_T) #(B,A) * (A,N) -> (B,N)
