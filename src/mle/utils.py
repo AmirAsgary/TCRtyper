@@ -552,7 +552,8 @@ class NonSparseTCRModel(tf.keras.Model):
     """
     def __init__(self, num_tcrs, num_total_alleles, donor_hla_matrix, 
                  beta=4.0, pad_token=-1., accumulation_steps=1, reduction='sum',
-                 alpha_0=1.0, alpha_1=2.5, alpha=1.0, B=30.0): # alpha=1.0 for Exponential
+                 alpha_0=0.0, alpha_1=0.5, alpha=2.0, B=30.0,
+                 lambda_eni=2.): # alpha=1.0 for Exponential
         super().__init__()
         self.beta = beta
         self.pad_token = pad_token
@@ -574,6 +575,7 @@ class NonSparseTCRModel(tf.keras.Model):
         self.loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.final_loss_tracker = tf.keras.metrics.Mean(name="final_loss")
         self.map_tracker = tf.keras.metrics.Mean(name="map_term")
+        self.eniprior_tracker = tf.keras.metrics.Mean(name='eni_prior')
         
         # MAP Hyperparameters
         self.alpha_0 = tf.constant(alpha_0, dtype=tf.float32)
@@ -581,12 +583,44 @@ class NonSparseTCRModel(tf.keras.Model):
         self.alpha = tf.constant(alpha, dtype=tf.float32)
         self.B = tf.constant(B, dtype=tf.float32)
 
+        # eni_prior params
+        self.lambda_eni = tf.constant(lambda_eni, dtype=tf.float32)
+
         self._grad_accumulators = None
         self._accum_step = None
 
     @property
     def metrics(self):
-        return [self.loss_tracker, self.final_loss_tracker, self.map_tracker]
+        return [self.loss_tracker, self.final_loss_tracker, self.map_tracker, self.eniprior_tracker]
+
+    def compute_prior_on_eni(self, z_probs, safe_pos_indices, pos_mask):
+            """A prior on the expected number of alleles of donor n bound by TCR i."""
+        # - \lambda \sum_{n: y_{ni}=1} \left| \ln \sum_a \gamma_{ia} x_{na} \right|
+        # first sum: |ln(sum_a(gamma_ia * x_ia))|
+        e_ni = tf.matmul(z_probs, self.X_T) #(B,A) * (A,N) -> (B,N)
+        e_ni_safe = tf.maximum(e_ni, tf.keras.backend.epsilon()) #(B,N)
+        log_e_ni = tf.math.log(e_ni_safe)
+        abs_log_e_ni = tf.math.abs(log_e_ni) #(B,N)
+        # second sum: sum_n(abs_log_e_ni) for n if y_ni = 1
+        # dim safe_pos_indices --> (B, P) where P are padded donors for that batch
+        abs_log_e_ni_gathered = tf.gather(abs_log_e_ni, safe_pos_indices, batch_dims=1) #(B,N) --> (B,P)
+        abs_log_e_ni_masked = abs_log_e_ni_gathered * pos_mask # removes padded ones
+        return self.lambda_eni * tf.reduce_sum(abs_log_e_ni_masked, axis=-1) # -(-lambda * term) # (B,)
+       
+
+    def compute_map_2(self, z_logits, z_probs):
+        # compute_logit_beta_penalty
+        # Computes the negative log-prior of the Logit-Beta distribution.
+        # Formula: - [ alpha_0 * h_ia - (alpha_0 + alpha_1) * ln(1 + exp(h_ia)) ]
+        neg_logit_beta_penalty = -(self.alpha_0 * z_logits) + ((self.alpha_0 + self.alpha_1) * tf.math.softplus(z_logits)) # (B, A)
+        neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1) # (B,)
+        # compute_gamma_sum_penalty
+        # Computes the negative log-prior of the Gamma distribution for expected bindings.
+        # Formula: - [ (alpha - 1) * ln(sum(gamma_ia)) - (alpha / B) * sum(gamma_ia) ]
+        sum_gamma = tf.reduce_sum(z_probs, axis=-1) # (B,)            
+        sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
+        neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
+        return neg_logit_beta_penalty, neg_log_p_g # Both are now (B,)
 
     def compute_map(self, z_logits, z_probs):
         """
@@ -607,6 +641,7 @@ class NonSparseTCRModel(tf.keras.Model):
         neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
         
         return neg_logit_beta_penalty, neg_log_p_g
+
 
     def call(self, inputs):
         """Compute negative log-likelihood loss across all alleles."""
@@ -634,8 +669,8 @@ class NonSparseTCRModel(tf.keras.Model):
         # -----------------------------------------------------------
         # Positive donors (Reward)
         # -----------------------------------------------------------
-        safe_pos_indices = tf.maximum(pos_donor_indices, 0)
-        pos_mask = tf.cast(tf.not_equal(pos_donor_indices, tf.cast(self.pad_token, tf.int32)), tf.float32)
+        safe_pos_indices = tf.maximum(pos_donor_indices, 0) #(B,P) keeps the indices --> used for tf.gather
+        pos_mask = tf.cast(tf.not_equal(pos_donor_indices, tf.cast(self.pad_token, tf.int32)), tf.float32) #(B,P) masks the padded token ones --> multipled by tf.gathered one
         
         p_pos = tf.gather(p_ni_safe, safe_pos_indices, batch_dims=1)
         reward = tf.reduce_sum(tf.math.log(p_pos) * pos_mask, axis=1)
@@ -655,18 +690,21 @@ class NonSparseTCRModel(tf.keras.Model):
         # Combine Likelihood and MAP
         # -----------------------------------------------------------
         log_likelihood = reward + penalty
-        
-        neg_logit_beta_penalty, neg_log_p_g = self.compute_map(z_logits, z_prob)
+        # MAP
+        neg_logit_beta_penalty, neg_log_p_g = self.compute_map2(z_logits, z_prob)
         map_penalties = neg_logit_beta_penalty + neg_log_p_g
-
+        # e_ni prior
+        minus_e_ni_prior = self.compute_prior_on_eni(z_prob, safe_pos_indices, pos_mask)
         if self.reduction == 'sum':
             nll = -tf.reduce_sum(log_likelihood)
             total_map = tf.reduce_sum(map_penalties)
+            total_e_ni_prior = tf.reduce_sum(minus_e_ni_prior)
         else:
             nll = -tf.reduce_mean(log_likelihood)
             total_map = tf.reduce_mean(map_penalties)
+            total_e_ni_prior = tf.reduce_mean(minus_e_ni_prior)
             
-        return nll, total_map
+        return nll, total_map, total_e_ni_prior
 
     # -----------------------------------------------------------
     # Gradient Accumulation and Training Step
@@ -690,8 +728,8 @@ class NonSparseTCRModel(tf.keras.Model):
 
     def train_step(self, data):
         with tf.GradientTape() as tape:
-            loss, total_map = self(data, training=True)
-            final_loss = loss + total_map
+            loss, total_map, total_e_ni_prior = self(data, training=True)
+            final_loss = loss + total_map + total_e_ni_prior
 
         gradients = tape.gradient(final_loss, self.trainable_variables)
 
@@ -715,14 +753,17 @@ class NonSparseTCRModel(tf.keras.Model):
             display_loss = loss / batch_size
             display_final = final_loss / batch_size
             display_map = total_map / batch_size
+            display_eniprior = total_e_ni_prior / batch_size
         else:
             display_loss = loss
             display_final = final_loss
             display_map = total_map
+            display_eniprior = total_e_ni_prior 
             
         self.loss_tracker.update_state(display_loss)
         self.final_loss_tracker.update_state(display_final)
         self.map_tracker.update_state(display_map)
+        self.eniprior_tracker.update_state(display_eniprior)
         
         return {m.name: m.result() for m in self.metrics}
 
@@ -745,7 +786,8 @@ class SparseTCRModel(tf.keras.Model):
     def __init__(self, num_tcrs, max_hlas_per_tcr, donor_hla_matrix, binder_sets, 
                  beta=4.0, mode='continuous', pad_token=-1., l2_reg_lambda=1e-5,
                  accumulation_steps=1, reduction='sum',
-                 alpha_0=1.0, alpha_1=2.5, alpha=2.0, B=30.0):
+                 alpha_0=0.0, alpha_1=0.5, alpha=2.0, B=30.0,
+                 lambda_eni=2.,):
         super().__init__()
         self.beta = beta
         self.mode = mode
@@ -768,11 +810,14 @@ class SparseTCRModel(tf.keras.Model):
         self.final_loss_tracker = tf.keras.metrics.Mean(name="final_loss")
         self.reg_tracker = tf.keras.metrics.Mean(name="reg_term")
         self.map_tracker = tf.keras.metrics.Mean(name="map_term")
+        self.eniprior_tracker = tf.keras.metrics.Mean(name='eni_prior')
         # MAP Hyperparameters
         self.alpha_0 = tf.constant(alpha_0, dtype=tf.float32)
         self.alpha_1 = tf.constant(alpha_1, dtype=tf.float32)
         self.alpha = tf.constant(alpha, dtype=tf.float32)
         self.B = tf.constant(B, dtype=tf.float32)
+        # eni params
+        self.lambda_eni = tf.constant(lambda_eni, dtype=tf.float32)
         # Gradient accumulation state (built lazily on first train_step)
         self._grad_accumulators = None
         self._accum_step = None
@@ -790,6 +835,42 @@ class SparseTCRModel(tf.keras.Model):
     def get_z_probabilities(self, z_logits, mask):
         """Toggle between continuous relaxation and binary sampling."""
         return tf.sigmoid(z_logits) * mask
+
+    def compute_prior_on_eni(self, z_probs, relevant_x, safe_pos_indices, pos_mask):
+        """A prior on the expected number of alleles of donor n bound by TCR i.
+        -lambda * sum_{n: y_ni=1} |ln(sum_a gamma_ia * x_na)|
+        Parameters
+        ----------
+        z_probs : (B, max_hlas_per_tcr)  — already masked (padded slots are 0)
+        relevant_x : (B, max_hlas_per_tcr, N) — donor HLA values for candidate alleles
+        safe_pos_indices : (B, P) — indices of positive donors (padded with 0)
+        pos_mask : (B, P) — 1.0 for real positive donors, 0.0 for padding
+        """
+        # e_ni = sum_a gamma_ia * x_na   -> (B, N)
+        e_ni = tf.einsum('ba,ban->bn', z_probs, relevant_x)
+        # |ln(e_ni)|
+        e_ni_safe = tf.maximum(e_ni, tf.keras.backend.epsilon())
+        abs_log_e_ni = tf.math.abs(tf.math.log(e_ni_safe))  # (B, N)
+        # gather only positive donors and mask out padding
+        abs_log_e_ni_gathered = tf.gather(abs_log_e_ni, safe_pos_indices, batch_dims=1)  # (B, P)
+        abs_log_e_ni_masked = abs_log_e_ni_gathered * pos_mask
+        return self.lambda_eni * tf.reduce_sum(abs_log_e_ni_masked, axis=-1)  # (B,)
+    def compute_map_2(self, z_logits, z_probs, mask=None):
+        # compute_logit_beta_penalty
+        # Computes the negative log-prior of the Logit-Beta distribution.
+        # Formula: - [ alpha_0 * h_ia - (alpha_0 + alpha_1) * ln(1 + exp(h_ia)) ]
+        neg_logit_beta_penalty = -(self.alpha_0 * z_logits) + ((self.alpha_0 + self.alpha_1) * tf.math.softplus(z_logits)) # (B, A)
+        if mask is not None:
+            neg_logit_beta_penalty = neg_logit_beta_penalty * mask
+        neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1) # (B,)
+        # compute_gamma_sum_penalty
+        # Computes the negative log-prior of the Gamma distribution for expected bindings.
+        # Formula: - [ (alpha - 1) * ln(sum(gamma_ia)) - (alpha / B) * sum(gamma_ia) ]
+        #NEW: only sum over learnable alleles for gamma-sum penalty
+        sum_gamma = tf.reduce_sum(z_probs, axis=-1) # (B,)            #NEW: was z_probs
+        sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
+        neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
+        return neg_logit_beta_penalty, neg_log_p_g # Both are now (B,)
 
     def compute_map(self, z_logits, z_probs, mask=None):
         # 1. Direct Beta Prior Penalty (Mode at 0 in probability space)
@@ -835,21 +916,23 @@ class SparseTCRModel(tf.keras.Model):
         penalty = tf.math.lgamma(n_tilde + self.beta) - tf.math.lgamma(n_i + n_tilde + self.beta + 1.0)
         log_likelihood = reward + penalty
         # MAP Penalties
-        neg_logit_beta_penalty, neg_log_p_g = self.compute_map(z_logits, z_prob, batch_mask)
+        neg_logit_beta_penalty, neg_log_p_g = self.compute_map2(z_logits, z_prob, batch_mask)
         map_penalties = neg_logit_beta_penalty + neg_log_p_g
-        # Reduction: sum makes gradient per z_i independent of batch_size
+        # e_ni prior
+        minus_e_ni_prior = self.compute_prior_on_eni(z_prob, relevant_x, safe_pos_indices, pos_mask)
         if self.reduction == 'sum':
             nll = -tf.reduce_sum(log_likelihood)
             total_map = tf.reduce_sum(map_penalties)
+            total_e_ni_prior = tf.reduce_sum(minus_e_ni_prior)
         else:
             nll = -tf.reduce_mean(log_likelihood)
             total_map = tf.reduce_mean(map_penalties)
-            
-        return nll, regularization_term, total_map
+            total_e_ni_prior = tf.reduce_mean(minus_e_ni_prior)
+        return nll, total_map, total_e_ni_prior
 
     @property
     def metrics(self):
-        return [self.loss_tracker, self.final_loss_tracker, self.reg_tracker, self.map_tracker]
+        return [self.loss_tracker, self.final_loss_tracker, self.map_tracker, self.eniprior_tracker,] #self.reg_tracker]
 
     def _ensure_accumulators(self):
             """Create gradient accumulator variables on the same device as the model."""
@@ -874,8 +957,8 @@ class SparseTCRModel(tf.keras.Model):
 
     def train_step(self, data):
         with tf.GradientTape() as tape:
-            loss, reg_term, total_map = self(data, training=True)
-            final_loss = loss + reg_term + total_map
+            loss, total_map, total_e_ni_prior = self(data, training=True)
+            final_loss = loss + total_map + total_e_ni_prior
 
         gradients = tape.gradient(final_loss, self.trainable_variables)
 
@@ -903,14 +986,17 @@ class SparseTCRModel(tf.keras.Model):
             display_loss = loss / batch_size
             display_final = final_loss / batch_size
             display_map = total_map / batch_size
+            display_eniprior = total_e_ni_prior / batch_size
         else:
             display_loss = loss
             display_final = final_loss
             display_map = total_map
+            display_eniprior = total_e_ni_prior
         self.loss_tracker.update_state(display_loss)
         self.final_loss_tracker.update_state(display_final)
-        self.reg_tracker.update_state(reg_term)
+        #self.reg_tracker.update_state(reg_term)
         self.map_tracker.update_state(display_map)
+        self.eniprior_tracker.update_state(display_eniprior)
         return {m.name: m.result() for m in self.metrics}
 
 

@@ -186,14 +186,17 @@ Examples:
                              "2=one line/epoch. Default: 1.")
 
     # --- MAP ---
-    parser.add_argument("--alpha_0", type=float, default=1.0,
+    parser.add_argument("--alpha_0", type=float, default=0.0,
                         help="Alpha_0 MAP hyperparameter (default: 1.0).")
-    parser.add_argument("--alpha_1", type=float, default=2.5,
+    parser.add_argument("--alpha_1", type=float, default=0.5,
                         help="Alpha_1 MAP hyperparameter (default: 2.5).")
     parser.add_argument("--alpha", type=float, default=2.0,
                         help="Alpha MAP hyperparameter (default: 2.0).")
     parser.add_argument("--B", type=float, default=30.0,
                         help="B MAP hyperparameter (default: 30.0).")
+    
+    parser.add_argument("--lambda_eni", type=float, default=2.0,
+                        help="lambda_eni hyperparameter (default: 2.0)")
 
     return parser.parse_args()
 
@@ -637,7 +640,7 @@ def run_train(args):
                 accumulation_steps=args.accumulation_steps,
                 reduction=args.reduction,
                 alpha_0=args.alpha_0, alpha_1=args.alpha_1, 
-                alpha=args.alpha, B=args.B,
+                alpha=args.alpha, B=args.B, lambda_eni=args.lambda_eni
             )
 
             # Optimizer with CosineDecay over total training steps

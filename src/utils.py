@@ -3071,7 +3071,7 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
 
         return kl
 
-    def compute_map2(self, z_logits, z_probs):
+    def compute_map_2(self, z_logits, z_probs):
         # compute_logit_beta_penalty
         # Computes the negative log-prior of the Logit-Beta distribution.
         # Formula: - [ alpha_0 * h_ia - (alpha_0 + alpha_1) * ln(1 + exp(h_ia)) ]
@@ -3079,7 +3079,6 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         #NEW: zero out singleton alleles before summing so they contribute no MAP gradient
         neg_logit_beta_penalty = neg_logit_beta_penalty * self.learnable_allele_mask[tf.newaxis, :]  #NEW
         neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1) # (B,)
-
         # compute_gamma_sum_penalty
         # Computes the negative log-prior of the Gamma distribution for expected bindings.
         # Formula: - [ (alpha - 1) * ln(sum(gamma_ia)) - (alpha / B) * sum(gamma_ia) ]
@@ -3091,29 +3090,25 @@ class TCRLikelihoodLoss(tf.keras.layers.Layer):
         
         return neg_logit_beta_penalty, neg_log_p_g # Both are now (B,)
 
-    def compute_map(self, z_logits, z_probs):
+    def compute_map_1(self, z_logits, z_probs):
         """
         Computes MAP penalties across ALL alleles (no masking).
+        uses (α0−1) ln γia +(α1−1) ln(1−γia) which is the old term
         """
         # 1. Direct Beta Prior Penalty (Mode at 0 in probability space)
         # Formula: -(alpha_0 - 1) * h_ia + (alpha_0 + alpha_1 - 2) * softplus(h_ia)
         neg_logit_beta_penalty = -(self.alpha_0 - 1.0) * z_logits + (self.alpha_0 + self.alpha_1 - 2.0) * tf.math.softplus(z_logits)
-        
         #NEW: zero out singleton alleles before summing so they contribute no MAP gradient
         neg_logit_beta_penalty = neg_logit_beta_penalty * self.learnable_allele_mask[tf.newaxis, :]  #NEW
-        
         # Sum over ALL alleles
         neg_logit_beta_penalty = tf.reduce_sum(neg_logit_beta_penalty, axis=-1)
-        
         # 2. Gamma/Exponential Sum Penalty
         #NEW: only sum over learnable alleles for gamma-sum penalty
         z_probs_masked = z_probs * self.learnable_allele_mask[tf.newaxis, :]  #NEW
         sum_gamma = tf.reduce_sum(z_probs_masked, axis=-1)                    #NEW: was z_probs
         sum_gamma_safe = tf.maximum(sum_gamma, tf.keras.backend.epsilon())
-        
         # Formula: (alpha / B) * sum_gamma - (alpha - 1) * ln(sum_gamma)
         neg_log_p_g = (self.alpha / self.B) * sum_gamma - (self.alpha - 1.0) * tf.math.log(sum_gamma_safe)
-        
         return neg_logit_beta_penalty, neg_log_p_g # Both are now (B,)
 
     # ------------------------------------------------------------------

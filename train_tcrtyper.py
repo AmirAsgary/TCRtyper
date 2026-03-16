@@ -1822,13 +1822,14 @@ def main():
         map_weight=args.map_weight,
         mask_singleton_alleles=args.mask_singleton_alleles,
         min_donors_per_allele=args.min_donors_per_allele,)
-    np.save(
-    os.path.join(args.output_dir, "learnable_allele_mask.npy"),
-    loss_fn.learnable_allele_mask.numpy()
-    )
+
     # ── count dataset size for LR schedule ───────────────────────────
     n_train = 0
     if args.mode == "train":
+        np.save(
+            os.path.join(args.output_dir, "learnable_allele_mask.npy"),
+            loss_fn.learnable_allele_mask.numpy()
+            )
         n_train, steps_per_epoch = count_dataset_clusters(
             args.train_ds, args.batch_size)
         total_steps = steps_per_epoch * args.epochs
