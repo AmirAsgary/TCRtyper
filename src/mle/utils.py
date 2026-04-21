@@ -1645,7 +1645,6 @@ def save_metrics_json(output_path, perf_metrics, analysis_results, donor_stats, 
 
 ##################################3
 ###################################
-
 @dataclass
 class PublicTcrHlaClusterChunk:
     cluster_start: int
@@ -1667,6 +1666,9 @@ class PublicTcrHlaClusterChunk:
     _v_gene_id_accessor: RaggedClusterAccessor | None = field(init=False, repr=False)
     _donor_ids_accessor: RaggedClusterAccessor | None = field(init=False, repr=False)
     _tcr_counts: np.ndarray = field(init=False, repr=False)
+    S_i: Optional[np.ndarray]
+    S_i_without_rare_alleles: Optional[np.ndarray]
+    percentile_rank_dense: Optional[np.ndarray]
 
     @property
     def n_clusters(self) -> int:
@@ -1690,6 +1692,10 @@ class PublicTcrHlaClusterChunk:
         raw_csr_tcr_int_fields: np.ndarray,
         raw_csr_tcr_int_field_names: tuple[str, ...],
         cdr_freq: Optional[Dict[str, "RaggedClusterAccessor"]] = None,
+        S_i: Optional[np.ndarray] = None,
+        S_i_without_rare_alleles: Optional[np.ndarray] = None,
+        percentile_rank_dense: Optional[np.ndarray] = None,
+
     ) -> None:
         self.cluster_start = int(cluster_start)
         self.cluster_end = int(cluster_end)
@@ -1706,6 +1712,11 @@ class PublicTcrHlaClusterChunk:
         self.raw_csr_tcr_int_fields = raw_csr_tcr_int_fields
         self.raw_csr_tcr_int_field_names = raw_csr_tcr_int_field_names
         self.cdr_freq = cdr_freq
+        self.S_i = S_i
+        self.S_i_without_rare_alleles = S_i_without_rare_alleles
+        self.percentile_rank_dense = percentile_rank_dense
+
+        
 
         self._tcr_loops_accessor = RaggedClusterAccessor(
             self.raw_csr_tcr_loops, self.raw_csr_tcr_indptr
@@ -1782,6 +1793,7 @@ def _index_int_field(names: Sequence[str], name: str) -> int:
         raise ValueError(f"Missing {name} in tcr_int_field_names.") from exc
 
 
+
 class PublicTcrHlaCsrReaderChunk:
     """
     Cluster-level reader for public_tcr_hla_counts.h5 with ragged TCR arrays.
@@ -1798,6 +1810,9 @@ class PublicTcrHlaCsrReaderChunk:
         include_donors: bool = False,
         include_z_probs: bool = False,
         include_cdr_freq: bool = False,
+        include_S_i: bool = False,
+        include_S_i_without_rare_alleles: bool = False,
+        include_percentile_rank: bool = False,
     ):
         self.path = Path(path)
         self.include_counts = bool(include_counts)
@@ -1806,6 +1821,9 @@ class PublicTcrHlaCsrReaderChunk:
         self.include_z_probs = bool(include_z_probs)
         self._h5 = None
         self.include_cdr_freq = bool(include_cdr_freq)
+        self.include_S_i = bool(include_S_i)
+        self.include_S_i_without_rare_alleles = bool(include_S_i_without_rare_alleles)
+        self.include_percentile_rank = bool(include_percentile_rank)
 
     def __enter__(self) -> "PublicTcrHlaCsrReaderChunk":
         self.open()
@@ -1869,6 +1887,12 @@ class PublicTcrHlaCsrReaderChunk:
         pvals_grp = clusters_grp.get("pvals") if self.include_pvals else None
         donors_grp = clusters_grp.get("donors") if include_donors else None
         z_probs_grp = clusters_grp.get("z_probs") if self.include_z_probs else None
+        pr_grp = clusters_grp.get("percentile_rank") if self.include_percentile_rank else None
+        if self.include_percentile_rank and pr_grp is None:raise KeyError("HDF5 missing clusters/percentile_rank (include_percentile_rank=True). Run compute_percentile_rank.py first.")
+        S_i_ds = clusters_grp["S_i"] if self.include_S_i and "S_i" in clusters_grp else None
+        S_i_wo_rare_ds = clusters_grp["S_i_without_rare_alleles"] if self.include_S_i_without_rare_alleles and "S_i_without_rare_alleles" in clusters_grp else None
+        if self.include_S_i and S_i_ds is None: raise KeyError("HDF5 missing clusters/S_i (include_S_i=True). Run compute_S_i.py first.")
+        if self.include_S_i_without_rare_alleles and S_i_wo_rare_ds is None: raise KeyError("HDF5 missing clusters/S_i_without_rare_alleles include_S_i_without_rare_alleles=True). Run compute_S_i.py first.")
         cdr_freq_grp = clusters_grp.get("cdr_freq") if self.include_cdr_freq else None
         if self.include_counts and counts_grp is None:
             raise KeyError("HDF5 missing clusters/counts (include_counts=True).")
@@ -1890,6 +1914,9 @@ class PublicTcrHlaCsrReaderChunk:
         zp_indptr = z_probs_grp["indptr"] if z_probs_grp is not None else None
         zp_indices = z_probs_grp["indices"] if z_probs_grp is not None else None
         zp_data = z_probs_grp["data"] if z_probs_grp is not None else None
+        pr_indptr = pr_grp["indptr"] if pr_grp is not None else None
+        pr_indices = pr_grp["indices"] if pr_grp is not None else None
+        pr_data = pr_grp["data"] if pr_grp is not None else None
 
         tcrs_grp = h5["tcrs"]
         loops_grp = tcrs_grp["loops"]
@@ -1914,6 +1941,8 @@ class PublicTcrHlaCsrReaderChunk:
 
             cluster_chunk = np.asarray(cluster_id[cluster_start:cluster_end])
             donors_chunk = np.asarray(n_donors[cluster_start:cluster_end])
+            S_i_chunk = np.asarray(S_i_ds[cluster_start:cluster_end]) if S_i_ds is not None else None
+            S_i_wo_rare_chunk = np.asarray(S_i_wo_rare_ds[cluster_start:cluster_end]) if S_i_wo_rare_ds is not None else None
 
             tcr_indptr_chunk = np.asarray(tcr_indptr[cluster_start : cluster_end + 1])
             tcr_start = int(tcr_indptr_chunk[0])
@@ -2042,6 +2071,29 @@ class PublicTcrHlaCsrReaderChunk:
                         (n_clusters, self.num_alleles), dtype=np.float32
                     )
 
+            percentile_rank_dense = None
+            if pr_indptr is not None and pr_indices is not None:
+                pr_indptr_chunk = np.asarray(
+                    pr_indptr[cluster_start : cluster_end + 1]
+                )
+                pr_start = int(pr_indptr_chunk[0])
+                pr_end = int(pr_indptr_chunk[-1])
+                pr_indptr_chunk = pr_indptr_chunk - pr_start
+                if pr_end > pr_start:
+                    pr_indices_chunk = np.asarray(pr_indices[pr_start:pr_end])
+                    pr_data_chunk = np.asarray(pr_data[pr_start:pr_end])
+                    percentile_rank_dense = np.zeros(
+                        (n_clusters, self.num_alleles), dtype=pr_data_chunk.dtype)
+                    for i in range(n_clusters):
+                        lo = int(pr_indptr_chunk[i])
+                        hi = int(pr_indptr_chunk[i + 1])
+                        if hi > lo:
+                            idx = pr_indices_chunk[lo:hi].astype(np.int64, copy=False)
+                            percentile_rank_dense[i, idx] = pr_data_chunk[lo:hi]
+                else:
+                    percentile_rank_dense = np.zeros(
+                        (n_clusters, self.num_alleles), dtype=np.float32)
+
             cdr_freq = None
             if cdr_freq_grp is not None:
                 cdr_freq = {}
@@ -2073,10 +2125,13 @@ class PublicTcrHlaCsrReaderChunk:
                 counts_dense=counts_dense,
                 pvals_dense=pvals_dense,
                 z_probs_dense=z_probs_dense,
+                percentile_rank_dense=percentile_rank_dense,
                 raw_csr_tcr_loops=tcr_loops,
                 raw_csr_tcr_int_fields=tcr_int_fields,
                 raw_csr_tcr_int_field_names=tuple(int_field_names),
                 cdr_freq=cdr_freq,
+                S_i=S_i_chunk,
+                S_i_without_rare_alleles=S_i_wo_rare_chunk,
             )
     def read_sparse_indices_of_counts(self):
         """
@@ -2096,6 +2151,7 @@ class PublicTcrHlaCsrReaderChunk:
         counts_set = [indices[indptr[i] : indptr[i+1]] for i in range(n_rows)]
 
         return counts_set, max_all
+
 
 
 class PublicTcrHlaCsrWriterChunk:
@@ -2676,6 +2732,116 @@ class MleZprobsWriter:
         self._nnz_written += total_nnz_new
 
 
+class SiWriter:
+    """
+    Writer for per-TCR S_i scalar datasets in clusters/.
+    Creates two dense float32 datasets:
+        clusters/S_i                       — full S_i scores
+        clusters/S_i_without_rare_alleles  — S_i with rare alleles masked
+    Both have shape (num_clusters,). If they already exist, they are
+    overwritten on open() (use force=False to skip overwrite).
+    Typical usage
+    -------------
+        with SiWriter(h5_path, num_clusters=N, chunk_rows=5000) as w:
+            for cs in range(0, N, chunk):
+                ce = min(cs + chunk, N)
+                w.write_chunk(cs, ce, S_i_chunk, S_i_without_rare_chunk)
+            w.set_attrs(rare_threshold=5, n_rare_alleles_masked=42)
+    """
+ 
+    def __init__(
+        self,
+        path,                          # str | Path
+        *,
+        num_clusters: int,
+        chunk_rows: int = 5_000,
+        compression: Optional[dict] = None,
+        force: bool = True,
+    ) -> None:
+        self.path = Path(path)
+        self.num_clusters = int(num_clusters)
+        self.chunk_rows = int(chunk_rows)
+        self.comp = compression or {"compression": "gzip", "compression_opts": 4}
+        self.force = bool(force)
+        self._h5 = None
+ 
+    def __enter__(self) -> "SiWriter":
+        self.open()
+        return self
+ 
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+ 
+    def open(self) -> None:
+        """Open file in append mode and (re)create the two datasets."""
+        if self._h5 is not None:
+            return
+        import h5py
+        self._h5 = h5py.File(self.path, "a")
+        clusters_grp = self._h5["clusters"]
+        for name in ("S_i", "S_i_without_rare_alleles"):
+            if name in clusters_grp:
+                if not self.force:
+                    raise FileExistsError(
+                        f"clusters/{name} exists; use force=True to overwrite.")
+                del clusters_grp[name]
+            clusters_grp.create_dataset(
+                name,
+                shape=(self.num_clusters,),
+                dtype=np.float32,
+                chunks=(min(self.chunk_rows, self.num_clusters),),
+                **self.comp,
+            )
+ 
+    def close(self) -> None:
+        """Close H5 file."""
+        if self._h5 is not None:
+            self._h5.close()
+            self._h5 = None
+ 
+    def write_chunk(
+        self,
+        cluster_start: int,
+        cluster_end: int,
+        S_i: np.ndarray,
+        S_i_without_rare_alleles: np.ndarray,
+    ) -> None:
+        """Write a chunk of S_i values to both datasets.
+        Args:
+            cluster_start: global index of first cluster.
+            cluster_end:   global index just past the last cluster.
+            S_i:           (cluster_end - cluster_start,) float32.
+            S_i_without_rare_alleles: same shape as S_i.
+        """
+        if self._h5 is None:
+            raise RuntimeError("SiWriter must be opened before write_chunk.")
+        n_expected = int(cluster_end - cluster_start)
+        if S_i.shape[0] != n_expected:
+            raise ValueError(
+                f"S_i shape mismatch: got {S_i.shape[0]}, expected {n_expected}")
+        if S_i_without_rare_alleles.shape[0] != n_expected:
+            raise ValueError(
+                f"S_i_without_rare_alleles shape mismatch: "
+                f"got {S_i_without_rare_alleles.shape[0]}, expected {n_expected}")
+        clusters_grp = self._h5["clusters"]
+        clusters_grp["S_i"][cluster_start:cluster_end] = S_i.astype(
+            np.float32, copy=False)
+        clusters_grp["S_i_without_rare_alleles"][cluster_start:cluster_end] = (
+            S_i_without_rare_alleles.astype(np.float32, copy=False))
+ 
+    def set_attrs(self, **kwargs) -> None:
+        """Attach metadata attrs (e.g. rare_threshold) to the S_i datasets."""
+        if self._h5 is None:
+            raise RuntimeError("SiWriter must be opened before set_attrs.")
+        clusters_grp = self._h5["clusters"]
+        # Common metadata for both datasets
+        clusters_grp["S_i"].attrs["formula"] = (
+            "S_i = (1/N_i) * sum_n y_ni * sum_a (x_na*gamma_ia) * "
+            "log((x_na*gamma_ia)/(sum_a' x_na'*gamma_ia'))")
+        clusters_grp["S_i"].attrs["range"] = "<= 0; closer to 0 = more confident"
+        # User-supplied attrs go on the rare-masked version
+        for k, v in kwargs.items():
+            clusters_grp["S_i_without_rare_alleles"].attrs[k] = v
 
 
 # ═══════════════════════════════════════════════════════════════════
